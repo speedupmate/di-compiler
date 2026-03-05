@@ -2,17 +2,19 @@
 //!
 //! Generates `<ns>\Interceptor` class files in `generated/code/**`.
 
-use php_extractor::types::{ClassInfo, MethodParam, MethodSignature};
 use di_resolver::InterceptorSpec;
+use php_extractor::types::{ClassInfo, MethodParam, MethodSignature};
 
 /// Generate the PHP source for an Interceptor class.
 ///
 /// `spec` — the InterceptorSpec from the resolver.
 /// `target_info` — optional ClassInfo for the target class (for constructor params).
 pub fn generate_interceptor(spec: &InterceptorSpec, target_info: Option<&ClassInfo>) -> String {
-    let fqcn = &spec.fqcn;
-    let (ns, _class_name) = split_fqcn(fqcn);
-    let ctor_params = target_info.and_then(|i| i.constructor.as_ref()).map(|c| &c.params);
+    let fqcn = spec.fqcn.trim_start_matches('\\');
+    let ns = interceptor_namespace(fqcn);
+    let ctor_params = target_info
+        .and_then(|i| i.constructor.as_ref())
+        .map(|c| &c.params);
 
     let mut out = String::new();
     out.push_str("<?php\n");
@@ -176,9 +178,8 @@ fn render_method_params(params: &[MethodParam]) -> String {
 ///   - Union types `Foo|Bar` (prefix each non-primitive part)
 pub fn render_type_hint(th: &str) -> String {
     const PRIMITIVES: &[&str] = &[
-        "string", "int", "float", "bool", "array", "callable", "iterable",
-        "object", "null", "void", "mixed", "never", "self", "parent", "static",
-        "false", "true",
+        "string", "int", "float", "bool", "array", "callable", "iterable", "object", "null",
+        "void", "mixed", "never", "self", "parent", "static", "false", "true",
     ];
 
     let (nullable, core) = if let Some(rest) = th.strip_prefix('?') {
@@ -211,12 +212,9 @@ pub fn render_type_hint(th: &str) -> String {
     format!("{}\\{}", nullable, core)
 }
 
-/// Split `Foo\Bar\Baz` into (`Foo\Bar`, `Baz`).
-fn split_fqcn(fqcn: &str) -> (String, String) {
-    match fqcn.rfind('\\') {
-        Some(pos) => (fqcn[..pos].to_string(), fqcn[pos + 1..].to_string()),
-        None => (String::new(), fqcn.to_string()),
-    }
+/// Namespace for generated interceptor class: `<TargetFQCN>`.
+fn interceptor_namespace(target_fqcn: &str) -> String {
+    target_fqcn.trim_start_matches('\\').to_string()
 }
 
 /// Return the file path for an interceptor: `generated/code/Foo/Bar/Interceptor.php`.
@@ -249,9 +247,25 @@ mod tests {
             public_methods: vec![],
         };
         let out = generate_interceptor(&spec, None);
-        assert!(out.contains("namespace Foo;"));
+        assert!(out.contains("namespace Foo\\Bar;"));
         assert!(out.contains("class Interceptor extends \\Foo\\Bar"));
         assert!(out.contains("use \\Magento\\Framework\\Interception\\Interceptor;"));
+    }
+
+    #[test]
+    fn test_nested_target_namespace_matches_path_mapping() {
+        let spec = InterceptorSpec {
+            fqcn: "Vendor\\Module\\Service\\Runner".to_string(),
+            plugins: vec![],
+            public_methods: vec![],
+        };
+        let out = generate_interceptor(&spec, None);
+        assert!(out.contains("namespace Vendor\\Module\\Service\\Runner;"));
+        assert!(out.contains("class Interceptor extends \\Vendor\\Module\\Service\\Runner"));
+        assert_eq!(
+            interceptor_path("Vendor\\Module\\Service\\Runner"),
+            "Vendor/Module/Service/Runner/Interceptor.php"
+        );
     }
 
     #[test]
@@ -298,7 +312,10 @@ mod tests {
             is_static: false,
         };
         let result = render_intercepted_method(&method);
-        assert!(!result.contains("return $pluginInfo"), "void method must not use return");
+        assert!(
+            !result.contains("return $pluginInfo"),
+            "void method must not use return"
+        );
         assert!(result.contains("$pluginInfo ? $this->___callPlugins"));
     }
 }
