@@ -11,4 +11,6 @@ pub use graph::{
     ResolvedGraph, ResolvedScalar, ResolvedType,
 };
 pub use interceptor::detect_interceptors;
-pub use proxy::{detect_proxies, detect_proxies_from_configs};
+pub use proxy::{
+    detect_proxies, detect_proxies_from_configs, detect_proxies_from_configs_with_existing,
+};

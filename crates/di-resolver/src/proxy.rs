@@ -30,6 +30,21 @@ pub fn detect_proxies_from_configs(
     class_map: &HashMap<String, ClassInfo>,
     scanner_di_configs: &[DiConfig],
 ) -> Vec<ProxySpec> {
+    let extra_existing_types = HashSet::new();
+    detect_proxies_from_configs_with_existing(
+        class_map,
+        scanner_di_configs,
+        &extra_existing_types,
+    )
+}
+
+/// Detect proxies with an explicit set of additional loadable class/interface
+/// names that are not present in `class_map` (e.g. Composer-only libraries).
+pub fn detect_proxies_from_configs_with_existing(
+    class_map: &HashMap<String, ClassInfo>,
+    scanner_di_configs: &[DiConfig],
+    extra_existing_types: &HashSet<String>,
+) -> Vec<ProxySpec> {
     let mut specs: Vec<ProxySpec> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let virtual_type_names: HashSet<&str> = scanner_di_configs
@@ -49,7 +64,7 @@ pub fn detect_proxies_from_configs(
             return;
         }
         let target_fqcn = proxy_fqcn[..proxy_fqcn.len() - 6].to_string();
-        if !class_or_interface_exists(class_map, &target_fqcn) {
+        if !class_or_interface_exists(class_map, extra_existing_types, &target_fqcn) {
             return;
         }
         if seen.insert(proxy_fqcn.clone()) {
@@ -101,7 +116,14 @@ fn collect_proxy_candidates_from_args(args: &[Argument], out: &mut Vec<String>) 
     }
 }
 
-fn class_or_interface_exists(class_map: &HashMap<String, ClassInfo>, fqcn: &str) -> bool {
+fn class_or_interface_exists(
+    class_map: &HashMap<String, ClassInfo>,
+    extra_existing_types: &HashSet<String>,
+    fqcn: &str,
+) -> bool {
+    if extra_existing_types.contains(fqcn) {
+        return true;
+    }
     matches!(
         class_map.get(fqcn).map(|info| &info.kind),
         Some(ClassKind::Class | ClassKind::AbstractClass | ClassKind::Interface)
@@ -311,5 +333,30 @@ mod tests {
         );
         let specs = detect_proxies(&class_map, &di_config);
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn test_proxy_target_can_be_resolved_from_extra_existing_types() {
+        let class_map = HashMap::new();
+        let mut di_config = DiConfig::default();
+        di_config.type_configs.insert(
+            "Foo\\Service".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Object {
+                    name: "dep".to_string(),
+                    value: "Psr\\Log\\LoggerInterface\\Proxy".to_string(),
+                    shared: None,
+                }],
+            },
+        );
+
+        let mut extra = HashSet::new();
+        extra.insert("Psr\\Log\\LoggerInterface".to_string());
+
+        let specs = detect_proxies_from_configs_with_existing(&class_map, &[di_config], &extra);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].proxy_fqcn, "Psr\\Log\\LoggerInterface\\Proxy");
+        assert_eq!(specs[0].target_fqcn, "Psr\\Log\\LoggerInterface");
     }
 }

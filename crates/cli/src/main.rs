@@ -10,7 +10,7 @@
 //!   7. Generate metadata files (area configs, interception.php)
 //!   8. Incremental writes (skip unchanged — TKT-022/026)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,12 +24,12 @@ use code_generator::{
     interceptor_path, proxy_path, serialize_interception_php, write_if_changed, AREAS,
 };
 use di_resolver::{
-    detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs,
+    detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs_with_existing,
     resolve_all_arguments,
 };
 use di_xml_reader::{
-    find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs,
-    merge_into, parse_di_xml,
+    find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs, merge_into,
+    parse_di_xml, Argument, DiConfig,
 };
 use php_extractor::{
     extract_file,
@@ -311,9 +311,32 @@ fn main() {
     // -----------------------------------------------------------------------
     // Phase 4: Detection (uses full_di_config = all areas merged)
     // -----------------------------------------------------------------------
+    let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
+    let proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
+    let mut extra_existing_proxy_targets: HashSet<String> = HashSet::new();
+    if let Some(index) = &composer_autoload {
+        for target in proxy_targets {
+            if class_map.contains_key(&target) {
+                continue;
+            }
+            // Keep Magento namespace existence tied to scanned ClassInfo scope.
+            // Composer fallback is for third-party/autoload-only targets (e.g. PSR).
+            if target.starts_with("Magento\\") {
+                continue;
+            }
+            if index.is_loadable(&target) {
+                extra_existing_proxy_targets.insert(target);
+            }
+        }
+    }
+
     let interceptors = detect_interceptors(&class_map, &full_di_config);
     let factories = detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs);
-    let proxies = detect_proxies_from_configs(&class_map, &scanner_di_configs);
+    let proxies = detect_proxies_from_configs_with_existing(
+        &class_map,
+        &scanner_di_configs,
+        &extra_existing_proxy_targets,
+    );
     log::info!(
         "Detected: {} interceptors, {} factories, {} proxies",
         interceptors.len(),
@@ -499,4 +522,162 @@ fn print_summary(
     println!("  Proxies:        {}", proxies.len());
     println!("  Classes with resolved args: {}", args_map.len());
     println!("  Total FQCNs (for interception.php): {}", all_fqcns.len());
+}
+
+#[derive(Default)]
+struct ComposerAutoloadIndex {
+    psr4_prefixes: Vec<(String, Vec<PathBuf>)>,
+    psr0_prefixes: Vec<(String, Vec<PathBuf>)>,
+}
+
+impl ComposerAutoloadIndex {
+    fn from_magento_root(magento_root: &Path) -> Option<Self> {
+        let installed_json_path = magento_root.join("vendor/composer/installed.json");
+        let installed_json = std::fs::read_to_string(&installed_json_path).ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&installed_json).ok()?;
+
+        let packages = parsed
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| parsed.as_array())?;
+
+        let base_dir = installed_json_path.parent()?;
+        let mut index = ComposerAutoloadIndex::default();
+
+        for pkg in packages {
+            let install_path = pkg
+                .get("install-path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if install_path.is_empty() {
+                continue;
+            }
+            let package_root = base_dir.join(install_path);
+            let autoload = match pkg.get("autoload").and_then(serde_json::Value::as_object) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            if let Some(psr4) = autoload.get("psr-4") {
+                push_autoload_map(psr4, &package_root, &mut index.psr4_prefixes);
+            }
+            if let Some(psr0) = autoload.get("psr-0") {
+                push_autoload_map(psr0, &package_root, &mut index.psr0_prefixes);
+            }
+        }
+
+        // Longest prefix first for deterministic matching.
+        index
+            .psr4_prefixes
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+        index
+            .psr0_prefixes
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+
+        Some(index)
+    }
+
+    fn is_loadable(&self, fqcn: &str) -> bool {
+        let fqcn = fqcn.trim().trim_start_matches('\\');
+        if fqcn.is_empty() {
+            return false;
+        }
+
+        // PSR-4
+        for (prefix, dirs) in &self.psr4_prefixes {
+            let Some(relative) = fqcn.strip_prefix(prefix) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            let rel_path = relative.replace('\\', "/");
+            for dir in dirs {
+                if dir.join(format!("{rel_path}.php")).is_file() {
+                    return true;
+                }
+            }
+        }
+
+        // PSR-0
+        for (prefix, dirs) in &self.psr0_prefixes {
+            let Some(relative) = fqcn.strip_prefix(prefix) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            let rel_path = relative.replace(['\\', '_'], "/");
+            for dir in dirs {
+                if dir.join(format!("{rel_path}.php")).is_file() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+fn push_autoload_map(
+    autoload_value: &serde_json::Value,
+    package_root: &Path,
+    out: &mut Vec<(String, Vec<PathBuf>)>,
+) {
+    let Some(map) = autoload_value.as_object() else {
+        return;
+    };
+
+    for (prefix, locations) in map {
+        let prefix = prefix.trim().trim_start_matches('\\').to_string();
+
+        let dirs: Vec<PathBuf> = match locations {
+            serde_json::Value::String(s) => vec![package_root.join(s)],
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|s| package_root.join(s))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        if !dirs.is_empty() {
+            out.push((prefix, dirs));
+        }
+    }
+}
+
+fn collect_proxy_targets_from_di_configs(di_configs: &[DiConfig]) -> HashSet<String> {
+    let mut targets = HashSet::new();
+    for cfg in di_configs {
+        for proxy_fqcn in cfg.preferences.values() {
+            maybe_push_proxy_target(proxy_fqcn, &mut targets);
+        }
+        for vt in cfg.virtual_types.values() {
+            maybe_push_proxy_target(&vt.type_name, &mut targets);
+        }
+        for tc in cfg.type_configs.values() {
+            collect_proxy_targets_from_args(&tc.arguments, &mut targets);
+        }
+    }
+    targets
+}
+
+fn collect_proxy_targets_from_args(args: &[Argument], out: &mut HashSet<String>) {
+    for arg in args {
+        match arg {
+            Argument::Object { value, .. } => maybe_push_proxy_target(value, out),
+            Argument::Array { items, .. } => collect_proxy_targets_from_args(items, out),
+            _ => {}
+        }
+    }
+}
+
+fn maybe_push_proxy_target(candidate: &str, out: &mut HashSet<String>) {
+    let candidate = candidate.trim().trim_start_matches('\\');
+    if let Some(target) = candidate.strip_suffix("\\Proxy") {
+        if !target.is_empty() {
+            out.insert(target.to_string());
+        }
+    }
 }
