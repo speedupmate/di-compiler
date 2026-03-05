@@ -13,6 +13,8 @@ pub struct ClassInfo {
     pub constructor: Option<Constructor>,
     pub is_abstract: bool,
     pub is_final: bool,
+    /// Public non-final methods (needed for InterceptorSpec)
+    pub public_methods: Vec<MethodSignature>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,7 @@ pub struct MethodSignature {
     pub name: String,
     pub params: Vec<MethodParam>,
     pub return_type: Option<String>,
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
