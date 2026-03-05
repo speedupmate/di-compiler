@@ -330,6 +330,7 @@ dependencies = [
  "indicatif",
  "log",
  "php-extractor",
+ "quick-xml",
  "rayon",
  "serde",
  "serde_json",
