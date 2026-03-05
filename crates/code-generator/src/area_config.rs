@@ -114,7 +114,7 @@ fn serialize_arg_indent(
             }
         }
     }
-    out.push_str(&format!("{}).\n", pad));
+    out.push_str(&format!("{}),\n", pad));
 }
 
 fn is_numeric(s: &str) -> bool {

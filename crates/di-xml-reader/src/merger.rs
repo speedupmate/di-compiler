@@ -14,7 +14,7 @@ pub fn merge_configs(configs: Vec<DiConfig>) -> DiConfig {
     result
 }
 
-fn merge_into(dst: &mut DiConfig, src: DiConfig) {
+pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
     // Preferences: last wins
     for (k, v) in src.preferences {
         dst.preferences.insert(k, v);

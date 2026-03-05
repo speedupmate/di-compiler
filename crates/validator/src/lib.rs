@@ -93,8 +93,22 @@ pub fn validate(php_generated: &Path, rust_generated: &Path) -> ValidationResult
         let php_path = php_generated.join(rel);
         let rust_path = rust_generated.join(rel);
 
-        let php_content = std::fs::read(&php_path).unwrap_or_default();
-        let rust_content = std::fs::read(&rust_path).unwrap_or_default();
+        let php_content = match std::fs::read(&php_path) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("validator: cannot read {}: {e}", php_path.display());
+                result.extraction_failures.push(rel.clone());
+                continue;
+            }
+        };
+        let rust_content = match std::fs::read(&rust_path) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("validator: cannot read {}: {e}", rust_path.display());
+                result.extraction_failures.push(rel.clone());
+                continue;
+            }
+        };
 
         if php_content != rust_content {
             let php_sha = sha256_hex(&php_content);

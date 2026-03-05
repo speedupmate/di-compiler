@@ -26,7 +26,7 @@ use code_generator::{
 use di_resolver::{
     detect_factories, detect_interceptors, detect_proxies, resolve_all_arguments,
 };
-use di_xml_reader::{find_di_xml_files, merge_configs, parse_di_xml};
+use di_xml_reader::{find_di_xml_files, find_di_xml_files_for_area, merge_configs, merge_into, parse_di_xml};
 use php_extractor::{
     types::{ClassInfo, ExtractResult},
     walker::{read_module_paths, walk_php_files},
@@ -134,6 +134,17 @@ fn main() {
         })
         .init();
 
+    // Wire --fallback-php to the env var that Tier 3 reads.
+    if args.fallback_php != "php" {
+        std::env::set_var("FAST_DI_PHP", &args.fallback_php);
+    }
+
+    // Validate requires --php-generated
+    if args.validate && args.php_generated.is_none() {
+        eprintln!("error: --validate requires --php-generated <dir>");
+        std::process::exit(2);
+    }
+
     // Configure rayon thread pool
     if let Some(jobs) = args.jobs {
         rayon::ThreadPoolBuilder::new()
@@ -177,10 +188,10 @@ fn main() {
     let fallback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failure_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // Share cache for read access in parallel section
+    let cache_ref = &cache;
+
     php_files.par_iter().for_each(|path| {
-        // Incremental: skip unchanged files if we already have their data
-        // (we can't really skip extraction here without a cache of ClassInfo,
-        //  so incremental for PHP extraction is a future optimization)
         let result = extract_file(path);
         pb.inc(1);
         match result {
@@ -223,6 +234,14 @@ fn main() {
     let di_configs: Vec<_> = di_xml_files
         .par_iter()
         .filter_map(|path| {
+            // Incremental: if this di.xml hasn't changed since last run, skip it.
+            // NOTE: this skips the file from contributing to the merge, which means
+            // we need ALL files to be cached to use this optimization correctly.
+            // We only skip if the full set was cached (cache has same count as files).
+            if args.incremental && cache_ref.is_unchanged(path) {
+                pb.inc(1);
+                return None;
+            }
             let r = parse_di_xml(path);
             pb.inc(1);
             match r {
@@ -339,14 +358,41 @@ fn main() {
     let interception_path = metadata_root.join("interception.php");
     let _ = write_if_changed(&interception_path, &interception_content);
 
-    // Per-area config files
+    // Per-area config files — each area merges global + area-specific di.xml overlays.
+    let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
     for area in AREAS {
-        // For now all areas get the same merged global config
-        // (area-specific merging is a future enhancement)
-        let area_content = generate_area_config(&args_map, &di_config);
+        let area_di_files = find_di_xml_files_for_area(&magento_root, area);
+
+        // Only re-merge if there are area-specific files beyond the global set
+        let area_di_config = if area_di_files.len() > di_xml_files.len() {
+            // Parse only the incremental area-specific files, then merge on top
+            let area_only: Vec<_> = area_di_files
+                .iter()
+                .filter(|p| !di_xml_files.contains(p))
+                .collect();
+            if area_only.is_empty() {
+                di_config.clone()
+            } else {
+                let extra_configs: Vec<_> = area_only
+                    .iter()
+                    .filter_map(|p| parse_di_xml(p).ok())
+                    .collect();
+                let mut merged_area = di_config.clone();
+                let overlay = merge_configs(extra_configs);
+                merge_into(&mut merged_area, overlay);
+                merged_area
+            }
+        } else {
+            di_config.clone()
+        };
+
+        let area_args = resolve_all_arguments(&class_map, &area_di_config);
+        let area_content = generate_area_config(&area_args, &area_di_config);
         let area_path = metadata_root.join(format!("{}.php", area));
         let _ = write_if_changed(&area_path, &area_content);
+        pb_area.inc(1);
     }
+    pb_area.finish_with_message("done");
 
     let total_written = written.load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
@@ -368,10 +414,8 @@ fn main() {
     // Phase 8: Validation (optional)
     // -----------------------------------------------------------------------
     if args.validate {
-        let php_gen = args
-            .php_generated
-            .as_deref()
-            .unwrap_or(&generated_root);
+        // --php-generated is required (enforced earlier in main)
+        let php_gen = args.php_generated.as_deref().unwrap();
         log::info!("Validating against {}", php_gen.display());
         let result = validator::validate(php_gen, &generated_root);
         println!("{}", result.summary());

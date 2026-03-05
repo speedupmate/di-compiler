@@ -157,10 +157,21 @@ pub fn generate_proxy(spec: &ProxySpec, target_info: Option<&ClassInfo>) -> Stri
 }
 
 fn render_proxy_method(m: &MethodSignature) -> String {
+    // Skip static methods — _getSubject() is an instance method and cannot be
+    // called in a static context.
+    if m.is_static {
+        return String::new();
+    }
+
+    let is_void = m
+        .return_type
+        .as_deref()
+        .map(|r| r == "void" || r == "never")
+        .unwrap_or(false);
+
     let mut s = String::new();
     s.push_str("    /**\n     * {@inheritdoc}\n     */\n");
-    let static_kw = if m.is_static { "static " } else { "" };
-    s.push_str(&format!("    public {}function {}(", static_kw, m.name));
+    s.push_str(&format!("    public function {}(", m.name));
 
     let params_str: Vec<String> = m
         .params
@@ -168,10 +179,11 @@ fn render_proxy_method(m: &MethodSignature) -> String {
         .map(|p| {
             let mut part = String::new();
             if let Some(th) = &p.type_hint {
+                let rendered = crate::interceptor::render_type_hint(th);
                 if p.is_variadic {
-                    part.push_str(&format!("...\\{} ", th));
+                    part.push_str(&format!("...{} ", rendered));
                 } else {
-                    part.push_str(&format!("\\{} ", th));
+                    part.push_str(&format!("{} ", rendered));
                 }
             }
             part.push_str(&format!("${}", p.name));
@@ -201,11 +213,20 @@ fn render_proxy_method(m: &MethodSignature) -> String {
             }
         })
         .collect();
-    s.push_str(&format!(
-        "        return $this->_getSubject()->{}({});\n    }}\n\n",
-        m.name,
-        arg_names.join(", ")
-    ));
+
+    if is_void {
+        s.push_str(&format!(
+            "        $this->_getSubject()->{}({});\n    }}\n\n",
+            m.name,
+            arg_names.join(", ")
+        ));
+    } else {
+        s.push_str(&format!(
+            "        return $this->_getSubject()->{}({});\n    }}\n\n",
+            m.name,
+            arg_names.join(", ")
+        ));
+    }
     s
 }
 

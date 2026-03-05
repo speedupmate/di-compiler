@@ -115,14 +115,40 @@ impl DiConfig {
     }
 }
 
-/// Collect di.xml files in Magento merge order.
+/// Collect **global-only** di.xml files in Magento merge order.
+///
+/// Only includes `etc/di.xml` files (not area-specific `etc/{area}/di.xml`).
+/// Merge order: vendor/magento/* → vendor/*/* → app/etc → app/code/*/*
 pub fn find_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    collect_di_xml_files(magento_root, None)
+}
+
+/// Collect di.xml files for a specific area in Magento merge order.
+///
+/// Returns the global `etc/di.xml` files **plus** `etc/{area}/di.xml` overlays.
+/// Area files are loaded after global files with the same source priority, so
+/// they override global settings for that area.
+pub fn find_di_xml_files_for_area(
+    magento_root: &std::path::Path,
+    area: &str,
+) -> Vec<std::path::PathBuf> {
+    collect_di_xml_files(magento_root, Some(area))
+}
+
+/// Internal: collect di.xml files with optional area overlay.
+///
+/// Each entry is `(priority, path)` where priority controls merge order.
+fn collect_di_xml_files(
+    magento_root: &std::path::Path,
+    area: Option<&str>,
+) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<(u8, std::path::PathBuf)> = Vec::new();
 
-    // Helper: walk a base dir collecting **/etc/di.xml
-    fn collect_di_xml(
+    // Collect `<base>/<module>/etc/di.xml` and optionally `<base>/<module>/etc/<area>/di.xml`
+    fn collect_vendor(
         base: &std::path::Path,
         priority: u8,
+        area: Option<&str>,
         out: &mut Vec<(u8, std::path::PathBuf)>,
     ) {
         if !base.is_dir() {
@@ -132,23 +158,14 @@ pub fn find_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathB
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    let di = p.join("etc/di.xml");
-                    if di.exists() {
-                        out.push((priority, di));
+                    let global = p.join("etc/di.xml");
+                    if global.exists() {
+                        out.push((priority, global));
                     }
-                    // Also check area-specific: etc/{area}/di.xml
-                    let etc = p.join("etc");
-                    if etc.is_dir() {
-                        if let Ok(area_entries) = std::fs::read_dir(&etc) {
-                            for ae in area_entries.flatten() {
-                                let ap = ae.path();
-                                if ap.is_dir() {
-                                    let area_di = ap.join("di.xml");
-                                    if area_di.exists() {
-                                        out.push((priority, area_di));
-                                    }
-                                }
-                            }
+                    if let Some(a) = area {
+                        let area_di = p.join(format!("etc/{}/di.xml", a));
+                        if area_di.exists() {
+                            out.push((priority, area_di));
                         }
                     }
                 }
@@ -157,20 +174,19 @@ pub fn find_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathB
     }
 
     // Priority 1: vendor/magento/*
-    collect_di_xml(&magento_root.join("vendor/magento"), 1, &mut paths);
+    collect_vendor(&magento_root.join("vendor/magento"), 1, area, &mut paths);
 
-    // Priority 2: other vendor/*/* (non-magento)
+    // Priority 2: other vendor/vendor/* (non-magento)
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("vendor")) {
         for vendor in vendors.flatten() {
-            let vname = vendor.file_name();
-            if vname.to_str().map(|s| s == "magento").unwrap_or(false) {
+            if vendor.file_name().to_str().map(|s| s == "magento").unwrap_or(false) {
                 continue;
             }
-            collect_di_xml(&vendor.path(), 2, &mut paths);
+            collect_vendor(&vendor.path(), 2, area, &mut paths);
         }
     }
 
-    // Priority 3: app/etc/di.xml
+    // Priority 3: app/etc/di.xml (global only; no area override here)
     let app_etc_di = magento_root.join("app/etc/di.xml");
     if app_etc_di.exists() {
         paths.push((3, app_etc_di));
@@ -181,16 +197,22 @@ pub fn find_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathB
         for vendor in vendors.flatten() {
             if let Ok(modules) = std::fs::read_dir(vendor.path()) {
                 for module in modules.flatten() {
-                    let di = module.path().join("etc/di.xml");
-                    if di.exists() {
-                        paths.push((4, di));
+                    let global = module.path().join("etc/di.xml");
+                    if global.exists() {
+                        paths.push((4, global));
+                    }
+                    if let Some(a) = area {
+                        let area_di = module.path().join(format!("etc/{}/di.xml", a));
+                        if area_di.exists() {
+                            paths.push((4, area_di));
+                        }
                     }
                 }
             }
         }
     }
 
-    // Sort by priority, then path for determinism
+    // Sort by priority then path for deterministic ordering
     paths.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     paths.into_iter().map(|(_, p)| p).collect()
 }

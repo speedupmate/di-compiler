@@ -115,7 +115,7 @@ fn serialize_resolved_arg(out: &mut String, name: &str, value: &ResolvedArgValue
             }
         }
     }
-    out.push_str(&format!("{}).\n", pad));
+    out.push_str(&format!("{}),\n", pad));
 }
 
 /// Escape a PHP string value (backslash and single-quote).
@@ -170,5 +170,21 @@ mod tests {
         );
         let out = serialize_arguments_php(&map);
         assert!(out.contains("'_vn_' => true,"));
+    }
+
+    #[test]
+    fn test_arg_closes_with_comma_not_dot() {
+        // Regression: array arg closing must be `),` not `).`
+        let mut map = HashMap::new();
+        map.insert(
+            "App\\Service".to_string(),
+            vec![ResolvedArg {
+                name: "x".to_string(),
+                resolved: ResolvedArgValue::SharedInstance("App\\X".to_string()),
+            }],
+        );
+        let out = serialize_arguments_php(&map);
+        assert!(!out.contains(")."), "closing must be ), not ).");
+        assert!(out.contains("),"));
     }
 }

@@ -53,11 +53,21 @@ pub fn generate_interceptor(spec: &InterceptorSpec, target_info: Option<&ClassIn
 }
 
 fn render_intercepted_method(m: &MethodSignature) -> String {
+    // Magento's interceptor framework does not support static methods.
+    // Skip them to avoid `$this` in static context errors.
+    if m.is_static {
+        return String::new();
+    }
+
+    let is_void = m
+        .return_type
+        .as_deref()
+        .map(|r| r == "void" || r == "never")
+        .unwrap_or(false);
+
     let mut s = String::new();
     s.push_str("    /**\n     * {@inheritdoc}\n     */\n");
-
-    let static_kw = if m.is_static { "static " } else { "" };
-    s.push_str(&format!("    public {}function {}(", static_kw, m.name));
+    s.push_str(&format!("    public function {}(", m.name));
     s.push_str(&render_method_params(&m.params));
     if let Some(ret) = &m.return_type {
         s.push_str(&format!(") : {}", ret));
@@ -69,11 +79,7 @@ fn render_intercepted_method(m: &MethodSignature) -> String {
         "        $pluginInfo = $this->pluginList->getNext($this->subjectType, '{}');\n",
         m.name
     ));
-    s.push_str(&format!(
-        "        return $pluginInfo ? $this->___callPlugins('{}', func_get_args(), $pluginInfo) : parent::{}(",
-        m.name, m.name
-    ));
-    // Forward args
+
     let arg_names: Vec<String> = m
         .params
         .iter()
@@ -85,8 +91,19 @@ fn render_intercepted_method(m: &MethodSignature) -> String {
             }
         })
         .collect();
-    s.push_str(&arg_names.join(", "));
-    s.push_str(");\n    }\n\n");
+
+    if is_void {
+        s.push_str(&format!(
+            "        $pluginInfo ? $this->___callPlugins('{}', func_get_args(), $pluginInfo) : parent::{}({});\n",
+            m.name, m.name, arg_names.join(", ")
+        ));
+    } else {
+        s.push_str(&format!(
+            "        return $pluginInfo ? $this->___callPlugins('{}', func_get_args(), $pluginInfo) : parent::{}({});\n",
+            m.name, m.name, arg_names.join(", ")
+        ));
+    }
+    s.push_str("    }\n\n");
     s
 }
 
@@ -96,10 +113,11 @@ fn render_params(params: &[php_extractor::types::ConstructorParam]) -> String {
         .map(|p| {
             let mut s = String::new();
             if let Some(th) = &p.type_hint {
+                let rendered = render_type_hint(th);
                 if p.is_variadic {
-                    s.push_str(&format!("...\\{} ", th));
+                    s.push_str(&format!("...{} ", rendered));
                 } else {
-                    s.push_str(&format!("\\{} ", th));
+                    s.push_str(&format!("{} ", rendered));
                 }
             }
             s.push_str(&format!("${}", p.name));
@@ -132,10 +150,11 @@ fn render_method_params(params: &[MethodParam]) -> String {
         .map(|p| {
             let mut s = String::new();
             if let Some(th) = &p.type_hint {
+                let rendered = render_type_hint(th);
                 if p.is_variadic {
-                    s.push_str(&format!("...\\{} ", th));
+                    s.push_str(&format!("...{} ", rendered));
                 } else {
-                    s.push_str(&format!("\\{} ", th));
+                    s.push_str(&format!("{} ", rendered));
                 }
             }
             s.push_str(&format!("${}", p.name));
@@ -146,6 +165,50 @@ fn render_method_params(params: &[MethodParam]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Render a PHP type hint, adding `\` only for class/interface names (not primitives).
+/// Public so proxy.rs can reuse it.
+///
+/// Handles:
+///   - Nullable prefix `?`
+///   - PHP built-in scalar/pseudo types (no `\`)
+///   - Union types `Foo|Bar` (prefix each non-primitive part)
+pub fn render_type_hint(th: &str) -> String {
+    const PRIMITIVES: &[&str] = &[
+        "string", "int", "float", "bool", "array", "callable", "iterable",
+        "object", "null", "void", "mixed", "never", "self", "parent", "static",
+        "false", "true",
+    ];
+
+    let (nullable, core) = if let Some(rest) = th.strip_prefix('?') {
+        ("?", rest)
+    } else {
+        ("", th)
+    };
+
+    if PRIMITIVES.contains(&core) {
+        return format!("{}{}", nullable, core);
+    }
+
+    // Union types: split on `|`
+    if core.contains('|') {
+        let parts: Vec<String> = core
+            .split('|')
+            .map(|p| {
+                let p = p.trim();
+                if PRIMITIVES.contains(&p) {
+                    p.to_string()
+                } else {
+                    format!("\\{}", p)
+                }
+            })
+            .collect();
+        return format!("{}{}", nullable, parts.join("|"));
+    }
+
+    // Plain class name
+    format!("{}\\{}", nullable, core)
 }
 
 /// Split `Foo\Bar\Baz` into (`Foo\Bar`, `Baz`).
@@ -189,5 +252,53 @@ mod tests {
         assert!(out.contains("namespace Foo;"));
         assert!(out.contains("class Interceptor extends \\Foo\\Bar"));
         assert!(out.contains("use \\Magento\\Framework\\Interception\\Interceptor;"));
+    }
+
+    #[test]
+    fn test_render_type_hint_primitives() {
+        assert_eq!(render_type_hint("string"), "string");
+        assert_eq!(render_type_hint("int"), "int");
+        assert_eq!(render_type_hint("bool"), "bool");
+        assert_eq!(render_type_hint("array"), "array");
+        assert_eq!(render_type_hint("void"), "void");
+    }
+
+    #[test]
+    fn test_render_type_hint_class() {
+        assert_eq!(render_type_hint("Foo\\Bar"), "\\Foo\\Bar");
+        assert_eq!(render_type_hint("?Foo\\Bar"), "?\\Foo\\Bar");
+    }
+
+    #[test]
+    fn test_render_type_hint_nullable_primitive() {
+        assert_eq!(render_type_hint("?string"), "?string");
+        assert_eq!(render_type_hint("?int"), "?int");
+    }
+
+    #[test]
+    fn test_static_method_skipped() {
+        use php_extractor::types::{MethodParam, MethodSignature};
+        let method = MethodSignature {
+            name: "getInstance".to_string(),
+            params: vec![],
+            return_type: Some("self".to_string()),
+            is_static: true,
+        };
+        let result = render_intercepted_method(&method);
+        assert!(result.is_empty(), "static methods must be skipped");
+    }
+
+    #[test]
+    fn test_void_method_no_return() {
+        use php_extractor::types::{MethodParam, MethodSignature};
+        let method = MethodSignature {
+            name: "doSomething".to_string(),
+            params: vec![],
+            return_type: Some("void".to_string()),
+            is_static: false,
+        };
+        let result = render_intercepted_method(&method);
+        assert!(!result.contains("return $pluginInfo"), "void method must not use return");
+        assert!(result.contains("$pluginInfo ? $this->___callPlugins"));
     }
 }
