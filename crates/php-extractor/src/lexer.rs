@@ -22,11 +22,15 @@ impl Lexer {
 struct Scanner<'a> {
     src: &'a [u8],
     pos: usize,
+    /// Current file namespace (populated when `namespace` keyword is parsed).
+    namespace: String,
+    /// File-level `use` imports: short alias → fully-qualified class name.
+    use_map: std::collections::HashMap<String, String>,
 }
 
 impl<'a> Scanner<'a> {
     fn new(src: &'a [u8]) -> Self {
-        Scanner { src, pos: 0 }
+        Scanner { src, pos: 0, namespace: String::new(), use_map: std::collections::HashMap::new() }
     }
 
     fn at(&self, offset: usize) -> u8 {
@@ -222,6 +226,13 @@ impl<'a> Scanner<'a> {
             match word {
                 b"namespace" => {
                     namespace = self.read_namespace_decl()?;
+                    self.namespace = namespace.clone();
+                }
+                b"use" => {
+                    // File-level use statement (before the class keyword).
+                    // Class-level `use TraitName;` cannot appear here since we
+                    // haven't entered the class body yet.
+                    self.read_use_stmt();
                 }
                 b"abstract" => {
                     self.skip_noise();
@@ -357,6 +368,137 @@ impl<'a> Scanner<'a> {
         Ok(ns)
     }
 
+    /// Parse a file-level `use` statement and populate `self.use_map`.
+    ///
+    /// Handles:
+    ///   use Foo\Bar;                       → Bar → Foo\Bar
+    ///   use Foo\Bar as Baz;                → Baz → Foo\Bar
+    ///   use Foo\Bar\{Baz, Qux as Q};       → Baz → Foo\Bar\Baz, Q → Foo\Bar\Qux
+    ///   use function ...; use const ...;   → ignored
+    fn read_use_stmt(&mut self) {
+        self.skip_noise();
+        // Skip `use function` and `use const`
+        let saved = self.pos;
+        if is_word_start(self.peek()) {
+            let w = self.read_word();
+            if w == b"function" || w == b"const" {
+                self.skip_to_semicolon();
+                return;
+            }
+            self.pos = saved;
+        }
+        // Skip leading `\`
+        if self.peek() == b'\\' { self.advance(1); }
+        // Read base FQCN parts
+        let mut base = String::new();
+        loop {
+            let b = self.peek();
+            if is_word_char(b) || b == b'_' {
+                let w = self.read_word();
+                base.push_str(std::str::from_utf8(w).unwrap_or(""));
+            } else if b == b'\\' {
+                self.advance(1);
+                // Group import: use Foo\Bar\{Baz, Qux as Q};
+                if self.peek() == b'{' {
+                    self.advance(1);
+                    loop {
+                        self.skip_noise();
+                        if self.is_eof() || self.peek() == b'}' { break; }
+                        if self.peek() == b',' { self.advance(1); continue; }
+                        // Read one entry in the group
+                        let mut part = String::new();
+                        loop {
+                            let c = self.peek();
+                            if is_word_char(c) || c == b'_' {
+                                let w = self.read_word();
+                                part.push_str(std::str::from_utf8(w).unwrap_or(""));
+                            } else if c == b'\\' {
+                                part.push('\\');
+                                self.advance(1);
+                            } else { break; }
+                        }
+                        // Optional `as Alias`
+                        let alias = self.try_read_as_alias().unwrap_or_else(|| {
+                            part.split('\\').last().unwrap_or(&part).to_string()
+                        });
+                        if !alias.is_empty() && !part.is_empty() {
+                            self.use_map.insert(alias, format!("{}\\{}", base, part));
+                        }
+                    }
+                    self.skip_noise();
+                    if self.peek() == b'}' { self.advance(1); }
+                    self.skip_noise();
+                    if self.peek() == b';' { self.advance(1); }
+                    return;
+                }
+                base.push('\\');
+            } else {
+                break;
+            }
+        }
+        if base.is_empty() {
+            self.skip_to_semicolon();
+            return;
+        }
+        // Optional `as Alias`
+        let alias = self.try_read_as_alias().unwrap_or_else(|| {
+            base.split('\\').last().unwrap_or(&base).to_string()
+        });
+        if !alias.is_empty() {
+            self.use_map.insert(alias, base);
+        }
+        self.skip_noise();
+        if self.peek() == b';' { self.advance(1); }
+    }
+
+    fn try_read_as_alias(&mut self) -> Option<String> {
+        self.skip_noise();
+        let saved = self.pos;
+        if !is_word_start(self.peek()) { return None; }
+        let w = self.read_word();
+        if w == b"as" {
+            self.skip_noise();
+            if is_word_start(self.peek()) {
+                let alias = self.read_word();
+                return Some(std::str::from_utf8(alias).unwrap_or("").to_string());
+            }
+        }
+        self.pos = saved;
+        None
+    }
+
+    fn skip_to_semicolon(&mut self) {
+        while !self.is_eof() && self.peek() != b';' {
+            self.advance(1);
+        }
+        if self.peek() == b';' { self.advance(1); }
+    }
+
+    /// Resolve a bare (non-absolute) PHP type hint to a FQCN using
+    /// the current namespace and file-level use imports.
+    fn resolve_type(&self, raw: &str) -> String {
+        // Primitives stay as-is — they are never FQCNs.
+        if is_primitive_type(raw) {
+            return raw.to_string();
+        }
+        // The first segment determines whether there's a use-import match.
+        let first = raw.split('\\').next().unwrap_or(raw);
+        if let Some(mapped) = self.use_map.get(first) {
+            if raw.contains('\\') {
+                // e.g. `use Foo\Bar;` + type `Bar\Baz` → `Foo\Bar\Baz`
+                let rest = &raw[first.len() + 1..];
+                return format!("{}\\{}", mapped, rest);
+            }
+            return mapped.clone();
+        }
+        // Relative to current namespace.
+        if self.namespace.is_empty() {
+            raw.to_string()
+        } else {
+            format!("{}\\{}", self.namespace, raw)
+        }
+    }
+
     fn read_class_header(
         &mut self,
         extends: &mut Option<String>,
@@ -417,7 +559,8 @@ impl<'a> Scanner<'a> {
 
     fn read_fqn(&mut self) -> Result<String, LexError> {
         self.skip_noise();
-        if self.peek() == b'\\' {
+        let absolute = self.peek() == b'\\';
+        if absolute {
             self.advance(1);
         }
         let mut fqn = String::new();
@@ -432,6 +575,9 @@ impl<'a> Scanner<'a> {
             } else {
                 break;
             }
+        }
+        if !absolute && !fqn.is_empty() {
+            fqn = self.resolve_type(&fqn);
         }
         Ok(fqn)
     }
@@ -762,7 +908,8 @@ impl<'a> Scanner<'a> {
         if !is_word_start(b) && b != b'\\' {
             return Ok(None);
         }
-        if self.peek() == b'\\' { self.advance(1); }
+        let absolute = self.peek() == b'\\';
+        if absolute { self.advance(1); }
         let start = self.pos;
         while !self.is_eof() && (is_word_char(self.peek()) || self.peek() == b'\\') {
             self.advance(1);
@@ -771,22 +918,29 @@ impl<'a> Scanner<'a> {
         if raw_type.is_empty() { return Ok(None); }
 
         if self.peek() == b'|' {
-            let mut parts: Vec<String> = vec![raw_type];
+            // Union type: pick first non-null, non-bool part, resolve it.
+            let first_part = if absolute { raw_type.clone() } else { self.resolve_type(&raw_type) };
+            let mut parts: Vec<String> = vec![first_part];
             while self.peek() == b'|' {
                 self.advance(1);
-                if self.peek() == b'\\' { self.advance(1); }
+                let part_abs = self.peek() == b'\\';
+                if part_abs { self.advance(1); }
                 let pstart = self.pos;
                 while !self.is_eof() && (is_word_char(self.peek()) || self.peek() == b'\\') {
                     self.advance(1);
                 }
                 let part = std::str::from_utf8(&self.src[pstart..self.pos]).unwrap_or("").to_string();
-                if !part.is_empty() { parts.push(part); }
+                if !part.is_empty() {
+                    let resolved = if part_abs { part } else { self.resolve_type(&part) };
+                    parts.push(resolved);
+                }
             }
             let first = parts.into_iter().find(|p| p != "null" && p != "false" && p != "true");
             return Ok(first);
         }
 
-        Ok(Some(raw_type))
+        let resolved = if absolute { raw_type } else { self.resolve_type(&raw_type) };
+        Ok(Some(resolved))
     }
 
     fn read_return_type(&mut self) -> Result<String, LexError> {
@@ -961,7 +1115,8 @@ mod tests {
             "<?php\nnamespace Foo;\nclass Bar extends \\Base\\Foo implements \\My\\Iface, Other {}",
         ).unwrap();
         assert_eq!(info.extends.as_deref(), Some("Base\\Foo"));
-        assert_eq!(info.implements, vec!["My\\Iface", "Other"]);
+        // `Other` has no `use` import and no leading `\`, so it resolves to `Foo\Other`
+        assert_eq!(info.implements, vec!["My\\Iface", "Foo\\Other"]);
     }
 
     #[test]
@@ -1051,7 +1206,8 @@ class Bar {
     public function __construct(Baz|null $dep = null) {}
 }"#).unwrap();
         let ctor = info.constructor.unwrap();
-        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Baz"));
+        // `Baz` in namespace `Foo` resolves to `Foo\Baz`
+        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Foo\\Baz"));
         assert!(ctor.params[0].is_optional);
     }
 

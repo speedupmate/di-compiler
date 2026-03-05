@@ -26,7 +26,7 @@ use code_generator::{
 use di_resolver::{
     detect_factories, detect_interceptors, detect_proxies, resolve_all_arguments,
 };
-use di_xml_reader::{find_di_xml_files, find_di_xml_files_for_area, merge_configs, merge_into, parse_di_xml};
+use di_xml_reader::{find_di_xml_files, find_di_xml_files_for_area, find_all_di_xml_files, merge_configs, merge_into, parse_di_xml};
 use php_extractor::{
     types::{ClassInfo, ExtractResult},
     walker::{read_module_paths, walk_php_files},
@@ -225,19 +225,15 @@ fn main() {
     );
 
     // -----------------------------------------------------------------------
-    // Phase 3: Parse + merge di.xml files
+    // Phase 3a: Parse + merge global di.xml files (for per-area metadata)
     // -----------------------------------------------------------------------
     let di_xml_files = find_di_xml_files(&magento_root);
-    log::info!("Found {} di.xml files", di_xml_files.len());
+    log::info!("Found {} di.xml files (global)", di_xml_files.len());
 
-    let pb = progress_bar(di_xml_files.len() as u64, "Parsing di.xml");
-    let di_configs: Vec<_> = di_xml_files
+    let pb = progress_bar(di_xml_files.len() as u64, "Parsing di.xml (global)");
+    let global_di_configs: Vec<_> = di_xml_files
         .par_iter()
         .filter_map(|path| {
-            // Incremental: if this di.xml hasn't changed since last run, skip it.
-            // NOTE: this skips the file from contributing to the merge, which means
-            // we need ALL files to be cached to use this optimization correctly.
-            // We only skip if the full set was cached (cache has same count as files).
             if args.incremental && cache_ref.is_unchanged(path) {
                 pb.inc(1);
                 return None;
@@ -255,29 +251,64 @@ fn main() {
         .collect();
     pb.finish_with_message("done");
 
-    let di_config = merge_configs(di_configs);
+    let di_config = merge_configs(global_di_configs);
+
+    // -----------------------------------------------------------------------
+    // Phase 3b: Parse + merge ALL di.xml files (all areas) for detection
+    //
+    // Interceptor/factory/proxy detection must consider plugins registered in
+    // area-specific di.xml files (e.g. etc/adminhtml/di.xml), not just global.
+    // -----------------------------------------------------------------------
+    let all_di_xml_files = find_all_di_xml_files(&magento_root);
+    log::info!("Found {} di.xml files (all areas)", all_di_xml_files.len());
+
+    // Only parse files not already in the global set
+    let extra_di_files: Vec<_> = all_di_xml_files
+        .iter()
+        .filter(|p| !di_xml_files.contains(p))
+        .collect();
+
+    let extra_configs: Vec<_> = extra_di_files
+        .par_iter()
+        .filter_map(|path| {
+            parse_di_xml(path).ok()
+        })
+        .collect();
+
+    let full_di_config = if extra_configs.is_empty() {
+        di_config.clone()
+    } else {
+        let mut full = di_config.clone();
+        let extra_merged = merge_configs(extra_configs);
+        merge_into(&mut full, extra_merged);
+        full
+    };
+
     log::info!(
-        "DI config: {} preferences, {} plugins, {} virtualTypes",
+        "DI config: {} preferences, {} plugins, {} virtualTypes (global: {}/{}/{})",
+        full_di_config.preferences.len(),
+        full_di_config.plugins.len(),
+        full_di_config.virtual_types.len(),
         di_config.preferences.len(),
         di_config.plugins.len(),
-        di_config.virtual_types.len()
+        di_config.virtual_types.len(),
     );
 
     // -----------------------------------------------------------------------
-    // Phase 4: Detection
+    // Phase 4: Detection (uses full_di_config = all areas merged)
     // -----------------------------------------------------------------------
-    let interceptors = detect_interceptors(&class_map, &di_config);
-    let factories = detect_factories(&class_map, &di_config);
-    let proxies = detect_proxies(&class_map, &di_config);
+    let interceptors = detect_interceptors(&class_map, &full_di_config);
+    let factories = detect_factories(&class_map, &full_di_config);
+    let proxies = detect_proxies(&class_map, &full_di_config);
     log::info!(
         "Detected: {} interceptors, {} factories, {} proxies",
         interceptors.len(), factories.len(), proxies.len()
     );
 
     // -----------------------------------------------------------------------
-    // Phase 5: Resolve arguments
+    // Phase 5: Resolve arguments (global config for per-area override later)
     // -----------------------------------------------------------------------
-    let args_map = resolve_all_arguments(&class_map, &di_config);
+    let args_map = resolve_all_arguments(&class_map, &di_config);  // global only; per-area overrides applied later
     log::info!("Resolved arguments for {} classes", args_map.len());
 
     // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
@@ -403,7 +434,7 @@ fn main() {
 
     // Update incremental cache
     if args.incremental {
-        for path in &di_xml_files {
+        for path in &all_di_xml_files {
             cache.record(path);
         }
         cache.save(&cache_path);

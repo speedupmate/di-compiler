@@ -40,6 +40,38 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
         paths.push(framework);
     }
 
+    // Other third-party vendor modules: vendor/{vendor}/{module}/registration.php
+    // Some modules nest their source under a `src/` subdirectory.
+    let vendor_dir = magento_root.join("vendor");
+    if let Ok(vendors) = std::fs::read_dir(&vendor_dir) {
+        for vendor in vendors.flatten() {
+            if vendor.file_name().to_str().map(|s| s == "magento").unwrap_or(false) {
+                continue; // already handled above
+            }
+            let vpath = vendor.path();
+            if !vpath.is_dir() {
+                continue;
+            }
+            if let Ok(modules) = std::fs::read_dir(&vpath) {
+                for module in modules.flatten() {
+                    let mpath = module.path();
+                    if !mpath.is_dir() {
+                        continue;
+                    }
+                    // Direct registration.php
+                    if mpath.join("registration.php").exists() {
+                        paths.push(mpath.clone());
+                    }
+                    // Nested src/registration.php (e.g. hyva-themes pattern)
+                    let src = mpath.join("src");
+                    if src.is_dir() && src.join("registration.php").exists() {
+                        paths.push(src);
+                    }
+                }
+            }
+        }
+    }
+
     paths.sort();
     paths.dedup();
     paths

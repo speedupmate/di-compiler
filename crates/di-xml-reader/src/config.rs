@@ -135,6 +135,35 @@ pub fn find_di_xml_files_for_area(
     collect_di_xml_files(magento_root, Some(area))
 }
 
+/// Collect ALL di.xml files from all areas (global + every area).
+///
+/// Used when detecting which classes need interceptors/factories/proxies.
+/// Magento determines interception requirements by considering plugin
+/// registrations across ALL areas, not just the global scope.
+pub fn find_all_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    const AREAS: &[&str] = &[
+        "global", "frontend", "adminhtml", "crontab",
+        "webapi_rest", "webapi_soap", "graphql",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    // Global first
+    for p in collect_di_xml_files(magento_root, None) {
+        if seen.insert(p.clone()) {
+            result.push(p);
+        }
+    }
+    // Then each area overlay
+    for area in AREAS {
+        for p in collect_di_xml_files(magento_root, Some(area)) {
+            if seen.insert(p.clone()) {
+                result.push(p);
+            }
+        }
+    }
+    result
+}
+
 /// Internal: collect di.xml files with optional area overlay.
 ///
 /// Each entry is `(priority, path)` where priority controls merge order.
