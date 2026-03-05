@@ -24,13 +24,17 @@ use code_generator::{
     interceptor_path, proxy_path, serialize_interception_php, write_if_changed, AREAS,
 };
 use di_resolver::{
-    detect_factories, detect_interceptors, detect_proxies, resolve_all_arguments,
+    detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs,
+    resolve_all_arguments,
 };
-use di_xml_reader::{find_di_xml_files, find_di_xml_files_for_area, find_all_di_xml_files, merge_configs, merge_into, parse_di_xml};
+use di_xml_reader::{
+    find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs,
+    merge_into, parse_di_xml,
+};
 use php_extractor::{
+    extract_file,
     types::{ClassInfo, ExtractResult},
     walker::{read_module_paths, walk_php_files},
-    extract_file,
 };
 
 #[derive(Parser, Debug)]
@@ -107,8 +111,12 @@ impl IncrementalCache {
 
     fn is_unchanged(&self, path: &Path) -> bool {
         let key = path.to_string_lossy().to_string();
-        let Some(cached) = self.files.get(&key) else { return false };
-        let Some(current) = Self::hash_of(path) else { return false };
+        let Some(cached) = self.files.get(&key) else {
+            return false;
+        };
+        let Some(current) = Self::hash_of(path) else {
+            return false;
+        };
         *cached == current
     }
 
@@ -153,7 +161,10 @@ fn main() {
             .unwrap_or_default();
     }
 
-    let magento_root = args.magento_root.canonicalize().unwrap_or(args.magento_root.clone());
+    let magento_root = args
+        .magento_root
+        .canonicalize()
+        .unwrap_or(args.magento_root.clone());
     let generated_root = args
         .output
         .clone()
@@ -221,7 +232,9 @@ fn main() {
     let failures = failure_count.load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
         "Extracted {} classes  ({} fallbacks, {} failures)",
-        class_map.len(), fallbacks, failures
+        class_map.len(),
+        fallbacks,
+        failures
     );
 
     // -----------------------------------------------------------------------
@@ -251,7 +264,7 @@ fn main() {
         .collect();
     pb.finish_with_message("done");
 
-    let di_config = merge_configs(global_di_configs);
+    let di_config = merge_configs(global_di_configs.clone());
 
     // -----------------------------------------------------------------------
     // Phase 3b: Parse + merge ALL di.xml files (all areas) for detection
@@ -270,10 +283,11 @@ fn main() {
 
     let extra_configs: Vec<_> = extra_di_files
         .par_iter()
-        .filter_map(|path| {
-            parse_di_xml(path).ok()
-        })
+        .filter_map(|path| parse_di_xml(path).ok())
         .collect();
+
+    let mut scanner_di_configs = global_di_configs.clone();
+    scanner_di_configs.extend(extra_configs.clone());
 
     let full_di_config = if extra_configs.is_empty() {
         di_config.clone()
@@ -298,17 +312,19 @@ fn main() {
     // Phase 4: Detection (uses full_di_config = all areas merged)
     // -----------------------------------------------------------------------
     let interceptors = detect_interceptors(&class_map, &full_di_config);
-    let factories = detect_factories(&class_map, &full_di_config);
-    let proxies = detect_proxies(&class_map, &full_di_config);
+    let factories = detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs);
+    let proxies = detect_proxies_from_configs(&class_map, &scanner_di_configs);
     log::info!(
         "Detected: {} interceptors, {} factories, {} proxies",
-        interceptors.len(), factories.len(), proxies.len()
+        interceptors.len(),
+        factories.len(),
+        proxies.len()
     );
 
     // -----------------------------------------------------------------------
     // Phase 5: Resolve arguments (global config for per-area override later)
     // -----------------------------------------------------------------------
-    let args_map = resolve_all_arguments(&class_map, &di_config);  // global only; per-area overrides applied later
+    let args_map = resolve_all_arguments(&class_map, &di_config); // global only; per-area overrides applied later
     log::info!("Resolved arguments for {} classes", args_map.len());
 
     // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
@@ -482,8 +498,5 @@ fn print_summary(
     println!("  Factories:      {}", factories.len());
     println!("  Proxies:        {}", proxies.len());
     println!("  Classes with resolved args: {}", args_map.len());
-    println!(
-        "  Total FQCNs (for interception.php): {}",
-        all_fqcns.len()
-    );
+    println!("  Total FQCNs (for interception.php): {}", all_fqcns.len());
 }

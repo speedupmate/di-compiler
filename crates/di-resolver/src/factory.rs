@@ -3,10 +3,6 @@
 //! Factory: generated when a constructor param type ends with `Factory` and that
 //!   class does not already exist on disk (not in class_map).
 //!
-//! Proxy: generated when:
-//!   1. A constructor param type ends with `\Proxy` (and not in class_map), OR
-//!   2. A di.xml `<argument xsi:type="object">` value ends with `\Proxy` (and not in class_map)
-//!
 //! This module handles factory detection; proxy detection is in proxy.rs.
 
 use std::collections::HashMap;
@@ -14,7 +10,7 @@ use std::collections::HashMap;
 use php_extractor::ClassInfo;
 
 use crate::graph::FactorySpec;
-use di_xml_reader::DiConfig;
+use di_xml_reader::{Argument, DiConfig};
 
 /// Detect factory classes to generate.
 ///
@@ -24,9 +20,54 @@ pub fn detect_factories(
     class_map: &HashMap<String, ClassInfo>,
     di_config: &DiConfig,
 ) -> Vec<FactorySpec> {
+    detect_factories_from_configs(class_map, di_config, std::slice::from_ref(di_config))
+}
+
+/// Detect factory classes using merged DI for preference resolution and
+/// raw per-file DI configs for XmlScanner-style candidate coverage.
+pub fn detect_factories_from_configs(
+    class_map: &HashMap<String, ClassInfo>,
+    merged_di_config: &DiConfig,
+    scanner_di_configs: &[DiConfig],
+) -> Vec<FactorySpec> {
     let mut specs: Vec<FactorySpec> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let virtual_type_names: std::collections::HashSet<&str> = scanner_di_configs
+        .iter()
+        .flat_map(|cfg| cfg.virtual_types.keys().map(String::as_str))
+        .collect();
 
+    let mut emit = |candidate: String| {
+        let Some(factory_fqcn) = first_non_null_type_hint_arm(&candidate) else {
+            return;
+        };
+        if !factory_fqcn.ends_with("Factory") {
+            return;
+        }
+        // Magento XmlScanner excludes virtual type names from factory candidates.
+        if virtual_type_names.contains(factory_fqcn.as_str()) {
+            return;
+        }
+        if class_map.contains_key(&factory_fqcn) {
+            return;
+        }
+
+        let target = merged_di_config.get_preference(&factory_fqcn);
+        let target_fqcn = if target != factory_fqcn {
+            target
+        } else {
+            factory_fqcn[..factory_fqcn.len() - 7].to_string()
+        };
+
+        if seen.insert(factory_fqcn.clone()) {
+            specs.push(FactorySpec {
+                target_fqcn,
+                factory_fqcn,
+            });
+        }
+    };
+
+    // Path 1: constructor type hints.
     for info in class_map.values() {
         let Some(ctor) = &info.constructor else {
             continue;
@@ -35,34 +76,17 @@ pub fn detect_factories(
             let Some(type_hint) = &param.type_hint else {
                 continue;
             };
-            let Some(type_hint) = first_non_null_type_hint_arm(type_hint) else {
-                continue;
-            };
-            // Must end with "Factory" but not be a built-in
-            if !type_hint.ends_with("Factory") {
-                continue;
-            }
-            // Resolve via preferences
-            let target = di_config.get_preference(&type_hint);
-            let factory_fqcn = type_hint;
+            emit(type_hint.clone());
+        }
+    }
 
-            // Skip if already exists
-            if class_map.contains_key(&factory_fqcn) {
-                continue;
-            }
-            // The target class is the name minus "Factory" suffix
-            let target_fqcn = if target != factory_fqcn {
-                target
-            } else {
-                // Strip "Factory" suffix to get the target
-                factory_fqcn[..factory_fqcn.len() - 7].to_string()
-            };
-
-            if seen.insert(factory_fqcn.clone()) {
-                specs.push(FactorySpec {
-                    target_fqcn,
-                    factory_fqcn,
-                });
+    // Path 2: XML argument/item object values.
+    for cfg in scanner_di_configs {
+        for tc in cfg.type_configs.values() {
+            let mut candidates = Vec::new();
+            collect_factory_candidates_from_args(&tc.arguments, &mut candidates);
+            for candidate in candidates {
+                emit(candidate);
             }
         }
     }
@@ -82,9 +106,20 @@ fn first_non_null_type_hint_arm(type_hint: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn collect_factory_candidates_from_args(args: &[Argument], out: &mut Vec<String>) {
+    for arg in args {
+        match arg {
+            Argument::Object { value, .. } => out.push(value.clone()),
+            Argument::Array { items, .. } => collect_factory_candidates_from_args(items, out),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use di_xml_reader::{Argument, TypeConfig, VirtualType};
     use php_extractor::types::{ClassInfo, ClassKind, Constructor, ConstructorParam};
     use std::path::PathBuf;
 
@@ -174,5 +209,88 @@ mod tests {
         let specs = detect_factories(&class_map, &di_config);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].factory_fqcn, "Foo\\Baz\\WidgetFactory");
+    }
+
+    #[test]
+    fn test_factory_from_xml_argument_object() {
+        let class_map = HashMap::new();
+        let mut di_config = DiConfig::default();
+        di_config.type_configs.insert(
+            "Foo\\Service".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Object {
+                    name: "factory".to_string(),
+                    value: "Foo\\Baz\\WidgetFactory".to_string(),
+                    shared: None,
+                }],
+            },
+        );
+        let specs = detect_factories(&class_map, &di_config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].factory_fqcn, "Foo\\Baz\\WidgetFactory");
+    }
+
+    #[test]
+    fn test_factory_virtual_type_name_is_skipped() {
+        let class_map = HashMap::new();
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "Foo\\Baz\\WidgetFactory".to_string(),
+            VirtualType {
+                name: "Foo\\Baz\\WidgetFactory".to_string(),
+                type_name: "Foo\\Real\\Type".to_string(),
+            },
+        );
+        di_config.type_configs.insert(
+            "Foo\\Service".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Object {
+                    name: "factory".to_string(),
+                    value: "Foo\\Baz\\WidgetFactory".to_string(),
+                    shared: None,
+                }],
+            },
+        );
+        let specs = detect_factories(&class_map, &di_config);
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn test_factory_scanner_preserves_candidates_across_file_overrides() {
+        let class_map = HashMap::new();
+
+        let mut cfg1 = DiConfig::default();
+        cfg1.type_configs.insert(
+            "Foo\\Service".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Object {
+                    name: "factory".to_string(),
+                    value: "Foo\\One\\WidgetFactory".to_string(),
+                    shared: None,
+                }],
+            },
+        );
+
+        let mut cfg2 = DiConfig::default();
+        cfg2.type_configs.insert(
+            "Foo\\Service".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Object {
+                    name: "factory".to_string(),
+                    value: "Foo\\Two\\WidgetFactory".to_string(),
+                    shared: None,
+                }],
+            },
+        );
+
+        let merged_di_config = cfg2.clone();
+        let specs = detect_factories_from_configs(&class_map, &merged_di_config, &[cfg1, cfg2]);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].factory_fqcn, "Foo\\One\\WidgetFactory");
+        assert_eq!(specs[1].factory_fqcn, "Foo\\Two\\WidgetFactory");
     }
 }
