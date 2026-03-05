@@ -1,0 +1,17 @@
+[package]
+name = "php-extractor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+rayon.workspace = true
+ignore.workspace = true
+memmap2.workspace = true
+tree-sitter.workspace = true
+tree-sitter-php.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true

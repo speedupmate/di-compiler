@@ -1,0 +1,16 @@
+[package]
+name = "code-generator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+di-resolver = { path = "../di-resolver" }
+php-extractor = { path = "../php-extractor" }
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true

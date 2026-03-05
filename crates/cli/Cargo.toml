@@ -1,0 +1,23 @@
+[package]
+name = "fast-di-compile"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fast-di-compile"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+indicatif.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+php-extractor = { path = "../php-extractor" }
+di-xml-reader = { path = "../di-xml-reader" }
+di-resolver = { path = "../di-resolver" }
+code-generator = { path = "../code-generator" }
+validator = { path = "../validator" }

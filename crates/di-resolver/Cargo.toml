@@ -1,0 +1,13 @@
+[package]
+name = "di-resolver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+di-xml-reader = { path = "../di-xml-reader" }
+php-extractor = { path = "../php-extractor" }
+
+[dev-dependencies]
+insta.workspace = true
