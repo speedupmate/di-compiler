@@ -1,5 +1,37 @@
+//! TKT-024/025/026: fast-di-compile CLI binary.
+//!
+//! Phases:
+//!   1. Walk all PHP files (rayon parallel — TKT-025)
+//!   2. Extract ClassInfo (3-tier: lexer → tree-sitter → PHP shell)
+//!   3. Parse + merge all di.xml files
+//!   4. Detect interceptors / factories / proxies
+//!   5. Resolve constructor arguments
+//!   6. Generate PHP code files (interceptors, factories, proxies)
+//!   7. Generate metadata files (area configs, interception.php)
+//!   8. Incremental writes (skip unchanged — TKT-022/026)
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
 use clap::Parser;
-use std::path::PathBuf;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use code_generator::{
+    factory_path, generate_area_config, generate_factory, generate_interceptor, generate_proxy,
+    interceptor_path, proxy_path, serialize_interception_php, write_if_changed, AREAS,
+};
+use di_resolver::{
+    detect_factories, detect_interceptors, detect_proxies, resolve_all_arguments,
+};
+use di_xml_reader::{find_di_xml_files, merge_configs, parse_di_xml};
+use php_extractor::{
+    types::{ClassInfo, ExtractResult},
+    walker::{read_module_paths, walk_php_files},
+    extract_file,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -23,11 +55,15 @@ struct Args {
     #[arg(long)]
     validate: bool,
 
+    /// PHP ground-truth generated dir (used with --validate)
+    #[arg(long)]
+    php_generated: Option<PathBuf>,
+
     /// Output directory (default: <magento-root>/generated)
     #[arg(long)]
     output: Option<PathBuf>,
 
-    /// Enable incremental compilation
+    /// Enable incremental compilation (skip unchanged files)
     #[arg(long)]
     incremental: bool,
 
@@ -40,6 +76,53 @@ struct Args {
     verbose: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Incremental cache (TKT-026)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Default)]
+struct IncrementalCache {
+    /// Map of absolute path → blake3 hex hash of that file at last compile
+    files: HashMap<String, String>,
+}
+
+impl IncrementalCache {
+    fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    fn hash_of(path: &Path) -> Option<String> {
+        let data = std::fs::read(path).ok()?;
+        Some(blake3::hash(&data).to_hex().to_string())
+    }
+
+    fn is_unchanged(&self, path: &Path) -> bool {
+        let key = path.to_string_lossy().to_string();
+        let Some(cached) = self.files.get(&key) else { return false };
+        let Some(current) = Self::hash_of(path) else { return false };
+        *cached == current
+    }
+
+    fn record(&mut self, path: &Path) {
+        if let Some(hash) = Self::hash_of(path) {
+            self.files.insert(path.to_string_lossy().to_string(), hash);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 fn main() {
     let args = Args::parse();
 
@@ -51,9 +134,281 @@ fn main() {
         })
         .init();
 
-    log::info!("fast-di-compile starting (magento_root: {})", args.magento_root.display());
+    // Configure rayon thread pool
+    if let Some(jobs) = args.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build_global()
+            .unwrap_or_default();
+    }
 
-    // TODO: wire up all phases in TKT-024
-    eprintln!("fast-di-compile: not yet implemented");
-    std::process::exit(1);
+    let magento_root = args.magento_root.canonicalize().unwrap_or(args.magento_root.clone());
+    let generated_root = args
+        .output
+        .clone()
+        .unwrap_or_else(|| magento_root.join("generated"));
+    let code_root = generated_root.join("code");
+    let metadata_root = generated_root.join("metadata");
+
+    log::info!(
+        "fast-di-compile starting\n  magento_root: {}\n  output:       {}",
+        magento_root.display(),
+        generated_root.display()
+    );
+
+    // Incremental cache
+    let cache_path = generated_root.join(".di-compiler-cache.json");
+    let mut cache = if args.incremental {
+        IncrementalCache::load(&cache_path)
+    } else {
+        IncrementalCache::default()
+    };
+
+    // -----------------------------------------------------------------------
+    // Phase 1 + 2: Walk PHP files + extract ClassInfo (parallel)
+    // -----------------------------------------------------------------------
+    let module_paths = read_module_paths(&magento_root);
+    let php_files = walk_php_files(&module_paths);
+    log::info!("Found {} PHP files", php_files.len());
+
+    let pb = progress_bar(php_files.len() as u64, "Extracting PHP classes");
+
+    let class_map: Arc<Mutex<HashMap<String, ClassInfo>>> = Arc::new(Mutex::new(HashMap::new()));
+    let fallback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failure_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    php_files.par_iter().for_each(|path| {
+        // Incremental: skip unchanged files if we already have their data
+        // (we can't really skip extraction here without a cache of ClassInfo,
+        //  so incremental for PHP extraction is a future optimization)
+        let result = extract_file(path);
+        pb.inc(1);
+        match result {
+            ExtractResult::Ok(info) => {
+                let mut map = class_map.lock().unwrap();
+                map.insert(info.fqcn.clone(), info);
+            }
+            ExtractResult::NoClass => {}
+            ExtractResult::PhpFallbackFailed(e) => {
+                fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!("Fallback failed for {}: {}", path.display(), e);
+            }
+            ExtractResult::LexError(e) => {
+                failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!("Lex error for {}: {e}", path.display());
+            }
+            ExtractResult::ParseFailure(e) => {
+                failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!("Parse failure for {}: {}", path.display(), e);
+            }
+        }
+    });
+    pb.finish_with_message("done");
+
+    let class_map = Arc::try_unwrap(class_map).unwrap().into_inner().unwrap();
+    let fallbacks = fallback_count.load(std::sync::atomic::Ordering::Relaxed);
+    let failures = failure_count.load(std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "Extracted {} classes  ({} fallbacks, {} failures)",
+        class_map.len(), fallbacks, failures
+    );
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Parse + merge di.xml files
+    // -----------------------------------------------------------------------
+    let di_xml_files = find_di_xml_files(&magento_root);
+    log::info!("Found {} di.xml files", di_xml_files.len());
+
+    let pb = progress_bar(di_xml_files.len() as u64, "Parsing di.xml");
+    let di_configs: Vec<_> = di_xml_files
+        .par_iter()
+        .filter_map(|path| {
+            let r = parse_di_xml(path);
+            pb.inc(1);
+            match r {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    log::warn!("di.xml parse error {}: {e}", path.display());
+                    None
+                }
+            }
+        })
+        .collect();
+    pb.finish_with_message("done");
+
+    let di_config = merge_configs(di_configs);
+    log::info!(
+        "DI config: {} preferences, {} plugins, {} virtualTypes",
+        di_config.preferences.len(),
+        di_config.plugins.len(),
+        di_config.virtual_types.len()
+    );
+
+    // -----------------------------------------------------------------------
+    // Phase 4: Detection
+    // -----------------------------------------------------------------------
+    let interceptors = detect_interceptors(&class_map, &di_config);
+    let factories = detect_factories(&class_map, &di_config);
+    let proxies = detect_proxies(&class_map, &di_config);
+    log::info!(
+        "Detected: {} interceptors, {} factories, {} proxies",
+        interceptors.len(), factories.len(), proxies.len()
+    );
+
+    // -----------------------------------------------------------------------
+    // Phase 5: Resolve arguments
+    // -----------------------------------------------------------------------
+    let args_map = resolve_all_arguments(&class_map, &di_config);
+    log::info!("Resolved arguments for {} classes", args_map.len());
+
+    // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
+    let intercepted_set: std::collections::HashSet<&str> =
+        interceptors.iter().map(|s| s.fqcn.as_str()).collect();
+    let all_fqcns: HashMap<String, bool> = class_map
+        .keys()
+        .map(|fqcn| {
+            let intercepted = intercepted_set.contains(fqcn.as_str());
+            (fqcn.clone(), intercepted)
+        })
+        .collect();
+
+    if args.dry_run {
+        log::info!("Dry run — skipping file writes");
+        print_summary(&interceptors, &factories, &proxies, &args_map, &all_fqcns);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: Generate PHP code files (parallel)
+    // -----------------------------------------------------------------------
+    let pb = progress_bar(
+        (interceptors.len() + factories.len() + proxies.len()) as u64,
+        "Generating code",
+    );
+    let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Interceptors
+    interceptors.par_iter().for_each(|spec| {
+        let info = class_map.get(&spec.fqcn);
+        let content = generate_interceptor(spec, info);
+        let rel = interceptor_path(&spec.fqcn);
+        let out_path = code_root.join(&rel);
+        if let Ok(changed) = write_if_changed(&out_path, &content) {
+            if changed {
+                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        pb.inc(1);
+    });
+
+    // Factories
+    factories.par_iter().for_each(|spec| {
+        let content = generate_factory(spec);
+        let rel = factory_path(&spec.factory_fqcn);
+        let out_path = code_root.join(&rel);
+        if let Ok(changed) = write_if_changed(&out_path, &content) {
+            if changed {
+                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        pb.inc(1);
+    });
+
+    // Proxies
+    proxies.par_iter().for_each(|spec| {
+        let target_info = class_map.get(&spec.target_fqcn);
+        let content = generate_proxy(spec, target_info);
+        let rel = proxy_path(&spec.proxy_fqcn);
+        let out_path = code_root.join(&rel);
+        if let Ok(changed) = write_if_changed(&out_path, &content) {
+            if changed {
+                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        pb.inc(1);
+    });
+    pb.finish_with_message("done");
+
+    // -----------------------------------------------------------------------
+    // Phase 7: Generate metadata files
+    // -----------------------------------------------------------------------
+    log::info!("Generating metadata files");
+
+    // interception.php
+    let interception_content = serialize_interception_php(&all_fqcns);
+    let interception_path = metadata_root.join("interception.php");
+    let _ = write_if_changed(&interception_path, &interception_content);
+
+    // Per-area config files
+    for area in AREAS {
+        // For now all areas get the same merged global config
+        // (area-specific merging is a future enhancement)
+        let area_content = generate_area_config(&args_map, &di_config);
+        let area_path = metadata_root.join(format!("{}.php", area));
+        let _ = write_if_changed(&area_path, &area_content);
+    }
+
+    let total_written = written.load(std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "Code generation complete: {} files written, {} unchanged",
+        total_written,
+        interceptors.len() + factories.len() + proxies.len() - total_written
+    );
+
+    // Update incremental cache
+    if args.incremental {
+        for path in &di_xml_files {
+            cache.record(path);
+        }
+        cache.save(&cache_path);
+        log::debug!("Incremental cache saved to {}", cache_path.display());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8: Validation (optional)
+    // -----------------------------------------------------------------------
+    if args.validate {
+        let php_gen = args
+            .php_generated
+            .as_deref()
+            .unwrap_or(&generated_root);
+        log::info!("Validating against {}", php_gen.display());
+        let result = validator::validate(php_gen, &generated_root);
+        println!("{}", result.summary());
+        if !result.is_clean() {
+            std::process::exit(1);
+        }
+    }
+
+    log::info!("fast-di-compile finished successfully");
+}
+
+fn progress_bar(len: u64, msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg} [{bar:40}] {pos}/{len} {elapsed}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb.set_message(msg.to_string());
+    pb
+}
+
+fn print_summary(
+    interceptors: &[di_resolver::InterceptorSpec],
+    factories: &[di_resolver::FactorySpec],
+    proxies: &[di_resolver::ProxySpec],
+    args_map: &HashMap<String, Vec<di_resolver::ResolvedArg>>,
+    all_fqcns: &HashMap<String, bool>,
+) {
+    println!("Dry run summary:");
+    println!("  Interceptors:   {}", interceptors.len());
+    println!("  Factories:      {}", factories.len());
+    println!("  Proxies:        {}", proxies.len());
+    println!("  Classes with resolved args: {}", args_map.len());
+    println!(
+        "  Total FQCNs (for interception.php): {}",
+        all_fqcns.len()
+    );
 }

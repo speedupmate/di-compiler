@@ -176,6 +176,7 @@ name = "code-generator"
 version = "0.1.0"
 dependencies = [
  "di-resolver",
+ "di-xml-reader",
  "insta",
  "log",
  "php-extractor",
@@ -329,6 +330,7 @@ dependencies = [
  "indicatif",
  "log",
  "php-extractor",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",
