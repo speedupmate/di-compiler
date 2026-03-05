@@ -16,16 +16,23 @@ Phase 03 complete (`ResolvedGraph` validated).
 - All interceptor/factory/proxy/repository PHP files generated correctly
 - Content-addressed writes in place (no unnecessary FS writes)
 
+## Current Status (2026-03-05)
+
+- Interceptor/factory/proxy generation exists.
+- Repository generation is currently a stub in Rust.
+- Area metadata + interception metadata generation exists.
+- Ground-truth parity is not yet closed; Phase 08 tracks remediation tickets.
+
 ## Features In This Phase
 
 | Feature | Deps |
 |---------|------|
-| [14-interceptor-codegen](./.features/14-interceptor-codegen.md) | 10, 13 |
-| [15-factory-codegen](./.features/15-factory-codegen.md) | 11 |
-| [16-proxy-codegen](./.features/16-proxy-codegen.md) | 12 |
-| [17-repository-codegen](./.features/17-repository-codegen.md) | 06, 09 |
-| [18-area-config-codegen](./.features/18-area-config-codegen.md) | 13 |
-| [19-metadata-php-serializer](./.features/19-metadata-php-serializer.md) | 13 |
+| [14-interceptor-codegen](../.features/14-interceptor-codegen.md) | 10, 13 |
+| [15-factory-codegen](../.features/15-factory-codegen.md) | 11 |
+| [16-proxy-codegen](../.features/16-proxy-codegen.md) | 12 |
+| [17-repository-codegen](../.features/17-repository-codegen.md) | 06, 09 |
+| [18-area-config-codegen](../.features/18-area-config-codegen.md) | 13 |
+| [19-metadata-php-serializer](../.features/19-metadata-php-serializer.md) | 13 |
 
 ## PHP Operations Covered
 

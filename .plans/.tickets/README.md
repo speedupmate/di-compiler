@@ -30,3 +30,11 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [024](TKT-024-cli-binary.md) | CLI binary | 06 | Ready | all |
 | [025](TKT-025-rayon-parallel-parse.md) | rayon parallel parse | 07 | Ready | 008, 022 |
 | [026](TKT-026-incremental-fingerprinting.md) | Incremental fingerprinting | 07 | Ready | 025 |
+| [027](TKT-027-metadata-syntax-and-scalar-parity.md) | Metadata syntax and scalar parity | 08 | Ready | 016, 023 |
+| [028](TKT-028-interceptor-namespace-structure-parity.md) | Interceptor namespace and structure parity | 08 | Ready | 017 |
+| [029](TKT-029-interceptor-method-and-signature-parity.md) | Interceptor method and signature parity | 08 | Ready | 028 |
+| [030](TKT-030-scanner-parity-xml-php.md) | Scanner parity for XML and PHP triggers | 08 | Ready | 014 |
+| [031](TKT-031-extension-attributes-and-service-data-generation.md) | Extension attributes and service data generation | 08 | Ready | 030 |
+| [032](TKT-032-plugin-list-metadata-generation.md) | Plugin-list metadata generation | 08 | Ready | 027, 030 |
+| [033](TKT-033-app-action-list-and-archive-layout-parity.md) | App action list and archive layout parity | 08 | Ready | 032 |
+| [034](TKT-034-runtime-map-coverage-and-final-diff-closure.md) | Runtime-map coverage and final diff closure | 08 | Ready | 031, 032, 033 |

@@ -19,9 +19,9 @@ Phase 00 complete (area-specific di.xml coverage confirmed, xsi:type varieties k
 
 | Feature | Deps |
 |---------|------|
-| [07-di-xml-parser](./.features/07-di-xml-parser.md) | TKT-001 |
-| [08-di-xml-merger](./.features/08-di-xml-merger.md) | 07 |
-| [09-di-config-model](./.features/09-di-config-model.md) | 08 |
+| [07-di-xml-parser](../.features/07-di-xml-parser.md) | TKT-001 |
+| [08-di-xml-merger](../.features/08-di-xml-merger.md) | 07 |
+| [09-di-config-model](../.features/09-di-config-model.md) | 08 |
 
 ## Merge Rules
 

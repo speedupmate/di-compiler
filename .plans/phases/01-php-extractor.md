@@ -20,13 +20,13 @@ Phase 00 complete — coverage gap table filled, constructor promotion count kno
 
 | Feature | Deps |
 |---------|------|
-| [01-workspace-scaffold](./.features/01-workspace-scaffold.md) | none |
-| [02-php-file-walker](./.features/02-php-file-walker.md) | 01 |
-| [03-php-lexer-tier1](./.features/03-php-lexer-tier1.md) | 01 |
-| [04-php-treesitter-tier2](./.features/04-php-treesitter-tier2.md) | 01 |
-| [05-php-fallback-tier3](./.features/05-php-fallback-tier3.md) | 01 |
-| [06-extract-result-type](./.features/06-extract-result-type.md) | 03–05 |
-| [22-snapshot-test-corpus](./.features/22-snapshot-test-corpus.md) | 06 |
+| [01-workspace-scaffold](../.features/01-workspace-scaffold.md) | none |
+| [02-php-file-walker](../.features/02-php-file-walker.md) | 01 |
+| [03-php-lexer-tier1](../.features/03-php-lexer-tier1.md) | 01 |
+| [04-php-treesitter-tier2](../.features/04-php-treesitter-tier2.md) | 01 |
+| [05-php-fallback-tier3](../.features/05-php-fallback-tier3.md) | 01 |
+| [06-extract-result-type](../.features/06-extract-result-type.md) | 03–05 |
+| [22-snapshot-test-corpus](../.features/22-snapshot-test-corpus.md) | 06 |
 
 ## Tickets In This Phase
 

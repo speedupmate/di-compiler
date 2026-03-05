@@ -20,7 +20,7 @@ Phases 01–05 complete (all crates functional, validator green).
 
 | Feature | Deps |
 |---------|------|
-| [21-cli-binary](./.features/21-cli-binary.md) | all crates |
+| [21-cli-binary](../.features/21-cli-binary.md) | all crates |
 
 ## CLI Interface
 

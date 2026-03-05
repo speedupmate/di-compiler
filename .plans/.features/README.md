@@ -29,3 +29,11 @@ One file per feature. Status values: Planned | In Progress | Implemented.
 | 22 | [snapshot-test-corpus](22-snapshot-test-corpus.md) | 01 | Planned |
 | 23 | [parallel-rayon](23-parallel-rayon.md) | 07 | Planned |
 | 24 | [incremental-fingerprinting](24-incremental-fingerprinting.md) | 07 | Planned |
+| 25 | [metadata-validity-parity](25-metadata-validity-parity.md) | 08 | Planned |
+| 26 | [interceptor-namespace-structure-parity](26-interceptor-namespace-structure-parity.md) | 08 | Planned |
+| 27 | [interceptor-method-signature-parity](27-interceptor-method-signature-parity.md) | 08 | Planned |
+| 28 | [scanner-parity-xml-php](28-scanner-parity-xml-php.md) | 08 | Planned |
+| 29 | [extension-attributes-generation](29-extension-attributes-generation.md) | 08 | Planned |
+| 30 | [plugin-list-metadata-generation](30-plugin-list-metadata-generation.md) | 08 | Planned |
+| 31 | [app-action-list-and-output-layout](31-app-action-list-and-output-layout.md) | 08 | Planned |
+| 32 | [runtime-map-generator-coverage](32-runtime-map-generator-coverage.md) | 08 | Planned |

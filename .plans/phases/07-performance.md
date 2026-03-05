@@ -9,6 +9,8 @@ Achieve < 5 s warm / < 15 s cold wall clock targets. Parallelize all safe phases
 
 TKT-023 green — validator reports zero diffs. Must not regress correctness.
 
+If parity is not yet green, performance work is exploratory only and must not be used as a release gate.
+
 ## Gate To Complete
 
 - `cargo bench` wall clock ≤ 5 s warm, ≤ 15 s cold on this Magento install
@@ -19,8 +21,8 @@ TKT-023 green — validator reports zero diffs. Must not regress correctness.
 
 | Feature | Deps |
 |---------|------|
-| [23-parallel-rayon](./.features/23-parallel-rayon.md) | 06, 22 |
-| [24-incremental-fingerprinting](./.features/24-incremental-fingerprinting.md) | 23 |
+| [23-parallel-rayon](../.features/23-parallel-rayon.md) | 06, 22 |
+| [24-incremental-fingerprinting](../.features/24-incremental-fingerprinting.md) | 23 |
 
 ## Profiling Approach
 

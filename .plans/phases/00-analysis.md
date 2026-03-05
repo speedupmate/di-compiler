@@ -33,7 +33,7 @@ None. This is the first phase.
 
 ## Features In This Phase
 
-- [00-ground-truth-capture](./.features/00-ground-truth-capture.md) — deps: none
+- [00-ground-truth-capture](../.features/00-ground-truth-capture.md) — deps: none
 
 ## Recommended External Tracker Shape
 

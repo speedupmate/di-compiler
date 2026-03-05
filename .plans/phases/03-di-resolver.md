@@ -22,10 +22,10 @@ Phase 01 (ClassInfo extraction) and Phase 02 (DiConfig merge) complete.
 
 | Feature | Deps |
 |---------|------|
-| [10-interceptor-detection](./.features/10-interceptor-detection.md) | 06, 09 |
-| [11-factory-detection](./.features/11-factory-detection.md) | 06, 09 |
-| [12-proxy-detection](./.features/12-proxy-detection.md) | 06, 09 |
-| [13-arguments-resolver](./.features/13-arguments-resolver.md) | 09, 06 |
+| [10-interceptor-detection](../.features/10-interceptor-detection.md) | 06, 09 |
+| [11-factory-detection](../.features/11-factory-detection.md) | 06, 09 |
+| [12-proxy-detection](../.features/12-proxy-detection.md) | 06, 09 |
+| [13-arguments-resolver](../.features/13-arguments-resolver.md) | 09, 06 |
 
 ## Key Resolution Rules
 
