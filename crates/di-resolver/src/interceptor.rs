@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use php_extractor::ClassInfo;
+use php_extractor::{ClassInfo, MethodSignature};
 
 use crate::graph::{InterceptorSpec, PluginRef};
 use di_xml_reader::DiConfig;
@@ -28,15 +28,16 @@ pub fn detect_interceptors(
     let mut directly_intercepted: HashSet<String> = HashSet::new();
 
     for (owner_name, plugins) in &di_config.plugins {
-        let active: Vec<&di_xml_reader::Plugin> =
-            plugins.iter().filter(|p| !p.disabled).collect();
+        let active: Vec<&di_xml_reader::Plugin> = plugins.iter().filter(|p| !p.disabled).collect();
         if active.is_empty() {
             continue;
         }
 
         // Resolve the concrete type to check is_final
         let concrete = di_config.get_instance_type(owner_name);
-        let info = class_map.get(&concrete).or_else(|| class_map.get(owner_name));
+        let info = class_map
+            .get(&concrete)
+            .or_else(|| class_map.get(owner_name));
 
         // Always record in directly_intercepted so concrete subclasses can inherit
         // via Phase 2. However, only generate an interceptor spec for classes that
@@ -74,7 +75,10 @@ pub fn detect_interceptors(
             .collect();
         plugin_refs.sort_by_key(|p| p.sort_order);
 
-        let public_methods = info.map(|i| i.public_methods.clone()).unwrap_or_default();
+        let intercepted_method_names =
+            derive_intercepted_methods_from_plugins(&plugin_refs, class_map, di_config);
+        let public_methods =
+            select_interceptor_methods(owner_name, class_map, Some(&intercepted_method_names));
 
         specs.push(InterceptorSpec {
             fqcn: owner_name.clone(),
@@ -90,8 +94,7 @@ pub fn detect_interceptors(
     // NOT already intercepted, walk its `extends` chain. If any ancestor is in
     // the intercepted set, this class also needs an interceptor.
     // -----------------------------------------------------------------------
-    let intercepted_set: HashSet<&str> =
-        directly_intercepted.iter().map(|s| s.as_str()).collect();
+    let intercepted_set: HashSet<&str> = directly_intercepted.iter().map(|s| s.as_str()).collect();
 
     // Build a cache to avoid repeated ancestor walks.
     // `ancestor_intercepted` memoizes: fqcn → bool
@@ -120,14 +123,113 @@ pub fn detect_interceptors(
         if has_intercepted_ancestor(fqcn, class_map, &intercepted_set, &mut ancestor_cache) {
             specs.push(InterceptorSpec {
                 fqcn: fqcn.clone(),
-                plugins: vec![],   // resolved at runtime by plugin framework
-                public_methods: info.public_methods.clone(),
+                plugins: vec![], // resolved at runtime by plugin framework
+                public_methods: select_interceptor_methods(fqcn, class_map, None),
             });
         }
     }
 
     specs.sort_by(|a, b| a.fqcn.cmp(&b.fqcn));
     specs
+}
+
+fn select_interceptor_methods(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+    intercepted_method_names: Option<&HashSet<String>>,
+) -> Vec<MethodSignature> {
+    let methods = collect_public_methods_with_inheritance(fqcn, class_map);
+    methods
+        .into_iter()
+        .filter(|m| is_interceptable_method(m))
+        .filter(|m| {
+            if let Some(names) = intercepted_method_names {
+                names.is_empty() || names.contains(&m.name)
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+fn collect_public_methods_with_inheritance(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> Vec<MethodSignature> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = Some(fqcn.to_string());
+
+    while let Some(current) = cursor {
+        let Some(info) = class_map.get(&current) else {
+            break;
+        };
+        for method in &info.public_methods {
+            if seen.insert(method.name.clone()) {
+                result.push(method.clone());
+            }
+        }
+        cursor = info.extends.clone();
+    }
+
+    result
+}
+
+fn derive_intercepted_methods_from_plugins(
+    plugins: &[PluginRef],
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> HashSet<String> {
+    let mut methods = HashSet::new();
+
+    for plugin in plugins {
+        let resolved_plugin_type = di_config.get_instance_type(&plugin.type_name);
+        let plugin_info = class_map
+            .get(&resolved_plugin_type)
+            .or_else(|| class_map.get(&plugin.type_name));
+        let Some(plugin_info) = plugin_info else {
+            continue;
+        };
+
+        for method in &plugin_info.public_methods {
+            if let Some(intercepted_method) = plugin_method_to_intercepted(&method.name) {
+                methods.insert(intercepted_method);
+            }
+        }
+    }
+
+    methods
+}
+
+fn plugin_method_to_intercepted(method: &str) -> Option<String> {
+    if let Some(rest) = method.strip_prefix("before") {
+        return lcfirst_nonempty(rest);
+    }
+    if let Some(rest) = method.strip_prefix("around") {
+        return lcfirst_nonempty(rest);
+    }
+    if let Some(rest) = method.strip_prefix("after") {
+        return lcfirst_nonempty(rest);
+    }
+    None
+}
+
+fn lcfirst_nonempty(s: &str) -> Option<String> {
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    let mut out = first.to_lowercase().to_string();
+    out.push_str(chars.as_str());
+    Some(out)
+}
+
+fn is_interceptable_method(method: &MethodSignature) -> bool {
+    if method.is_static {
+        return false;
+    }
+    !matches!(
+        method.name.as_str(),
+        "__construct" | "__destruct" | "__sleep" | "__wakeup" | "__clone" | "_resetState"
+    )
 }
 
 /// Walk the `extends` chain AND all `implements` interfaces of `fqcn`, returning
@@ -181,7 +283,7 @@ fn has_intercepted_ancestor<'a>(
 mod tests {
     use super::*;
     use di_xml_reader::{DiConfig, Plugin};
-    use php_extractor::types::{ClassInfo, ClassKind};
+    use php_extractor::types::{ClassInfo, ClassKind, MethodSignature};
     use std::path::PathBuf;
 
     fn make_class(fqcn: &str, is_final: bool) -> ClassInfo {
@@ -207,7 +309,22 @@ mod tests {
     }
 
     fn make_plugin(name: &str, type_name: &str, sort_order: i32, disabled: bool) -> Plugin {
-        Plugin { name: name.to_string(), type_name: type_name.to_string(), sort_order, disabled }
+        Plugin {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            sort_order,
+            disabled,
+        }
+    }
+
+    fn make_method(name: &str, is_static: bool) -> MethodSignature {
+        MethodSignature {
+            name: name.to_string(),
+            params: vec![],
+            return_type: None,
+            is_static,
+            returns_reference: false,
+        }
     }
 
     #[test]
@@ -230,9 +347,10 @@ mod tests {
         let mut class_map = HashMap::new();
         class_map.insert("Foo\\Final".to_string(), make_class("Foo\\Final", true));
         let mut di_config = DiConfig::default();
-        di_config
-            .plugins
-            .insert("Foo\\Final".to_string(), vec![make_plugin("p", "Foo\\P", 0, false)]);
+        di_config.plugins.insert(
+            "Foo\\Final".to_string(),
+            vec![make_plugin("p", "Foo\\P", 0, false)],
+        );
         let specs = detect_interceptors(&class_map, &di_config);
         assert!(specs.is_empty());
     }
@@ -242,9 +360,10 @@ mod tests {
         let mut class_map = HashMap::new();
         class_map.insert("Foo\\Bar".to_string(), make_class("Foo\\Bar", false));
         let mut di_config = DiConfig::default();
-        di_config
-            .plugins
-            .insert("Foo\\Bar".to_string(), vec![make_plugin("p", "Foo\\P", 0, true)]);
+        di_config.plugins.insert(
+            "Foo\\Bar".to_string(),
+            vec![make_plugin("p", "Foo\\P", 0, true)],
+        );
         let specs = detect_interceptors(&class_map, &di_config);
         assert!(specs.is_empty());
     }
@@ -300,10 +419,51 @@ mod tests {
         let mut di_config = DiConfig::default();
         di_config.plugins.insert(
             "Foo\\Bar".to_string(),
-            vec![make_plugin("b", "B", 20, false), make_plugin("a", "A", 10, false)],
+            vec![
+                make_plugin("b", "B", 20, false),
+                make_plugin("a", "A", 10, false),
+            ],
         );
         let specs = detect_interceptors(&class_map, &di_config);
         assert_eq!(specs[0].plugins[0].name, "a");
         assert_eq!(specs[0].plugins[1].name, "b");
+    }
+
+    #[test]
+    fn test_methods_filtered_by_plugin_method_list_and_skip_rules() {
+        let mut target = make_class("Foo\\Bar", false);
+        target.public_methods = vec![
+            make_method("run", false),
+            make_method("__sleep", false),
+            make_method("_resetState", false),
+            make_method("staticMethod", true),
+        ];
+
+        let mut plugin = make_class("Foo\\Plugin", false);
+        plugin.public_methods = vec![
+            make_method("beforeRun", false),
+            make_method("aroundRun", false),
+            make_method("afterRun", false),
+            make_method("beforeStaticMethod", false),
+        ];
+
+        let mut class_map = HashMap::new();
+        class_map.insert("Foo\\Bar".to_string(), target);
+        class_map.insert("Foo\\Plugin".to_string(), plugin);
+
+        let mut di_config = DiConfig::default();
+        di_config.plugins.insert(
+            "Foo\\Bar".to_string(),
+            vec![make_plugin("p", "Foo\\Plugin", 10, false)],
+        );
+
+        let specs = detect_interceptors(&class_map, &di_config);
+        assert_eq!(specs.len(), 1);
+        let names: Vec<&str> = specs[0]
+            .public_methods
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["run"]);
     }
 }

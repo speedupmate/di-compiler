@@ -46,19 +46,24 @@ pub fn generate_interceptor(spec: &InterceptorSpec, target_info: Option<&ClassIn
     }
 
     // Intercepted methods
-    for method in &spec.public_methods {
-        out.push_str(&render_intercepted_method(method));
+    let rendered_methods: Vec<String> = spec
+        .public_methods
+        .iter()
+        .filter_map(|method| render_intercepted_method(method))
+        .collect();
+    if !rendered_methods.is_empty() {
+        out.push_str(&rendered_methods.join("\n"));
     }
 
     out.push_str("}\n");
     out
 }
 
-fn render_intercepted_method(m: &MethodSignature) -> String {
+fn render_intercepted_method(m: &MethodSignature) -> Option<String> {
     // Magento's interceptor framework does not support static methods.
     // Skip them to avoid `$this` in static context errors.
     if m.is_static {
-        return String::new();
+        return None;
     }
 
     let is_void = m
@@ -69,10 +74,14 @@ fn render_intercepted_method(m: &MethodSignature) -> String {
 
     let mut s = String::new();
     s.push_str("    /**\n     * {@inheritdoc}\n     */\n");
-    s.push_str(&format!("    public function {}(", m.name));
+    let reference_prefix = if m.returns_reference { "& " } else { "" };
+    s.push_str(&format!(
+        "    public function {}{}(",
+        reference_prefix, m.name
+    ));
     s.push_str(&render_method_params(&m.params));
     if let Some(ret) = &m.return_type {
-        s.push_str(&format!(") : {}", ret));
+        s.push_str(&format!(") : {}", render_type_hint(ret)));
     } else {
         s.push(')');
     }
@@ -105,8 +114,8 @@ fn render_intercepted_method(m: &MethodSignature) -> String {
             m.name, m.name, arg_names.join(", ")
         ));
     }
-    s.push_str("    }\n\n");
-    s
+    s.push_str("    }\n");
+    Some(s)
 }
 
 fn render_params(params: &[php_extractor::types::ConstructorParam]) -> String {
@@ -116,11 +125,10 @@ fn render_params(params: &[php_extractor::types::ConstructorParam]) -> String {
             let mut s = String::new();
             if let Some(th) = &p.type_hint {
                 let rendered = render_type_hint(th);
-                if p.is_variadic {
-                    s.push_str(&format!("...{} ", rendered));
-                } else {
-                    s.push_str(&format!("{} ", rendered));
-                }
+                s.push_str(&format!("{} ", rendered));
+            }
+            if p.is_variadic {
+                s.push_str("...");
             }
             s.push_str(&format!("${}", p.name));
             if p.is_optional && !p.is_variadic {
@@ -153,11 +161,13 @@ fn render_method_params(params: &[MethodParam]) -> String {
             let mut s = String::new();
             if let Some(th) = &p.type_hint {
                 let rendered = render_type_hint(th);
-                if p.is_variadic {
-                    s.push_str(&format!("...{} ", rendered));
-                } else {
-                    s.push_str(&format!("{} ", rendered));
-                }
+                s.push_str(&format!("{} ", rendered));
+            }
+            if p.is_variadic {
+                s.push_str("...");
+            }
+            if p.is_by_ref {
+                s.push('&');
             }
             s.push_str(&format!("${}", p.name));
             if p.has_default && !p.is_variadic {
@@ -291,31 +301,66 @@ mod tests {
 
     #[test]
     fn test_static_method_skipped() {
-        use php_extractor::types::{MethodParam, MethodSignature};
+        use php_extractor::types::MethodSignature;
         let method = MethodSignature {
             name: "getInstance".to_string(),
             params: vec![],
             return_type: Some("self".to_string()),
             is_static: true,
+            returns_reference: false,
         };
         let result = render_intercepted_method(&method);
-        assert!(result.is_empty(), "static methods must be skipped");
+        assert!(result.is_none(), "static methods must be skipped");
     }
 
     #[test]
     fn test_void_method_no_return() {
-        use php_extractor::types::{MethodParam, MethodSignature};
+        use php_extractor::types::MethodSignature;
         let method = MethodSignature {
             name: "doSomething".to_string(),
             params: vec![],
             return_type: Some("void".to_string()),
             is_static: false,
+            returns_reference: false,
         };
-        let result = render_intercepted_method(&method);
+        let result = render_intercepted_method(&method).unwrap();
         assert!(
             !result.contains("return $pluginInfo"),
             "void method must not use return"
         );
         assert!(result.contains("$pluginInfo ? $this->___callPlugins"));
+    }
+
+    #[test]
+    fn test_method_signature_renders_by_ref_and_variadic_order() {
+        use php_extractor::types::{MethodParam, MethodSignature};
+        let method = MethodSignature {
+            name: "resolve".to_string(),
+            params: vec![
+                MethodParam {
+                    name: "value".to_string(),
+                    type_hint: Some("?Foo\\Bar|null".to_string()),
+                    has_default: false,
+                    is_variadic: false,
+                    is_by_ref: true,
+                },
+                MethodParam {
+                    name: "rest".to_string(),
+                    type_hint: Some("Baz\\Qux".to_string()),
+                    has_default: false,
+                    is_variadic: true,
+                    is_by_ref: false,
+                },
+            ],
+            return_type: Some("string|null".to_string()),
+            is_static: false,
+            returns_reference: true,
+        };
+
+        let rendered = render_intercepted_method(&method).unwrap();
+        assert!(rendered.contains("public function & resolve("));
+        assert!(rendered.contains("?\\Foo\\Bar|null &$value"));
+        assert!(rendered.contains("\\Baz\\Qux ...$rest"));
+        assert!(rendered.contains(") : string|null"));
     }
 }

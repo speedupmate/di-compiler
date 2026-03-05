@@ -4,8 +4,8 @@
 //! Run `cargo test` then `cargo insta review` to accept new snapshots.
 //! Run with `INSTA_UPDATE=always` to regenerate all snapshots.
 
-use std::path::Path;
 use php_extractor::{extract_file, ExtractResult};
+use std::path::Path;
 
 fn fixture(name: &str) -> std::path::PathBuf {
     // Path relative to workspace root
@@ -51,8 +51,14 @@ fn fixture_simple_class_constructor_params() {
     let info = extract_ok("simple_class.php");
     let ctor = info.constructor.unwrap();
     assert_eq!(ctor.params.len(), 2);
-    assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Magento\\Framework\\AppInterface"));
-    assert_eq!(ctor.params[1].type_hint.as_deref(), Some("Magento\\Framework\\App\\State"));
+    assert_eq!(
+        ctor.params[0].type_hint.as_deref(),
+        Some("Magento\\Framework\\AppInterface")
+    );
+    assert_eq!(
+        ctor.params[1].type_hint.as_deref(),
+        Some("Magento\\Framework\\App\\State")
+    );
 }
 
 #[test]
@@ -105,11 +111,14 @@ fn fixture_nullable_union() {
     let info = extract_ok("nullable_union.php");
     let ctor = info.constructor.unwrap();
     assert_eq!(ctor.params.len(), 3);
-    // ?RequestInterface → optional, type=RequestInterface
+    // ?RequestInterface preserved as nullable type
     assert!(ctor.params[0].is_optional);
-    assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Magento\\Framework\\App\\RequestInterface"));
-    // string|int|null → first non-null = string
-    assert_eq!(ctor.params[1].type_hint.as_deref(), Some("string"));
+    assert_eq!(
+        ctor.params[0].type_hint.as_deref(),
+        Some("?Magento\\Framework\\App\\RequestInterface")
+    );
+    // string|int|null preserved
+    assert_eq!(ctor.params[1].type_hint.as_deref(), Some("string|int|null"));
     assert!(ctor.params[1].is_optional);
 }
 
@@ -119,7 +128,10 @@ fn fixture_variadic() {
     let ctor = info.constructor.unwrap();
     assert_eq!(ctor.params.len(), 3);
     assert!(ctor.params[2].is_variadic);
-    assert_eq!(ctor.params[2].type_hint.as_deref(), Some("Magento\\Framework\\Logger\\Handler"));
+    assert_eq!(
+        ctor.params[2].type_hint.as_deref(),
+        Some("Magento\\Framework\\Logger\\Handler")
+    );
 }
 
 #[test]
@@ -149,22 +161,47 @@ fn fixture_no_namespace() {
 #[test]
 fn fixture_extends_implements() {
     let info = extract_ok("extends_implements.php");
-    assert_eq!(info.extends.as_deref(), Some("Magento\\Framework\\DataObject"));
+    assert_eq!(
+        info.extends.as_deref(),
+        Some("Magento\\Framework\\DataObject")
+    );
     assert_eq!(info.implements.len(), 2);
-    assert!(info.implements.iter().any(|i| i.contains("ObjectRelationInterface")));
-    assert!(info.implements.iter().any(|i| i.contains("IdentityInterface")));
+    assert!(info
+        .implements
+        .iter()
+        .any(|i| i.contains("ObjectRelationInterface")));
+    assert!(info
+        .implements
+        .iter()
+        .any(|i| i.contains("IdentityInterface")));
 }
 
 #[test]
 fn fixture_public_methods() {
     let info = extract_ok("public_methods.php");
-    let method_names: Vec<&str> = info.public_methods.iter().map(|m| m.name.as_str()).collect();
+    let method_names: Vec<&str> = info
+        .public_methods
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
     // getData and processRequest and static create should be included
-    assert!(method_names.contains(&"getData"), "missing getData: {method_names:?}");
-    assert!(method_names.contains(&"create"), "missing create: {method_names:?}");
-    assert!(method_names.contains(&"processRequest"), "missing processRequest: {method_names:?}");
+    assert!(
+        method_names.contains(&"getData"),
+        "missing getData: {method_names:?}"
+    );
+    assert!(
+        method_names.contains(&"create"),
+        "missing create: {method_names:?}"
+    );
+    assert!(
+        method_names.contains(&"processRequest"),
+        "missing processRequest: {method_names:?}"
+    );
     // final getVersion should be excluded
-    assert!(!method_names.contains(&"getVersion"), "getVersion should be excluded");
+    assert!(
+        !method_names.contains(&"getVersion"),
+        "getVersion should be excluded"
+    );
     // private/protected excluded
     assert!(!method_names.contains(&"internalMethod"));
     assert!(!method_names.contains(&"protectedMethod"));
@@ -197,9 +234,9 @@ fn fixture_complex_defaults() {
     assert_eq!(ctor.params.len(), 5);
     assert_eq!(ctor.params[0].name, "service");
     assert_eq!(ctor.params[1].name, "config");
-    assert!(ctor.params[1].is_optional);  // has default
+    assert!(ctor.params[1].is_optional); // has default
     assert_eq!(ctor.params[2].name, "name");
-    assert!(ctor.params[3].is_optional);  // = null
+    assert!(ctor.params[3].is_optional); // = null
     assert_eq!(ctor.params[4].name, "timeout");
     assert!(ctor.params[4].is_optional);
 }

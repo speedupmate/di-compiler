@@ -101,7 +101,14 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
                 .or_else(|| find_named_node(n, "qualified_name"))
                 .or_else(|| find_named_node(n, "name"))
                 .map(|nn| normalize_fqn(node_text(nn, src).trim()))
-                .unwrap_or_else(|| normalize_fqn(node_text(n, src).trim().trim_start_matches("extends").trim()))
+                .unwrap_or_else(|| {
+                    normalize_fqn(
+                        node_text(n, src)
+                            .trim()
+                            .trim_start_matches("extends")
+                            .trim(),
+                    )
+                })
         });
 
     let mut implements: Vec<String> = Vec::new();
@@ -134,6 +141,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
                     let is_final_method = has_modifier(member, src, "final");
                     if vis == "public" && !is_final_method {
                         let is_static = has_modifier(member, src, "static");
+                        let returns_reference = node_text(member, src).contains("function &");
                         let params = parse_method_params_ts(member, src);
                         let return_type = member
                             .child_by_field_name("return_type")
@@ -143,6 +151,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
                             params,
                             return_type,
                             is_static,
+                            returns_reference,
                         });
                     }
                 }
@@ -287,14 +296,11 @@ fn parse_ctor_params_ts(params_node: Node, src: &[u8]) -> Vec<ConstructorParam> 
                     .unwrap_or_default();
 
                 let has_default = child.child_by_field_name("default_value").is_some();
-                let is_nullable = child
-                    .child_by_field_name("nullable_type")
-                    .is_some()
+                let is_nullable = child.child_by_field_name("nullable_type").is_some()
                     || type_hint
                         .as_ref()
                         .map(|t| t.starts_with('?'))
                         .unwrap_or(false);
-                let type_hint = type_hint.map(|t| t.trim_start_matches('?').to_string());
                 let is_primitive = type_hint.as_deref().map(is_primitive_type).unwrap_or(true);
 
                 params.push(ConstructorParam {
@@ -321,14 +327,21 @@ fn parse_method_params_ts(method: Node, src: &[u8]) -> Vec<MethodParam> {
                     let is_variadic = child.kind() == "variadic_parameter";
                     let type_hint = child
                         .child_by_field_name("type")
-                        .map(|n| extract_type_from_node(n, src))
-                        .map(|t| t.trim_start_matches('?').to_string());
+                        .map(|n| extract_type_from_node(n, src));
                     let name = child
                         .child_by_field_name("name")
                         .map(|n| node_text(n, src).trim().trim_start_matches('$').to_string())
                         .unwrap_or_default();
                     let has_default = child.child_by_field_name("default_value").is_some();
-                    params.push(MethodParam { name, type_hint, has_default, is_variadic });
+                    let raw = node_text(child, src);
+                    let is_by_ref = raw.contains("&$") || raw.trim_start().starts_with('&');
+                    params.push(MethodParam {
+                        name,
+                        type_hint,
+                        has_default,
+                        is_variadic,
+                        is_by_ref,
+                    });
                 }
                 _ => {}
             }
@@ -349,18 +362,20 @@ fn extract_type_from_node(type_node: Node, src: &[u8]) -> String {
             format!("?{inner}")
         }
         "union_type" => {
-            // `Foo|Bar` — extract first non-null
+            // `Foo|Bar` — preserve all union parts in declaration order
             let mut parts = Vec::new();
             for child in iter_children(type_node) {
                 match child.kind() {
                     "named_type" | "name" | "qualified_name" => {
                         parts.push(normalize_fqn(node_text(child, src).trim()));
                     }
+                    "primitive_type" => {
+                        parts.push(node_text(child, src).trim().to_string());
+                    }
                     _ => {}
                 }
             }
-            parts.into_iter().find(|p| p != "null" && p != "false" && p != "true")
-                .unwrap_or_default()
+            parts.join("|")
         }
         _ => normalize_fqn(node_text(type_node, src).trim()),
     }
@@ -371,11 +386,36 @@ fn normalize_fqn(s: &str) -> String {
 }
 
 fn is_primitive_type(t: &str) -> bool {
+    let t = t.trim_start_matches('?');
+    if t.contains('|') {
+        return t.split('|').all(is_primitive_base);
+    }
+    is_primitive_base(t)
+}
+
+fn is_primitive_base(t: &str) -> bool {
     matches!(
         t,
-        "int" | "integer" | "float" | "double" | "string" | "bool" | "boolean"
-            | "array" | "callable" | "iterable" | "void" | "null" | "mixed"
-            | "never" | "true" | "false" | "object" | "self" | "static" | "parent"
+        "int"
+            | "integer"
+            | "float"
+            | "double"
+            | "string"
+            | "bool"
+            | "boolean"
+            | "array"
+            | "callable"
+            | "iterable"
+            | "void"
+            | "null"
+            | "mixed"
+            | "never"
+            | "true"
+            | "false"
+            | "object"
+            | "self"
+            | "static"
+            | "parent"
     )
 }
 
@@ -419,7 +459,10 @@ mod tests {
                 // tree-sitter parses it; type may be extracted or empty
                 assert_eq!(ctor.params[0].name, "x");
             }
-            other => panic!("Expected Ok from tier2 for intersection type, got {:?}", other),
+            other => panic!(
+                "Expected Ok from tier2 for intersection type, got {:?}",
+                other
+            ),
         }
     }
 }

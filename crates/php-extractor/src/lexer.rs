@@ -30,7 +30,12 @@ struct Scanner<'a> {
 
 impl<'a> Scanner<'a> {
     fn new(src: &'a [u8]) -> Self {
-        Scanner { src, pos: 0, namespace: String::new(), use_map: std::collections::HashMap::new() }
+        Scanner {
+            src,
+            pos: 0,
+            namespace: String::new(),
+            use_map: std::collections::HashMap::new(),
+        }
     }
 
     fn at(&self, offset: usize) -> u8 {
@@ -388,7 +393,9 @@ impl<'a> Scanner<'a> {
             self.pos = saved;
         }
         // Skip leading `\`
-        if self.peek() == b'\\' { self.advance(1); }
+        if self.peek() == b'\\' {
+            self.advance(1);
+        }
         // Read base FQCN parts
         let mut base = String::new();
         loop {
@@ -403,8 +410,13 @@ impl<'a> Scanner<'a> {
                     self.advance(1);
                     loop {
                         self.skip_noise();
-                        if self.is_eof() || self.peek() == b'}' { break; }
-                        if self.peek() == b',' { self.advance(1); continue; }
+                        if self.is_eof() || self.peek() == b'}' {
+                            break;
+                        }
+                        if self.peek() == b',' {
+                            self.advance(1);
+                            continue;
+                        }
                         // Read one entry in the group
                         let mut part = String::new();
                         loop {
@@ -415,7 +427,9 @@ impl<'a> Scanner<'a> {
                             } else if c == b'\\' {
                                 part.push('\\');
                                 self.advance(1);
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         // Optional `as Alias`
                         let alias = self.try_read_as_alias().unwrap_or_else(|| {
@@ -426,9 +440,13 @@ impl<'a> Scanner<'a> {
                         }
                     }
                     self.skip_noise();
-                    if self.peek() == b'}' { self.advance(1); }
+                    if self.peek() == b'}' {
+                        self.advance(1);
+                    }
                     self.skip_noise();
-                    if self.peek() == b';' { self.advance(1); }
+                    if self.peek() == b';' {
+                        self.advance(1);
+                    }
                     return;
                 }
                 base.push('\\');
@@ -441,20 +459,24 @@ impl<'a> Scanner<'a> {
             return;
         }
         // Optional `as Alias`
-        let alias = self.try_read_as_alias().unwrap_or_else(|| {
-            base.split('\\').last().unwrap_or(&base).to_string()
-        });
+        let alias = self
+            .try_read_as_alias()
+            .unwrap_or_else(|| base.split('\\').last().unwrap_or(&base).to_string());
         if !alias.is_empty() {
             self.use_map.insert(alias, base);
         }
         self.skip_noise();
-        if self.peek() == b';' { self.advance(1); }
+        if self.peek() == b';' {
+            self.advance(1);
+        }
     }
 
     fn try_read_as_alias(&mut self) -> Option<String> {
         self.skip_noise();
         let saved = self.pos;
-        if !is_word_start(self.peek()) { return None; }
+        if !is_word_start(self.peek()) {
+            return None;
+        }
         let w = self.read_word();
         if w == b"as" {
             self.skip_noise();
@@ -471,7 +493,9 @@ impl<'a> Scanner<'a> {
         while !self.is_eof() && self.peek() != b';' {
             self.advance(1);
         }
-        if self.peek() == b';' { self.advance(1); }
+        if self.peek() == b';' {
+            self.advance(1);
+        }
     }
 
     /// Resolve a bare (non-absolute) PHP type hint to a FQCN using
@@ -612,14 +636,38 @@ impl<'a> Scanner<'a> {
 
             if depth != 1 {
                 match self.peek() {
-                    b'\'' => { self.advance(1); self.skip_sq_string(); }
-                    b'"' => { self.advance(1); self.skip_dq_string(); }
-                    b'/' if self.at(1) == b'/' => { self.advance(2); self.skip_line_comment(); }
-                    b'/' if self.at(1) == b'*' => { self.advance(2); self.skip_block_comment(); }
-                    b'#' if self.at(1) != b'[' => { self.advance(1); self.skip_line_comment(); }
-                    b'<' if self.at(1) == b'<' && self.at(2) == b'<' => { self.advance(3); self.skip_heredoc(); }
-                    b'{' => { depth += 1; self.advance(1); }
-                    b'}' => { depth -= 1; self.advance(1); }
+                    b'\'' => {
+                        self.advance(1);
+                        self.skip_sq_string();
+                    }
+                    b'"' => {
+                        self.advance(1);
+                        self.skip_dq_string();
+                    }
+                    b'/' if self.at(1) == b'/' => {
+                        self.advance(2);
+                        self.skip_line_comment();
+                    }
+                    b'/' if self.at(1) == b'*' => {
+                        self.advance(2);
+                        self.skip_block_comment();
+                    }
+                    b'#' if self.at(1) != b'[' => {
+                        self.advance(1);
+                        self.skip_line_comment();
+                    }
+                    b'<' if self.at(1) == b'<' && self.at(2) == b'<' => {
+                        self.advance(3);
+                        self.skip_heredoc();
+                    }
+                    b'{' => {
+                        depth += 1;
+                        self.advance(1);
+                    }
+                    b'}' => {
+                        depth -= 1;
+                        self.advance(1);
+                    }
                     _ => self.advance(1),
                 }
                 continue;
@@ -627,14 +675,30 @@ impl<'a> Scanner<'a> {
 
             // depth == 1
             self.skip_noise();
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
 
             let b = self.peek();
-            if b == b'{' { depth += 1; self.advance(1); continue; }
-            if b == b'}' { depth -= 1; self.advance(1); continue; }
-            if b == b'#' && self.at(1) == b'[' { self.skip_php_attribute(); continue; }
+            if b == b'{' {
+                depth += 1;
+                self.advance(1);
+                continue;
+            }
+            if b == b'}' {
+                depth -= 1;
+                self.advance(1);
+                continue;
+            }
+            if b == b'#' && self.at(1) == b'[' {
+                self.skip_php_attribute();
+                continue;
+            }
 
-            if !is_word_start(b) { self.advance(1); continue; }
+            if !is_word_start(b) {
+                self.advance(1);
+                continue;
+            }
 
             let mut is_abstract_method = false;
             let mut is_final_method = false;
@@ -645,8 +709,14 @@ impl<'a> Scanner<'a> {
             let first_word = self.read_word();
             let is_modifier = matches!(
                 first_word,
-                b"abstract" | b"final" | b"public" | b"private" | b"protected"
-                    | b"static" | b"readonly" | b"function"
+                b"abstract"
+                    | b"final"
+                    | b"public"
+                    | b"private"
+                    | b"protected"
+                    | b"static"
+                    | b"readonly"
+                    | b"function"
             );
             if !is_modifier {
                 self.skip_to_stmt_end(&mut depth);
@@ -662,7 +732,10 @@ impl<'a> Scanner<'a> {
                     b"private" | b"protected" => {}
                     b"static" => is_static = true,
                     b"readonly" => {}
-                    b"function" => { saw_function = true; break; }
+                    b"function" => {
+                        saw_function = true;
+                        break;
+                    }
                     _ => break,
                 }
                 self.skip_noise();
@@ -678,8 +751,10 @@ impl<'a> Scanner<'a> {
                 continue;
             }
 
+            let mut returns_reference = false;
             self.skip_noise();
             if self.peek() == b'&' {
+                returns_reference = true;
                 self.advance(1);
                 self.skip_noise();
             }
@@ -688,7 +763,9 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             let method_name_bytes = self.read_word();
-            let method_name = std::str::from_utf8(method_name_bytes).unwrap_or("").to_string();
+            let method_name = std::str::from_utf8(method_name_bytes)
+                .unwrap_or("")
+                .to_string();
 
             self.skip_noise();
             if self.peek() != b'(' {
@@ -724,6 +801,7 @@ impl<'a> Scanner<'a> {
                     params,
                     return_type,
                     is_static,
+                    returns_reference,
                 });
             } else {
                 self.skip_to_matching_paren();
@@ -743,11 +821,26 @@ impl<'a> Scanner<'a> {
     fn skip_to_stmt_end(&mut self, depth: &mut u32) {
         loop {
             self.skip_noise();
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
             match self.peek() {
-                b';' => { self.advance(1); break; }
-                b'{' => { *depth += 1; self.advance(1); break; }
-                b'}' => { if *depth > 0 { *depth -= 1; } self.advance(1); break; }
+                b';' => {
+                    self.advance(1);
+                    break;
+                }
+                b'{' => {
+                    *depth += 1;
+                    self.advance(1);
+                    break;
+                }
+                b'}' => {
+                    if *depth > 0 {
+                        *depth -= 1;
+                    }
+                    self.advance(1);
+                    break;
+                }
                 _ => self.advance(1),
             }
         }
@@ -757,11 +850,22 @@ impl<'a> Scanner<'a> {
         let mut params = Vec::new();
         loop {
             self.skip_noise();
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
             match self.peek() {
-                b')' => { self.advance(1); break; }
-                b',' => { self.advance(1); continue; }
-                b'#' if self.at(1) == b'[' => { self.skip_php_attribute(); continue; }
+                b')' => {
+                    self.advance(1);
+                    break;
+                }
+                b',' => {
+                    self.advance(1);
+                    continue;
+                }
+                b'#' if self.at(1) == b'[' => {
+                    self.skip_php_attribute();
+                    continue;
+                }
                 _ => {}
             }
             if let Some(p) = self.parse_one_ctor_param()? {
@@ -775,11 +879,22 @@ impl<'a> Scanner<'a> {
         let mut params = Vec::new();
         loop {
             self.skip_noise();
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
             match self.peek() {
-                b')' => { self.advance(1); break; }
-                b',' => { self.advance(1); continue; }
-                b'#' if self.at(1) == b'[' => { self.skip_php_attribute(); continue; }
+                b')' => {
+                    self.advance(1);
+                    break;
+                }
+                b',' => {
+                    self.advance(1);
+                    continue;
+                }
+                b'#' if self.at(1) == b'[' => {
+                    self.skip_php_attribute();
+                    continue;
+                }
                 _ => {}
             }
             if let Some(p) = self.parse_one_method_param()? {
@@ -806,17 +921,19 @@ impl<'a> Scanner<'a> {
                         is_readonly = true;
                     }
                 }
-                b"readonly" => { is_readonly = true; }
+                b"readonly" => {
+                    is_readonly = true;
+                }
                 _ => self.pos = saved,
             }
         }
         let _ = is_readonly;
 
-        self.skip_noise();
-        let mut is_nullable = false;
-        if self.peek() == b'?' { is_nullable = true; self.advance(1); }
-
         let type_hint = self.try_read_type_hint()?;
+        let is_nullable = type_hint
+            .as_deref()
+            .map(|t| t.starts_with('?'))
+            .unwrap_or(false);
 
         self.skip_noise();
         if type_hint.is_some() && self.peek() == b'&' && self.at(1) != b'$' && self.at(1) != b'&' {
@@ -828,7 +945,9 @@ impl<'a> Scanner<'a> {
             is_variadic = true;
             self.advance(3);
         }
-        if self.peek() == b'&' { self.advance(1); }
+        if self.peek() == b'&' {
+            self.advance(1);
+        }
 
         self.skip_noise();
         if self.peek() != b'$' {
@@ -849,7 +968,14 @@ impl<'a> Scanner<'a> {
 
         let is_primitive = type_hint.as_deref().map(is_primitive_type).unwrap_or(true);
 
-        Ok(Some(ConstructorParam { name, type_hint, is_optional, is_primitive, is_variadic, is_promoted }))
+        Ok(Some(ConstructorParam {
+            name,
+            type_hint,
+            is_optional,
+            is_primitive,
+            is_variadic,
+            is_promoted,
+        }))
     }
 
     fn parse_one_method_param(&mut self) -> Result<Option<MethodParam>, LexError> {
@@ -862,9 +988,6 @@ impl<'a> Scanner<'a> {
                 _ => self.pos = saved,
             }
         }
-        self.skip_noise();
-        if self.peek() == b'?' { self.advance(1); }
-
         let type_hint = self.try_read_type_hint()?;
 
         self.skip_noise();
@@ -872,12 +995,22 @@ impl<'a> Scanner<'a> {
             return Err(LexError::Unsupported("intersection_type".into()));
         }
 
+        let mut is_by_ref = false;
+        self.skip_noise();
+        if self.peek() == b'&' {
+            is_by_ref = true;
+            self.advance(1);
+        }
+
         let mut is_variadic = false;
         if self.peek() == b'.' && self.at(1) == b'.' && self.at(2) == b'.' {
             is_variadic = true;
             self.advance(3);
         }
-        if self.peek() == b'&' { self.advance(1); }
+        if self.peek() == b'&' {
+            is_by_ref = true;
+            self.advance(1);
+        }
 
         self.skip_noise();
         if self.peek() != b'$' {
@@ -896,11 +1029,24 @@ impl<'a> Scanner<'a> {
             self.skip_default_value();
         }
 
-        Ok(Some(MethodParam { name, type_hint, has_default, is_variadic }))
+        Ok(Some(MethodParam {
+            name,
+            type_hint,
+            has_default,
+            is_variadic,
+            is_by_ref,
+        }))
     }
 
     fn try_read_type_hint(&mut self) -> Result<Option<String>, LexError> {
         self.skip_noise();
+        let mut is_nullable = false;
+        if self.peek() == b'?' {
+            is_nullable = true;
+            self.advance(1);
+            self.skip_noise();
+        }
+
         let b = self.peek();
         if b == b'$' || b == b')' || b == b',' || b == b'.' || b == b'&' {
             return Ok(None);
@@ -909,42 +1055,62 @@ impl<'a> Scanner<'a> {
             return Ok(None);
         }
         let absolute = self.peek() == b'\\';
-        if absolute { self.advance(1); }
+        if absolute {
+            self.advance(1);
+        }
         let start = self.pos;
         while !self.is_eof() && (is_word_char(self.peek()) || self.peek() == b'\\') {
             self.advance(1);
         }
-        let raw_type = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("").to_string();
-        if raw_type.is_empty() { return Ok(None); }
-
-        if self.peek() == b'|' {
-            // Union type: pick first non-null, non-bool part, resolve it.
-            let first_part = if absolute { raw_type.clone() } else { self.resolve_type(&raw_type) };
-            let mut parts: Vec<String> = vec![first_part];
-            while self.peek() == b'|' {
-                self.advance(1);
-                let part_abs = self.peek() == b'\\';
-                if part_abs { self.advance(1); }
-                let pstart = self.pos;
-                while !self.is_eof() && (is_word_char(self.peek()) || self.peek() == b'\\') {
-                    self.advance(1);
-                }
-                let part = std::str::from_utf8(&self.src[pstart..self.pos]).unwrap_or("").to_string();
-                if !part.is_empty() {
-                    let resolved = if part_abs { part } else { self.resolve_type(&part) };
-                    parts.push(resolved);
-                }
-            }
-            let first = parts.into_iter().find(|p| p != "null" && p != "false" && p != "true");
-            return Ok(first);
+        let raw_type = std::str::from_utf8(&self.src[start..self.pos])
+            .unwrap_or("")
+            .to_string();
+        if raw_type.is_empty() {
+            return Ok(None);
         }
 
-        let resolved = if absolute { raw_type } else { self.resolve_type(&raw_type) };
+        let first = if absolute {
+            raw_type.clone()
+        } else {
+            self.resolve_type(&raw_type)
+        };
+        let mut parts: Vec<String> = vec![first];
+
+        while self.peek() == b'|' {
+            self.advance(1);
+            let part_abs = self.peek() == b'\\';
+            if part_abs {
+                self.advance(1);
+            }
+            let pstart = self.pos;
+            while !self.is_eof() && (is_word_char(self.peek()) || self.peek() == b'\\') {
+                self.advance(1);
+            }
+            let part = std::str::from_utf8(&self.src[pstart..self.pos])
+                .unwrap_or("")
+                .to_string();
+            if !part.is_empty() {
+                let resolved = if part_abs {
+                    part
+                } else {
+                    self.resolve_type(&part)
+                };
+                parts.push(resolved);
+            }
+        }
+
+        let mut resolved = if parts.len() > 1 {
+            parts.join("|")
+        } else {
+            parts.remove(0)
+        };
+        if is_nullable {
+            resolved = format!("?{resolved}");
+        }
         Ok(Some(resolved))
     }
 
     fn read_return_type(&mut self) -> Result<String, LexError> {
-        if self.peek() == b'?' { self.advance(1); }
         match self.try_read_type_hint()? {
             Some(t) => Ok(t),
             None => Ok(String::new()),
@@ -952,7 +1118,6 @@ impl<'a> Scanner<'a> {
     }
 
     fn skip_type_hint(&mut self) -> Result<(), LexError> {
-        if self.peek() == b'?' { self.advance(1); }
         self.try_read_type_hint()?;
         Ok(())
     }
@@ -961,18 +1126,47 @@ impl<'a> Scanner<'a> {
         let mut paren: i32 = 0;
         let mut bracket: i32 = 0;
         loop {
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
             match self.peek() {
-                b'\'' => { self.advance(1); self.skip_sq_string(); }
-                b'"' => { self.advance(1); self.skip_dq_string(); }
-                b'/' if self.at(1) == b'/' => { self.advance(2); self.skip_line_comment(); }
-                b'/' if self.at(1) == b'*' => { self.advance(2); self.skip_block_comment(); }
-                b'#' if self.at(1) != b'[' => { self.advance(1); self.skip_line_comment(); }
-                b'(' => { paren += 1; self.advance(1); }
+                b'\'' => {
+                    self.advance(1);
+                    self.skip_sq_string();
+                }
+                b'"' => {
+                    self.advance(1);
+                    self.skip_dq_string();
+                }
+                b'/' if self.at(1) == b'/' => {
+                    self.advance(2);
+                    self.skip_line_comment();
+                }
+                b'/' if self.at(1) == b'*' => {
+                    self.advance(2);
+                    self.skip_block_comment();
+                }
+                b'#' if self.at(1) != b'[' => {
+                    self.advance(1);
+                    self.skip_line_comment();
+                }
+                b'(' => {
+                    paren += 1;
+                    self.advance(1);
+                }
                 b')' if paren == 0 => break,
-                b')' => { paren -= 1; self.advance(1); }
-                b'[' => { bracket += 1; self.advance(1); }
-                b']' if bracket > 0 => { bracket -= 1; self.advance(1); }
+                b')' => {
+                    paren -= 1;
+                    self.advance(1);
+                }
+                b'[' => {
+                    bracket += 1;
+                    self.advance(1);
+                }
+                b']' if bracket > 0 => {
+                    bracket -= 1;
+                    self.advance(1);
+                }
                 b',' if paren == 0 && bracket == 0 => break,
                 _ => self.advance(1),
             }
@@ -982,14 +1176,31 @@ impl<'a> Scanner<'a> {
     fn skip_to_param_end(&mut self) {
         let mut depth: i32 = 0;
         loop {
-            if self.is_eof() { break; }
+            if self.is_eof() {
+                break;
+            }
             match self.peek() {
-                b'\'' => { self.advance(1); self.skip_sq_string(); }
-                b'"' => { self.advance(1); self.skip_dq_string(); }
-                b'(' | b'[' => { depth += 1; self.advance(1); }
+                b'\'' => {
+                    self.advance(1);
+                    self.skip_sq_string();
+                }
+                b'"' => {
+                    self.advance(1);
+                    self.skip_dq_string();
+                }
+                b'(' | b'[' => {
+                    depth += 1;
+                    self.advance(1);
+                }
                 b')' if depth == 0 => break,
-                b')' => { depth -= 1; self.advance(1); }
-                b']' if depth > 0 => { depth -= 1; self.advance(1); }
+                b')' => {
+                    depth -= 1;
+                    self.advance(1);
+                }
+                b']' if depth > 0 => {
+                    depth -= 1;
+                    self.advance(1);
+                }
                 b',' if depth == 0 => break,
                 _ => self.advance(1),
             }
@@ -1000,10 +1211,18 @@ impl<'a> Scanner<'a> {
         let mut depth: i32 = 1;
         loop {
             self.skip_noise();
-            if self.is_eof() || depth == 0 { break; }
+            if self.is_eof() || depth == 0 {
+                break;
+            }
             match self.peek() {
-                b'(' => { depth += 1; self.advance(1); }
-                b')' => { depth -= 1; self.advance(1); }
+                b'(' => {
+                    depth += 1;
+                    self.advance(1);
+                }
+                b')' => {
+                    depth -= 1;
+                    self.advance(1);
+                }
                 _ => self.advance(1),
             }
         }
@@ -1011,21 +1230,52 @@ impl<'a> Scanner<'a> {
 
     fn skip_method_body_braces(&mut self, _class_depth: &mut u32) {
         self.skip_noise();
-        if self.peek() == b';' { self.advance(1); return; }
-        if self.peek() != b'{' { return; }
+        if self.peek() == b';' {
+            self.advance(1);
+            return;
+        }
+        if self.peek() != b'{' {
+            return;
+        }
         self.advance(1);
         let mut depth: u32 = 1;
         loop {
-            if self.is_eof() || depth == 0 { break; }
+            if self.is_eof() || depth == 0 {
+                break;
+            }
             match self.peek() {
-                b'\'' => { self.advance(1); self.skip_sq_string(); }
-                b'"' => { self.advance(1); self.skip_dq_string(); }
-                b'/' if self.at(1) == b'/' => { self.advance(2); self.skip_line_comment(); }
-                b'/' if self.at(1) == b'*' => { self.advance(2); self.skip_block_comment(); }
-                b'#' if self.at(1) != b'[' => { self.advance(1); self.skip_line_comment(); }
-                b'<' if self.at(1) == b'<' && self.at(2) == b'<' => { self.advance(3); self.skip_heredoc(); }
-                b'{' => { depth += 1; self.advance(1); }
-                b'}' => { depth -= 1; self.advance(1); }
+                b'\'' => {
+                    self.advance(1);
+                    self.skip_sq_string();
+                }
+                b'"' => {
+                    self.advance(1);
+                    self.skip_dq_string();
+                }
+                b'/' if self.at(1) == b'/' => {
+                    self.advance(2);
+                    self.skip_line_comment();
+                }
+                b'/' if self.at(1) == b'*' => {
+                    self.advance(2);
+                    self.skip_block_comment();
+                }
+                b'#' if self.at(1) != b'[' => {
+                    self.advance(1);
+                    self.skip_line_comment();
+                }
+                b'<' if self.at(1) == b'<' && self.at(2) == b'<' => {
+                    self.advance(3);
+                    self.skip_heredoc();
+                }
+                b'{' => {
+                    depth += 1;
+                    self.advance(1);
+                }
+                b'}' => {
+                    depth -= 1;
+                    self.advance(1);
+                }
                 _ => self.advance(1),
             }
         }
@@ -1037,10 +1287,18 @@ impl<'a> Scanner<'a> {
             self.advance(1);
             let mut depth = 1u32;
             loop {
-                if self.is_eof() || depth == 0 { break; }
+                if self.is_eof() || depth == 0 {
+                    break;
+                }
                 match self.peek() {
-                    b'[' => { depth += 1; self.advance(1); }
-                    b']' => { depth -= 1; self.advance(1); }
+                    b'[' => {
+                        depth += 1;
+                        self.advance(1);
+                    }
+                    b']' => {
+                        depth -= 1;
+                        self.advance(1);
+                    }
                     _ => self.advance(1),
                 }
             }
@@ -1061,11 +1319,36 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 fn is_primitive_type(t: &str) -> bool {
+    let t = t.trim_start_matches('?');
+    if t.contains('|') {
+        return t.split('|').all(is_primitive_base);
+    }
+    is_primitive_base(t)
+}
+
+fn is_primitive_base(t: &str) -> bool {
     matches!(
         t,
-        "int" | "integer" | "float" | "double" | "string" | "bool" | "boolean"
-            | "array" | "callable" | "iterable" | "void" | "null" | "mixed"
-            | "never" | "true" | "false" | "object" | "self" | "static" | "parent"
+        "int"
+            | "integer"
+            | "float"
+            | "double"
+            | "string"
+            | "bool"
+            | "boolean"
+            | "array"
+            | "callable"
+            | "iterable"
+            | "void"
+            | "null"
+            | "mixed"
+            | "never"
+            | "true"
+            | "false"
+            | "object"
+            | "self"
+            | "static"
+            | "parent"
     )
 }
 
@@ -1113,7 +1396,8 @@ mod tests {
     fn test_extends_implements() {
         let info = extract_str(
             "<?php\nnamespace Foo;\nclass Bar extends \\Base\\Foo implements \\My\\Iface, Other {}",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(info.extends.as_deref(), Some("Base\\Foo"));
         // `Other` has no `use` import and no leading `\`, so it resolves to `Foo\Other`
         assert_eq!(info.implements, vec!["My\\Iface", "Foo\\Other"]);
@@ -1121,7 +1405,8 @@ mod tests {
 
     #[test]
     fn test_constructor_params() {
-        let info = extract_str(r#"<?php
+        let info = extract_str(
+            r#"<?php
 namespace Foo;
 class Bar {
     public function __construct(
@@ -1129,12 +1414,17 @@ class Bar {
         ?string $name = null,
         array $items = []
     ) {}
-}"#).unwrap();
+}"#,
+        )
+        .unwrap();
         let ctor = info.constructor.unwrap();
         assert_eq!(ctor.params.len(), 3);
-        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Magento\\Framework\\Thing"));
+        assert_eq!(
+            ctor.params[0].type_hint.as_deref(),
+            Some("Magento\\Framework\\Thing")
+        );
         assert!(!ctor.params[0].is_optional);
-        assert_eq!(ctor.params[1].type_hint.as_deref(), Some("string"));
+        assert_eq!(ctor.params[1].type_hint.as_deref(), Some("?string"));
         assert!(ctor.params[1].is_optional);
         assert!(ctor.params[2].is_primitive);
     }
@@ -1155,14 +1445,17 @@ class Bar {
 
     #[test]
     fn test_constructor_promotion() {
-        let info = extract_str(r#"<?php
+        let info = extract_str(
+            r#"<?php
 namespace Foo;
 class Bar {
     public function __construct(
         public readonly \Foo\Service $service,
         private string $name = 'default'
     ) {}
-}"#).unwrap();
+}"#,
+        )
+        .unwrap();
         let ctor = info.constructor.unwrap();
         assert_eq!(ctor.params.len(), 2);
         assert!(ctor.params[0].is_promoted);
@@ -1171,16 +1464,23 @@ class Bar {
 
     #[test]
     fn test_public_methods() {
-        let info = extract_str(r#"<?php
+        let info = extract_str(
+            r#"<?php
 namespace Foo;
 class Bar {
     public function doThing(string $x): string { return $x; }
     private function secretMethod(): void {}
     final public function finalMethod(): void {}
     public static function staticMethod(): void {}
-}"#).unwrap();
+}"#,
+        )
+        .unwrap();
         assert_eq!(info.public_methods.len(), 2);
-        let names: Vec<&str> = info.public_methods.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = info
+            .public_methods
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
         assert!(names.contains(&"doThing"));
         assert!(names.contains(&"staticMethod"));
     }
@@ -1199,25 +1499,56 @@ class Bar {
     }
 
     #[test]
-    fn test_union_type_first_nonnull() {
-        let info = extract_str(r#"<?php
+    fn test_union_type_preserved() {
+        let info = extract_str(
+            r#"<?php
 namespace Foo;
 class Bar {
     public function __construct(Baz|null $dep = null) {}
-}"#).unwrap();
+}"#,
+        )
+        .unwrap();
         let ctor = info.constructor.unwrap();
-        // `Baz` in namespace `Foo` resolves to `Foo\Baz`
-        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Foo\\Baz"));
+        // `Baz` in namespace `Foo` resolves to `Foo\Baz`, union with `null` preserved
+        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Foo\\Baz|null"));
         assert!(ctor.params[0].is_optional);
     }
 
     #[test]
+    fn test_method_nullable_union_and_reference_preserved() {
+        let info = extract_str(
+            r#"<?php
+namespace Foo;
+class Bar {
+    public function & resolve(\A\B|C|null &$value, D|E $next = null): \X\Y|Z|null
+    {
+        return $value;
+    }
+}"#,
+        )
+        .unwrap();
+        assert_eq!(info.public_methods.len(), 1);
+        let m = &info.public_methods[0];
+        assert_eq!(m.name, "resolve");
+        assert!(m.returns_reference);
+        assert_eq!(m.params.len(), 2);
+        assert_eq!(m.params[0].type_hint.as_deref(), Some("A\\B|Foo\\C|null"));
+        assert!(m.params[0].is_by_ref);
+        assert_eq!(m.params[1].type_hint.as_deref(), Some("Foo\\D|Foo\\E"));
+        assert!(m.params[1].has_default);
+        assert_eq!(m.return_type.as_deref(), Some("X\\Y|Foo\\Z|null"));
+    }
+
+    #[test]
     fn test_variadic_param() {
-        let info = extract_str(r#"<?php
+        let info = extract_str(
+            r#"<?php
 namespace Foo;
 class Bar {
     public function __construct(\Foo\Dep ...$deps) {}
-}"#).unwrap();
+}"#,
+        )
+        .unwrap();
         let ctor = info.constructor.unwrap();
         assert!(ctor.params[0].is_variadic);
     }

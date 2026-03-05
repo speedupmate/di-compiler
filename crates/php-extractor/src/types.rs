@@ -49,6 +49,7 @@ pub struct MethodSignature {
     pub params: Vec<MethodParam>,
     pub return_type: Option<String>,
     pub is_static: bool,
+    pub returns_reference: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub struct MethodParam {
     pub type_hint: Option<String>,
     pub has_default: bool,
     pub is_variadic: bool,
+    pub is_by_ref: bool,
 }
 
 #[derive(Debug)]
