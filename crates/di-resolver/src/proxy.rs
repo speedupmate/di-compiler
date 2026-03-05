@@ -31,17 +31,27 @@ pub fn detect_proxies(
         if seen.insert(proxy_fqcn.clone()) {
             // Target is proxy_fqcn with "\\Proxy" stripped
             let target_fqcn = proxy_fqcn[..proxy_fqcn.len() - 6].to_string();
-            specs.push(ProxySpec { target_fqcn, proxy_fqcn });
+            specs.push(ProxySpec {
+                target_fqcn,
+                proxy_fqcn,
+            });
         }
     };
 
     // Path 1: constructor type hints
     for info in class_map.values() {
-        let Some(ctor) = &info.constructor else { continue };
+        let Some(ctor) = &info.constructor else {
+            continue;
+        };
         for param in &ctor.params {
-            let Some(type_hint) = &param.type_hint else { continue };
+            let Some(type_hint) = &param.type_hint else {
+                continue;
+            };
+            let Some(type_hint) = first_non_null_type_hint_arm(type_hint) else {
+                continue;
+            };
             if type_hint.ends_with("\\Proxy") {
-                emit(type_hint.clone(), class_map);
+                emit(type_hint, class_map);
             }
         }
     }
@@ -53,6 +63,17 @@ pub fn detect_proxies(
 
     specs.sort_by(|a, b| a.proxy_fqcn.cmp(&b.proxy_fqcn));
     specs
+}
+
+/// Constructor type hints may include nullable/union notation.
+/// Proxy detection should inspect a normalized class-like arm.
+fn first_non_null_type_hint_arm(type_hint: &str) -> Option<String> {
+    type_hint
+        .split('|')
+        .map(str::trim)
+        .map(|arm| arm.trim_start_matches('?').trim_start_matches('\\'))
+        .find(|arm| !arm.is_empty() && !matches!(*arm, "null" | "false" | "true"))
+        .map(ToOwned::to_owned)
 }
 
 fn collect_proxy_from_args(
@@ -169,5 +190,31 @@ mod tests {
         let di_config = DiConfig::default();
         let specs = detect_proxies(&class_map, &di_config);
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn test_proxy_from_nullable_constructor_type_hint() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Foo\\Bar".to_string(),
+            make_class_with_proxy_param("Foo\\Bar", "?Foo\\Baz\\Proxy"),
+        );
+        let di_config = DiConfig::default();
+        let specs = detect_proxies(&class_map, &di_config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].proxy_fqcn, "Foo\\Baz\\Proxy");
+    }
+
+    #[test]
+    fn test_proxy_from_union_constructor_type_hint() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Foo\\Bar".to_string(),
+            make_class_with_proxy_param("Foo\\Bar", "null|Foo\\Baz\\Proxy"),
+        );
+        let di_config = DiConfig::default();
+        let specs = detect_proxies(&class_map, &di_config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].proxy_fqcn, "Foo\\Baz\\Proxy");
     }
 }

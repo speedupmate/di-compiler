@@ -28,16 +28,23 @@ pub fn detect_factories(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for info in class_map.values() {
-        let Some(ctor) = &info.constructor else { continue };
+        let Some(ctor) = &info.constructor else {
+            continue;
+        };
         for param in &ctor.params {
-            let Some(type_hint) = &param.type_hint else { continue };
+            let Some(type_hint) = &param.type_hint else {
+                continue;
+            };
+            let Some(type_hint) = first_non_null_type_hint_arm(type_hint) else {
+                continue;
+            };
             // Must end with "Factory" but not be a built-in
             if !type_hint.ends_with("Factory") {
                 continue;
             }
             // Resolve via preferences
-            let target = di_config.get_preference(type_hint);
-            let factory_fqcn = type_hint.clone();
+            let target = di_config.get_preference(&type_hint);
+            let factory_fqcn = type_hint;
 
             // Skip if already exists
             if class_map.contains_key(&factory_fqcn) {
@@ -52,13 +59,27 @@ pub fn detect_factories(
             };
 
             if seen.insert(factory_fqcn.clone()) {
-                specs.push(FactorySpec { target_fqcn, factory_fqcn });
+                specs.push(FactorySpec {
+                    target_fqcn,
+                    factory_fqcn,
+                });
             }
         }
     }
 
     specs.sort_by(|a, b| a.factory_fqcn.cmp(&b.factory_fqcn));
     specs
+}
+
+/// Constructor type hints may now preserve nullable/union notation.
+/// Factory detection must use a normalized class-like arm.
+fn first_non_null_type_hint_arm(type_hint: &str) -> Option<String> {
+    type_hint
+        .split('|')
+        .map(str::trim)
+        .map(|arm| arm.trim_start_matches('?').trim_start_matches('\\'))
+        .find(|arm| !arm.is_empty() && !matches!(*arm, "null" | "false" | "true"))
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -127,5 +148,31 @@ mod tests {
         let di_config = DiConfig::default();
         let specs = detect_factories(&class_map, &di_config);
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn test_nullable_factory_type_hint_normalized() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Foo\\Bar".to_string(),
+            make_class_with_ctor("Foo\\Bar", "?Foo\\Baz\\WidgetFactory"),
+        );
+        let di_config = DiConfig::default();
+        let specs = detect_factories(&class_map, &di_config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].factory_fqcn, "Foo\\Baz\\WidgetFactory");
+    }
+
+    #[test]
+    fn test_union_factory_type_hint_uses_first_non_null_arm() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Foo\\Bar".to_string(),
+            make_class_with_ctor("Foo\\Bar", "null|Foo\\Baz\\WidgetFactory"),
+        );
+        let di_config = DiConfig::default();
+        let specs = detect_factories(&class_map, &di_config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].factory_fqcn, "Foo\\Baz\\WidgetFactory");
     }
 }
