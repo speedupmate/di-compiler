@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use php_extractor::ClassInfo;
 
-use crate::graph::{ResolvedArg, ResolvedArgValue};
+use crate::graph::{ResolvedArg, ResolvedArgValue, ResolvedScalar};
 use di_xml_reader::{Argument, DiConfig};
 
 /// Resolve constructor arguments for all classes.
@@ -39,11 +39,7 @@ pub fn resolve_all_arguments(
 }
 
 /// Resolve constructor args for a single class.
-pub fn resolve_for_class(
-    fqcn: &str,
-    info: &ClassInfo,
-    di_config: &DiConfig,
-) -> Vec<ResolvedArg> {
+pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> Vec<ResolvedArg> {
     let Some(ctor) = &info.constructor else {
         return vec![];
     };
@@ -79,7 +75,10 @@ pub fn resolve_for_class(
             }
         };
 
-        resolved.push(ResolvedArg { name: param.name.clone(), resolved: value });
+        resolved.push(ResolvedArg {
+            name: param.name.clone(),
+            resolved: value,
+        });
     }
 
     resolved
@@ -96,11 +95,13 @@ fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue
                 ResolvedArgValue::NonSharedInstance(concrete)
             }
         }
-        Argument::String { value, .. } => ResolvedArgValue::Scalar(value.clone()),
-        Argument::Boolean { value, .. } => {
-            ResolvedArgValue::Scalar(if *value { "true".to_string() } else { "false".to_string() })
+        Argument::String { value, .. } => {
+            ResolvedArgValue::Scalar(ResolvedScalar::String(value.clone()))
         }
-        Argument::Number { value, .. } => ResolvedArgValue::Scalar(value.clone()),
+        Argument::Boolean { value, .. } => ResolvedArgValue::Scalar(ResolvedScalar::Bool(*value)),
+        Argument::Number { value, .. } => {
+            ResolvedArgValue::Scalar(ResolvedScalar::Number(value.clone()))
+        }
         Argument::Null { .. } => ResolvedArgValue::Null,
         Argument::Array { items, .. } => {
             let resolved_items: Vec<ResolvedArg> = items
@@ -112,8 +113,12 @@ fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue
                 .collect();
             ResolvedArgValue::Array(resolved_items)
         }
-        Argument::Init { value, .. } => ResolvedArgValue::Scalar(value.clone()),
-        Argument::Const { value, .. } => ResolvedArgValue::Scalar(value.clone()),
+        Argument::Init { value, .. } => {
+            ResolvedArgValue::Scalar(ResolvedScalar::String(value.clone()))
+        }
+        Argument::Const { value, .. } => {
+            ResolvedArgValue::Scalar(ResolvedScalar::String(value.clone()))
+        }
     }
 }
 
@@ -159,7 +164,9 @@ mod tests {
                         name: n.to_string(),
                         type_hint: t.map(|s| s.to_string()),
                         is_optional: false,
-                        is_primitive: t.map(|s| matches!(s, "string" | "int" | "bool" | "float")).unwrap_or(false),
+                        is_primitive: t
+                            .map(|s| matches!(s, "string" | "int" | "bool" | "float"))
+                            .unwrap_or(false),
                         is_variadic: false,
                         is_promoted: false,
                     })
@@ -207,9 +214,10 @@ mod tests {
         );
         let map = resolve_all_arguments(&class_map, &di_config);
         let args = &map["App\\Service"];
-        assert!(
-            matches!(&args[0].resolved, ResolvedArgValue::Scalar(v) if v == "Hello World")
-        );
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::Scalar(ResolvedScalar::String(v)) if v == "Hello World"
+        ));
     }
 
     #[test]

@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 
-use di_resolver::ResolvedArg;
+use di_resolver::{ResolvedArg, ResolvedArgValue};
 use di_xml_reader::DiConfig;
 
-use crate::metadata::escape_php;
+use crate::metadata::{escape_php, render_scalar, render_untyped_default};
 
 /// Generate the PHP source for one area config file.
 ///
@@ -70,15 +70,15 @@ pub fn generate_area_config(
     out
 }
 
-fn serialize_arg_indent(
-    out: &mut String,
-    name: &str,
-    value: &di_resolver::ResolvedArgValue,
-    indent: usize,
-) {
-    use di_resolver::ResolvedArgValue::*;
+fn serialize_arg_indent(out: &mut String, name: &str, value: &ResolvedArgValue, indent: usize) {
+    use ResolvedArgValue::*;
     let pad = " ".repeat(indent);
-    out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+    out.push_str(&format!(
+        "{}'{}' => \n{}array (\n",
+        pad,
+        escape_php(name),
+        pad
+    ));
     match value {
         SharedInstance(fqcn) => {
             out.push_str(&format!("{}  '_i_' => '{}',\n", pad, escape_php(fqcn)));
@@ -87,11 +87,7 @@ fn serialize_arg_indent(
             out.push_str(&format!("{}  '_ins_' => '{}',\n", pad, escape_php(fqcn)));
         }
         Scalar(val) => {
-            if is_numeric(val) {
-                out.push_str(&format!("{}  '_v_' => {},\n", pad, val));
-            } else {
-                out.push_str(&format!("{}  '_v_' => '{}',\n", pad, escape_php(val)));
-            }
+            out.push_str(&format!("{}  '_v_' => {},\n", pad, render_scalar(val)));
         }
         Null => {
             out.push_str(&format!("{}  '_vn_' => true,\n", pad));
@@ -106,19 +102,15 @@ fn serialize_arg_indent(
         GlobalArgRef { arg_name, default } => {
             out.push_str(&format!("{}  '_a_' => '{}',\n", pad, escape_php(arg_name)));
             if let Some(d) = default {
-                if is_numeric(d) {
-                    out.push_str(&format!("{}  '_d_' => {},\n", pad, d));
-                } else {
-                    out.push_str(&format!("{}  '_d_' => '{}',\n", pad, escape_php(d)));
-                }
+                out.push_str(&format!(
+                    "{}  '_d_' => {},\n",
+                    pad,
+                    render_untyped_default(d)
+                ));
             }
         }
     }
     out.push_str(&format!("{}),\n", pad));
-}
-
-fn is_numeric(s: &str) -> bool {
-    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
 }
 
 /// Standard area names in Magento DI.

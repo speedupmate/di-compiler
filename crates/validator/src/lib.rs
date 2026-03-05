@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Result of comparing PHP ground truth vs Rust-generated output.
 #[derive(Debug, Default)]
@@ -17,6 +18,8 @@ pub struct ValidationResult {
     pub files_with_diff: Vec<FileDiff>,
     /// Files Rust couldn't generate
     pub extraction_failures: Vec<PathBuf>,
+    /// Rust metadata files that fail `php -n -l`
+    pub metadata_syntax_errors: Vec<PathBuf>,
 }
 
 impl ValidationResult {
@@ -25,6 +28,7 @@ impl ValidationResult {
             && self.files_only_in_rust.is_empty()
             && self.files_with_diff.is_empty()
             && self.extraction_failures.is_empty()
+            && self.metadata_syntax_errors.is_empty()
     }
 
     /// Human-readable summary.
@@ -46,12 +50,21 @@ impl ValidationResult {
             ));
         }
         if !self.files_with_diff.is_empty() {
-            lines.push(format!("  Content differs: {} files", self.files_with_diff.len()));
+            lines.push(format!(
+                "  Content differs: {} files",
+                self.files_with_diff.len()
+            ));
         }
         if !self.extraction_failures.is_empty() {
             lines.push(format!(
                 "  Extraction failures: {} files",
                 self.extraction_failures.len()
+            ));
+        }
+        if !self.metadata_syntax_errors.is_empty() {
+            lines.push(format!(
+                "  Metadata PHP syntax errors: {} files",
+                self.metadata_syntax_errors.len()
             ));
         }
         lines.join("\n")
@@ -129,6 +142,7 @@ pub fn validate(php_generated: &Path, rust_generated: &Path) -> ValidationResult
     result.files_only_in_php.sort();
     result.files_only_in_rust.sort();
     result.files_with_diff.sort_by(|a, b| a.path.cmp(&b.path));
+    result.metadata_syntax_errors = lint_metadata_php_files(rust_generated);
 
     result
 }
@@ -143,7 +157,9 @@ fn collect_relative_paths(root: &Path) -> Vec<PathBuf> {
 }
 
 fn collect_recursive(root: &Path, current: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(current) else { return };
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -201,6 +217,57 @@ fn unified_diff_first50(php: &str, rust: &str) -> String {
     out.join("\n")
 }
 
+fn lint_metadata_php_files(rust_generated: &Path) -> Vec<PathBuf> {
+    let metadata_root = rust_generated.join("metadata");
+    if !metadata_root.is_dir() {
+        return Vec::new();
+    }
+
+    if !is_php_cli_available() {
+        log::warn!("validator: php CLI not found; skipping metadata syntax lint");
+        return Vec::new();
+    }
+
+    let mut errors = Vec::new();
+    let rel_paths = collect_relative_paths(&metadata_root);
+    for rel in rel_paths {
+        if rel.extension().and_then(|s| s.to_str()) != Some("php") {
+            continue;
+        }
+        let abs = metadata_root.join(&rel);
+        let output = match Command::new("php").arg("-n").arg("-l").arg(&abs).output() {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!(
+                    "validator: failed to run php lint for {}: {e}",
+                    abs.display()
+                );
+                return Vec::new();
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "validator: php lint failed for {}: {}",
+                abs.display(),
+                stderr.trim()
+            );
+            errors.push(PathBuf::from("metadata").join(rel));
+        }
+    }
+    errors.sort();
+    errors
+}
+
+fn is_php_cli_available() -> bool {
+    Command::new("php")
+        .arg("-n")
+        .arg("-v")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +301,25 @@ mod tests {
         fs::write(rust_dir.path().join("f.php"), "<?php return 2;").unwrap();
         let result = validate(php_dir.path(), rust_dir.path());
         assert_eq!(result.files_with_diff.len(), 1);
+    }
+
+    #[test]
+    fn test_metadata_syntax_error_detected() {
+        if !is_php_cli_available() {
+            return;
+        }
+
+        let php_dir = tempdir().unwrap();
+        let rust_dir = tempdir().unwrap();
+        let rust_meta = rust_dir.path().join("metadata");
+        fs::create_dir_all(&rust_meta).unwrap();
+        fs::write(rust_meta.join("bad.php"), "<?php return [").unwrap();
+
+        let result = validate(php_dir.path(), rust_dir.path());
+        assert_eq!(result.metadata_syntax_errors.len(), 1);
+        assert_eq!(
+            result.metadata_syntax_errors[0],
+            PathBuf::from("metadata/bad.php")
+        );
     }
 }

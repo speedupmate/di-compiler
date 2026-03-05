@@ -58,8 +58,18 @@ pub struct ResolvedArg {
 pub enum ResolvedArgValue {
     SharedInstance(String),
     NonSharedInstance(String),
-    Scalar(String),
+    Scalar(ResolvedScalar),
     Null,
     Array(Vec<ResolvedArg>),
-    GlobalArgRef { arg_name: String, default: Option<String> },
+    GlobalArgRef {
+        arg_name: String,
+        default: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ResolvedScalar {
+    String(String),
+    Number(String),
+    Bool(bool),
 }
