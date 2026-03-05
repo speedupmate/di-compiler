@@ -10,6 +10,11 @@ pub fn extract_file(path: &Path) -> ExtractResult {
     match Lexer::extract(path) {
         Ok(info) => ExtractResult::Ok(info),
         Err(LexError::Io(e)) => ExtractResult::PhpFallbackFailed(format!("IO: {e}")),
+        Err(LexError::Unsupported(ref reason)) if reason == "no_class" => ExtractResult::NoClass,
+        Err(LexError::Unsupported(ref reason)) if reason == "enum" => ExtractResult::NoClass,
+        Err(LexError::Unsupported(ref reason)) if reason == "anonymous_class" => {
+            ExtractResult::NoClass
+        }
         Err(e @ LexError::Unsupported(_)) | Err(e @ LexError::UnexpectedEof) => {
             log::debug!("Tier1 failed for {}: {e} — trying tree-sitter", path.display());
             match extract_tier2(path) {
