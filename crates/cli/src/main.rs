@@ -295,6 +295,8 @@ fn main() {
     pb.finish_with_message("done");
 
     let di_config = merge_configs(global_di_configs.clone());
+    // HashSet for O(1) membership tests — used in Phase 3b and Phase 7 filters.
+    let di_xml_files_set: HashSet<&PathBuf> = di_xml_files.iter().collect();
     log_phase_elapsed("Phase 3a", phase_3a_started);
 
     // -----------------------------------------------------------------------
@@ -310,7 +312,7 @@ fn main() {
     // Only parse files not already in the global set
     let extra_di_files: Vec<_> = all_di_xml_files
         .iter()
-        .filter(|p| !di_xml_files.contains(p))
+        .filter(|p| !di_xml_files_set.contains(p))
         .collect();
 
     let extra_configs: Vec<_> = extra_di_files
@@ -520,7 +522,7 @@ fn main() {
     );
     let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let reflected_ctor_params: HashMap<String, Vec<ConstructorParam>> = interceptors
-        .iter()
+        .par_iter()
         .filter_map(|spec| {
             let info = interceptor_target_info_with_inherited_constructor(
                 &spec.fqcn,
@@ -735,41 +737,42 @@ fn main() {
     let _ = write_if_changed(&interception_path, &interception_content);
 
     // Per-area config files — each area merges global + area-specific di.xml overlays.
-    let mut area_di_configs: HashMap<String, DiConfig> = HashMap::new();
+    // Run in parallel: each area is independent (different files, different output path).
     let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
-    for area in AREAS {
-        let area_di_files = find_di_xml_files_for_area(&magento_root, area);
+    let area_di_configs: HashMap<String, DiConfig> = AREAS
+        .par_iter()
+        .map(|&area| {
+            let area_di_files = find_di_xml_files_for_area(&magento_root, area);
 
-        // Only re-merge if there are area-specific files beyond the global set
-        let area_di_config = if area_di_files.len() > di_xml_files.len() {
-            // Parse only the incremental area-specific files, then merge on top
-            let area_only: Vec<_> = area_di_files
-                .iter()
-                .filter(|p| !di_xml_files.contains(p))
-                .collect();
-            if area_only.is_empty() {
-                di_config.clone()
-            } else {
-                let extra_configs: Vec<_> = area_only
+            // Only re-merge if there are area-specific files beyond the global set.
+            let area_di_config = if area_di_files.len() > di_xml_files.len() {
+                let area_only: Vec<_> = area_di_files
                     .iter()
-                    .filter_map(|p| parse_di_xml(p).ok())
+                    .filter(|p| !di_xml_files_set.contains(p))
                     .collect();
-                let mut merged_area = di_config.clone();
-                let overlay = merge_configs(extra_configs);
-                merge_into(&mut merged_area, overlay);
-                merged_area
-            }
-        } else {
-            di_config.clone()
-        };
+                if area_only.is_empty() {
+                    di_config.clone()
+                } else {
+                    let extra_configs: Vec<_> = area_only
+                        .iter()
+                        .filter_map(|p| parse_di_xml(p).ok())
+                        .collect();
+                    let mut merged_area = di_config.clone();
+                    merge_into(&mut merged_area, merge_configs(extra_configs));
+                    merged_area
+                }
+            } else {
+                di_config.clone()
+            };
 
-        let area_args = resolve_all_arguments(&class_map, &area_di_config);
-        let area_content = generate_area_config(&area_args, &area_di_config);
-        let area_path = metadata_root.join(format!("{}.php", area));
-        let _ = write_if_changed(&area_path, &area_content);
-        area_di_configs.insert((*area).to_string(), area_di_config);
-        pb_area.inc(1);
-    }
+            let area_args = resolve_all_arguments(&class_map, &area_di_config);
+            let area_content = generate_area_config(&area_args, &area_di_config);
+            let area_path = metadata_root.join(format!("{}.php", area));
+            let _ = write_if_changed(&area_path, &area_content);
+            pb_area.inc(1);
+            (area.to_string(), area_di_config)
+        })
+        .collect();
     pb_area.finish_with_message("done");
 
     // Scope-specific plugin-list metadata files.
@@ -1421,78 +1424,196 @@ fn enrich_interceptor_specs_with_reflection(
     magento_root: &Path,
     php_bin: &str,
 ) {
-    let mut reflection_cache: HashMap<String, Option<Vec<MethodSignature>>> = HashMap::new();
-    let mut plugin_method_cache: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    // -----------------------------------------------------------------
+    // Phase A: collect unique plugin class FQCNs not in class_map,
+    // then reflect them all in parallel to build a plugin-method lookup
+    // table.  Replaces the old sequential plugin_method_cache loop.
+    // -----------------------------------------------------------------
+    let plugin_fqcns_to_reflect: HashSet<String> = specs
+        .iter()
+        .flat_map(|spec| {
+            spec.plugins.iter().flat_map(|p| {
+                let resolved = di_config
+                    .get_instance_type(&p.type_name)
+                    .trim_start_matches('\\')
+                    .to_string();
+                let raw = p.type_name.trim_start_matches('\\').to_string();
+                [resolved, raw]
+            })
+        })
+        .filter(|fqcn| !fqcn.is_empty() && !class_map.contains_key(fqcn))
+        .collect();
 
+    let plugin_method_map: HashMap<String, HashSet<String>> = plugin_fqcns_to_reflect
+        .par_iter()
+        .filter_map(|fqcn| {
+            let methods = reflect_interceptable_methods(fqcn, magento_root, php_bin)?;
+            let names: HashSet<String> = methods
+                .iter()
+                .filter_map(|m| plugin_method_to_intercepted(&m.name))
+                .collect();
+            if names.is_empty() {
+                None
+            } else {
+                Some((fqcn.clone(), names))
+            }
+        })
+        .collect();
+
+    // -----------------------------------------------------------------
+    // Phase B: determine which spec FQCNs need their own reflection,
+    // then reflect them all in parallel.  Replaces the old sequential
+    // reflection_cache loop.
+    // -----------------------------------------------------------------
+    let specs_needing_reflection: HashSet<String> = specs
+        .iter()
+        .filter(|spec| spec_needs_reflection(spec, class_map, di_config, &plugin_method_map))
+        .map(|spec| spec.fqcn.clone())
+        .collect();
+
+    let spec_reflection_map: HashMap<String, Vec<MethodSignature>> = specs_needing_reflection
+        .par_iter()
+        .filter_map(|fqcn| {
+            let mut methods = reflect_interceptable_methods(fqcn, magento_root, php_bin)?;
+            for m in &mut methods {
+                normalize_reflected_method_signature(m, fqcn, class_map);
+            }
+            Some((fqcn.clone(), methods))
+        })
+        .collect();
+
+    log::debug!(
+        "enrich_interceptor_specs: {} plugin FQCNs reflected, {} spec FQCNs reflected",
+        plugin_fqcns_to_reflect.len(),
+        specs_needing_reflection.len(),
+    );
+
+    // -----------------------------------------------------------------
+    // Phase C: apply — sequential, pure computation, no I/O.
+    // self/static/parent and union types are already normalised by
+    // normalize_reflected_method_signature above; class-constant
+    // defaults come through via PHP reflection in Phase B.
+    // -----------------------------------------------------------------
     for spec in specs.iter_mut() {
-        let needs_signature_normalization =
-            interceptor_methods_need_reflection_normalization(&spec.public_methods);
+        let needs_sig = interceptor_methods_need_reflection_normalization(&spec.public_methods);
         let expected = if spec.plugins.is_empty() {
             HashSet::new()
         } else {
-            derive_intercepted_method_names_from_plugins(
-                &spec.plugins,
-                class_map,
-                di_config,
-                magento_root,
-                php_bin,
-                &mut plugin_method_cache,
-            )
+            compute_expected_method_names(&spec.plugins, class_map, di_config, &plugin_method_map)
         };
-        if spec.plugins.is_empty() && !needs_signature_normalization {
+
+        if spec.plugins.is_empty() && !needs_sig {
             continue;
         }
-        if !spec.plugins.is_empty() && expected.is_empty() && !needs_signature_normalization {
+        if !spec.plugins.is_empty() && expected.is_empty() && !needs_sig {
             continue;
         }
 
         let current: HashSet<String> = spec.public_methods.iter().map(|m| m.name.clone()).collect();
         let missing_expected = !spec.plugins.is_empty() && !expected.is_subset(&current);
-        if !missing_expected && !needs_signature_normalization {
+        if !missing_expected && !needs_sig {
             continue;
         }
 
-        let reflected = reflection_cache
-            .entry(spec.fqcn.clone())
-            .or_insert_with(|| reflect_interceptable_methods(&spec.fqcn, magento_root, php_bin))
-            .clone();
-
-        let Some(mut reflected_methods) = reflected else {
+        let Some(reflected_methods) = spec_reflection_map.get(&spec.fqcn) else {
             continue;
         };
-        for method in reflected_methods.iter_mut() {
-            normalize_reflected_method_signature(method, &spec.fqcn, class_map);
-        }
 
-        let reflected_by_name: HashMap<String, MethodSignature> = reflected_methods
+        let reflected_by_name: HashMap<&str, &MethodSignature> = reflected_methods
             .iter()
-            .map(|m| (m.name.clone(), m.clone()))
+            .map(|m| (m.name.as_str(), m))
             .collect();
 
         if !missing_expected {
-            // Keep resolver-selected method set/order, but normalize signatures/defaults
-            // from reflection where available to match Magento output.
+            // Keep resolver-selected method set/order; normalise signatures
+            // from reflection (self→concrete, static→concrete, union order, defaults).
             spec.public_methods = spec
                 .public_methods
                 .iter()
                 .map(|m| {
                     reflected_by_name
-                        .get(&m.name)
+                        .get(m.name.as_str())
+                        .copied()
                         .cloned()
                         .unwrap_or_else(|| m.clone())
                 })
                 .collect();
-            continue;
-        }
-
-        let reflected_filtered: Vec<MethodSignature> = reflected_methods
-            .into_iter()
-            .filter(|m| expected.contains(&m.name))
-            .collect();
-        if !reflected_filtered.is_empty() {
-            spec.public_methods = reflected_filtered;
+        } else {
+            let filtered: Vec<MethodSignature> = reflected_methods
+                .iter()
+                .filter(|m| expected.contains(&m.name))
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                spec.public_methods = filtered;
+            }
         }
     }
+}
+
+/// Returns true when `spec` needs PHP reflection — either its method signatures
+/// contain types requiring normalisation (self/static/parent/union/constants) or
+/// it has plugin registrations whose expected intercepted methods are not present.
+fn spec_needs_reflection(
+    spec: &di_resolver::InterceptorSpec,
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    plugin_method_map: &HashMap<String, HashSet<String>>,
+) -> bool {
+    if interceptor_methods_need_reflection_normalization(&spec.public_methods) {
+        return true;
+    }
+    if spec.plugins.is_empty() {
+        return false;
+    }
+    let expected =
+        compute_expected_method_names(&spec.plugins, class_map, di_config, plugin_method_map);
+    if expected.is_empty() {
+        return false;
+    }
+    let current: HashSet<&str> = spec
+        .public_methods
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    !expected.iter().all(|e| current.contains(e.as_str()))
+}
+
+/// Compute the set of intercepted method names expected from a plugin list,
+/// using class_map data and the precomputed plugin-method reflection map.
+/// Pure computation — no I/O.
+fn compute_expected_method_names(
+    plugins: &[di_resolver::PluginRef],
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    plugin_method_map: &HashMap<String, HashSet<String>>,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for plugin in plugins {
+        let resolved = di_config
+            .get_instance_type(&plugin.type_name)
+            .trim_start_matches('\\')
+            .to_string();
+        let raw = plugin.type_name.trim_start_matches('\\').to_string();
+        let mut candidates = vec![resolved, raw];
+        candidates.sort();
+        candidates.dedup();
+        candidates.retain(|c| !c.is_empty());
+
+        for candidate in &candidates {
+            if let Some(plugin_info) = class_map.get(candidate) {
+                for method in &plugin_info.public_methods {
+                    if let Some(name) = plugin_method_to_intercepted(&method.name) {
+                        names.insert(name);
+                    }
+                }
+            }
+            if let Some(reflected_names) = plugin_method_map.get(candidate) {
+                names.extend(reflected_names.iter().cloned());
+            }
+        }
+    }
+    names
 }
 
 fn interceptor_methods_need_reflection_normalization(methods: &[MethodSignature]) -> bool {
@@ -1602,58 +1723,6 @@ fn normalize_reflected_type_hint(
     }
 
     format!("{}{}", nullable, normalize_single(core))
-}
-
-fn derive_intercepted_method_names_from_plugins(
-    plugins: &[di_resolver::PluginRef],
-    class_map: &HashMap<String, ClassInfo>,
-    di_config: &DiConfig,
-    magento_root: &Path,
-    php_bin: &str,
-    plugin_method_cache: &mut HashMap<String, Option<HashSet<String>>>,
-) -> HashSet<String> {
-    let mut names = HashSet::new();
-
-    for plugin in plugins {
-        let resolved = di_config.get_instance_type(&plugin.type_name);
-        let mut candidates = vec![
-            resolved.trim_start_matches('\\').to_string(),
-            plugin.type_name.trim_start_matches('\\').to_string(),
-        ];
-        candidates.sort();
-        candidates.dedup();
-        candidates.retain(|c| !c.is_empty());
-
-        for candidate in &candidates {
-            if let Some(plugin_info) = class_map.get(candidate) {
-                for method in &plugin_info.public_methods {
-                    if let Some(name) = plugin_method_to_intercepted(&method.name) {
-                        names.insert(name);
-                    }
-                }
-            }
-
-            let reflected = plugin_method_cache
-                .entry(candidate.clone())
-                .or_insert_with(|| {
-                    reflect_interceptable_methods(candidate, magento_root, php_bin).map(|methods| {
-                        let mut method_names = HashSet::new();
-                        for method in methods {
-                            if let Some(name) = plugin_method_to_intercepted(&method.name) {
-                                method_names.insert(name);
-                            }
-                        }
-                        method_names
-                    })
-                })
-                .clone();
-            if let Some(method_names) = reflected {
-                names.extend(method_names);
-            }
-        }
-    }
-
-    names
 }
 
 fn plugin_method_to_intercepted(method: &str) -> Option<String> {

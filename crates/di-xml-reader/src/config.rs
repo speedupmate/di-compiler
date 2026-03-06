@@ -266,13 +266,39 @@ fn collect_di_xml_files(
 
                     // Nested module roots, e.g. package/src/<module>/registration.php
                     if discover_nested_modules {
-                        for module_root in discover_module_roots_from_registration(&p) {
+                        for module_root in cached_discover_module_roots(&p) {
                             push_module_di_paths(&module_root, priority, area, out);
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Cached wrapper around `discover_module_roots_from_registration`.
+    ///
+    /// `collect_di_xml_files` is called up to 16 times per process run (Phase 3a,
+    /// Phase 3b × 8 areas, Phase 7 × 7 areas) for the same package roots. Without
+    /// caching this means 1,392 DFS traversals across 87 non-magento vendor packages.
+    /// The cache reduces that to at most 87 traversals (one per unique package root).
+    fn cached_discover_module_roots(package_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<
+            Mutex<std::collections::HashMap<std::path::PathBuf, Vec<std::path::PathBuf>>>,
+        > = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        {
+            let map = cache.lock().unwrap();
+            if let Some(cached) = map.get(package_root) {
+                return cached.clone();
+            }
+        }
+        let roots = discover_module_roots_from_registration(package_root);
+        cache
+            .lock()
+            .unwrap()
+            .insert(package_root.to_path_buf(), roots.clone());
+        roots
     }
 
     // Priority 1: vendor/magento/*
