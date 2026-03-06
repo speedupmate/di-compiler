@@ -66,12 +66,19 @@ pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> 
         let value = if param.is_variadic || param.type_hint.is_none() || param.is_primitive {
             ResolvedArgValue::Null
         } else {
-            let type_hint = param.type_hint.as_ref().unwrap();
-            let concrete = di_config.get_preference(type_hint);
-            if di_config.is_shared(&concrete) {
-                ResolvedArgValue::SharedInstance(concrete)
+            if let Some(type_hint) = param
+                .type_hint
+                .as_deref()
+                .and_then(first_non_null_class_type_hint_arm)
+            {
+                let concrete = di_config.get_preference(&type_hint);
+                if di_config.is_shared(&concrete) {
+                    ResolvedArgValue::SharedInstance(concrete)
+                } else {
+                    ResolvedArgValue::NonSharedInstance(concrete)
+                }
             } else {
-                ResolvedArgValue::NonSharedInstance(concrete)
+                ResolvedArgValue::Null
             }
         };
 
@@ -82,6 +89,20 @@ pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> 
     }
 
     resolved
+}
+
+fn first_non_null_class_type_hint_arm(type_hint: &str) -> Option<String> {
+    const NON_CLASS_TYPES: &[&str] = &[
+        "null", "false", "true", "int", "float", "string", "bool", "array", "callable", "iterable",
+        "object", "mixed", "void", "never", "self", "parent", "static",
+    ];
+
+    type_hint
+        .split('|')
+        .map(str::trim)
+        .map(|arm| arm.trim_start_matches('?').trim_start_matches('\\'))
+        .find(|arm| !arm.is_empty() && !NON_CLASS_TYPES.contains(arm))
+        .map(ToOwned::to_owned)
 }
 
 fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue {
@@ -164,6 +185,7 @@ mod tests {
                         name: n.to_string(),
                         type_hint: t.map(|s| s.to_string()),
                         is_optional: false,
+                        default_value: None,
                         is_primitive: t
                             .map(|s| matches!(s, "string" | "int" | "bool" | "float"))
                             .unwrap_or(false),
@@ -227,6 +249,54 @@ mod tests {
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("options", None)]),
         );
+        let di_config = DiConfig::default();
+        let map = resolve_all_arguments(&class_map, &di_config);
+        let args = &map["App\\Service"];
+        assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
+    }
+
+    #[test]
+    fn test_nullable_object_type_hint_normalized() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("dep", Some("?App\\Dep"))]),
+        );
+
+        let di_config = DiConfig::default();
+        let map = resolve_all_arguments(&class_map, &di_config);
+        let args = &map["App\\Service"];
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\Dep"
+        ));
+    }
+
+    #[test]
+    fn test_union_with_primitive_uses_class_arm() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("dep", Some("string|App\\Dep"))]),
+        );
+
+        let di_config = DiConfig::default();
+        let map = resolve_all_arguments(&class_map, &di_config);
+        let args = &map["App\\Service"];
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\Dep"
+        ));
+    }
+
+    #[test]
+    fn test_union_without_class_resolves_null() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("dep", Some("string|null"))]),
+        );
+
         let di_config = DiConfig::default();
         let map = resolve_all_arguments(&class_map, &di_config);
         let args = &map["App\\Service"];

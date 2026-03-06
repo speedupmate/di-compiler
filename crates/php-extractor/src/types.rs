@@ -36,6 +36,7 @@ pub struct ConstructorParam {
     pub name: String,
     pub type_hint: Option<String>,
     pub is_optional: bool,
+    pub default_value: Option<String>,
     pub is_primitive: bool,
     pub is_variadic: bool,
     /// Constructor promotion: visibility keyword present
@@ -57,6 +58,7 @@ pub struct MethodParam {
     pub name: String,
     pub type_hint: Option<String>,
     pub has_default: bool,
+    pub default_value: Option<String>,
     pub is_variadic: bool,
     pub is_by_ref: bool,
 }

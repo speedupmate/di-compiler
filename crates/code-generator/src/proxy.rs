@@ -6,8 +6,8 @@
 //!
 //! The proxy delegates all public methods to `_getSubject()`.
 
-use php_extractor::types::{ClassInfo, ClassKind, MethodSignature};
 use di_resolver::ProxySpec;
+use php_extractor::types::{ClassInfo, ClassKind, MethodSignature};
 
 /// Generate the PHP source for a Proxy class.
 ///
@@ -44,7 +44,8 @@ pub fn generate_proxy(spec: &ProxySpec, target_info: Option<&ClassInfo>) -> Stri
     out.push_str(&format!("/**\n * Proxy class for @see \\{}\n */\n", target));
     out.push_str(&format!("class Proxy {}\n{{\n", inheritance));
 
-    out.push_str(r#"    /**
+    out.push_str(
+        r#"    /**
      * Object Manager instance
      *
      * @var \Magento\Framework\ObjectManagerInterface
@@ -61,10 +62,12 @@ pub fn generate_proxy(spec: &ProxySpec, target_info: Option<&ClassInfo>) -> Stri
     /**
      * Proxied instance
      *
-"#);
+"#,
+    );
     out.push_str(&format!("     * @var \\{}\n     */\n", target));
     out.push_str("    protected $_subject = null;\n\n");
-    out.push_str(r#"    /**
+    out.push_str(
+        r#"    /**
      * Instance shareability flag
      *
      * @var bool
@@ -78,7 +81,8 @@ pub fn generate_proxy(spec: &ProxySpec, target_info: Option<&ClassInfo>) -> Stri
      * @param string $instanceName
      * @param bool $shared
      */
-"#);
+"#,
+    );
     out.push_str(&format!(
         "    public function __construct(\\Magento\\Framework\\ObjectManagerInterface $objectManager, $instanceName = '\\\\{}', $shared = true)\n    {{\n",
         target.replace('\\', "\\\\")
@@ -148,19 +152,38 @@ pub fn generate_proxy(spec: &ProxySpec, target_info: Option<&ClassInfo>) -> Stri
     ));
 
     // Delegating methods
+    let mut rendered_methods: Vec<String> = Vec::new();
     for method in &public_methods {
-        out.push_str(&render_proxy_method(method));
+        if method.name == "_resetState" {
+            rendered_methods.push(
+                "    /**\n     * Reset state of proxied instance\n     */\n    public function _resetState() : void\n    {\n        if ($this->_subject) {\n            $this->_subject->_resetState(); \n        }\n    }\n"
+                    .to_string(),
+            );
+            continue;
+        }
+        if let Some(rendered) = render_proxy_method(method) {
+            rendered_methods.push(rendered);
+        }
+    }
+    if !rendered_methods.is_empty() {
+        out.push_str(&rendered_methods.join("\n"));
     }
 
     out.push_str("}\n");
     out
 }
 
-fn render_proxy_method(m: &MethodSignature) -> String {
+fn render_proxy_method(m: &MethodSignature) -> Option<String> {
+    if matches!(
+        m.name.as_str(),
+        "__sleep" | "__wakeup" | "__clone" | "__debugInfo" | "_resetState"
+    ) {
+        return None;
+    }
     // Skip static methods — _getSubject() is an instance method and cannot be
     // called in a static context.
     if m.is_static {
-        return String::new();
+        return None;
     }
 
     let is_void = m
@@ -186,9 +209,15 @@ fn render_proxy_method(m: &MethodSignature) -> String {
                     part.push_str(&format!("{} ", rendered));
                 }
             }
+            if p.is_by_ref {
+                part.push('&');
+            }
             part.push_str(&format!("${}", p.name));
-            if p.has_default && !p.is_variadic {
-                part.push_str(" = null");
+            if !p.is_variadic {
+                if let Some(default_value) = &p.default_value {
+                    part.push_str(" = ");
+                    part.push_str(default_value);
+                }
             }
             part
         })
@@ -196,7 +225,10 @@ fn render_proxy_method(m: &MethodSignature) -> String {
     s.push_str(&params_str.join(", "));
 
     if let Some(ret) = &m.return_type {
-        s.push_str(&format!(") : {}", ret));
+        s.push_str(&format!(
+            ") : {}",
+            crate::interceptor::render_type_hint(ret)
+        ));
     } else {
         s.push(')');
     }
@@ -216,18 +248,18 @@ fn render_proxy_method(m: &MethodSignature) -> String {
 
     if is_void {
         s.push_str(&format!(
-            "        $this->_getSubject()->{}({});\n    }}\n\n",
+            "        $this->_getSubject()->{}({});\n    }}\n",
             m.name,
             arg_names.join(", ")
         ));
     } else {
         s.push_str(&format!(
-            "        return $this->_getSubject()->{}({});\n    }}\n\n",
+            "        return $this->_getSubject()->{}({});\n    }}\n",
             m.name,
             arg_names.join(", ")
         ));
     }
-    s
+    Some(s)
 }
 
 /// Return the file path for a proxy: `generated/code/Foo/Bar/Proxy.php`.

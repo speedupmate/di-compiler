@@ -5,9 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::types::{
-    ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult,
-};
+use crate::types::{ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult};
 
 /// Path to PHP binary. Can be overridden via FAST_DI_PHP env var.
 fn php_bin() -> String {
@@ -266,11 +264,13 @@ fn parse_params_array(json: &str) -> Vec<ConstructorParam> {
                             let is_optional = obj.contains(r#""is_optional":true"#);
                             let is_variadic = obj.contains(r#""is_variadic":true"#);
                             let is_promoted = obj.contains(r#""is_promoted":true"#);
-                            let is_primitive = type_hint.as_deref().map(is_primitive_type).unwrap_or(true);
+                            let is_primitive =
+                                type_hint.as_deref().map(is_primitive_type).unwrap_or(true);
                             params.push(ConstructorParam {
                                 name,
                                 type_hint,
                                 is_optional,
+                                default_value: None,
                                 is_primitive,
                                 is_variadic,
                                 is_promoted,
@@ -294,9 +294,26 @@ fn parse_params_array(json: &str) -> Vec<ConstructorParam> {
 fn is_primitive_type(t: &str) -> bool {
     matches!(
         t,
-        "int" | "integer" | "float" | "double" | "string" | "bool" | "boolean"
-            | "array" | "callable" | "iterable" | "void" | "null" | "mixed"
-            | "never" | "true" | "false" | "object" | "self" | "static" | "parent"
+        "int"
+            | "integer"
+            | "float"
+            | "double"
+            | "string"
+            | "bool"
+            | "boolean"
+            | "array"
+            | "callable"
+            | "iterable"
+            | "void"
+            | "null"
+            | "mixed"
+            | "never"
+            | "true"
+            | "false"
+            | "object"
+            | "self"
+            | "static"
+            | "parent"
     )
 }
 

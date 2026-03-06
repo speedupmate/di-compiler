@@ -1,12 +1,12 @@
+pub mod config;
+pub mod merger;
 pub mod model;
 pub mod parser;
-pub mod merger;
-pub mod config;
 
-pub use model::{DiConfig, Plugin, TypeConfig, Argument, VirtualType, Preference};
-pub use parser::{parse_di_xml, parse_di_xml_impl};
+pub use config::{find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area};
 pub use merger::{merge_configs, merge_into};
-pub use config::{find_di_xml_files, find_di_xml_files_for_area, find_all_di_xml_files};
+pub use model::{Argument, DiConfig, Plugin, Preference, TypeConfig, VirtualType};
+pub use parser::{parse_di_xml, parse_di_xml_impl};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

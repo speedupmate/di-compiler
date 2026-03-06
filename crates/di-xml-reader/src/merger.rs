@@ -87,22 +87,51 @@ mod tests {
         c2.preferences.insert("Iface".into(), "Impl2".into());
 
         let merged = merge_configs(vec![c1, c2]);
-        assert_eq!(merged.preferences.get("Iface").map(|s| s.as_str()), Some("Impl2"));
+        assert_eq!(
+            merged.preferences.get("Iface").map(|s| s.as_str()),
+            Some("Impl2")
+        );
     }
 
     #[test]
     fn test_plugins_merged_by_name() {
         let mut c1 = DiConfig::default();
-        c1.plugins.insert("Foo".into(), vec![
-            Plugin { name: "p1".into(), type_name: "T1".into(), sort_order: 10, disabled: false },
-            Plugin { name: "p2".into(), type_name: "T2".into(), sort_order: 20, disabled: false },
-        ]);
+        c1.plugins.insert(
+            "Foo".into(),
+            vec![
+                Plugin {
+                    name: "p1".into(),
+                    type_name: "T1".into(),
+                    sort_order: 10,
+                    disabled: false,
+                },
+                Plugin {
+                    name: "p2".into(),
+                    type_name: "T2".into(),
+                    sort_order: 20,
+                    disabled: false,
+                },
+            ],
+        );
 
         let mut c2 = DiConfig::default();
-        c2.plugins.insert("Foo".into(), vec![
-            Plugin { name: "p1".into(), type_name: "T1Updated".into(), sort_order: 5, disabled: false },
-            Plugin { name: "p3".into(), type_name: "T3".into(), sort_order: 30, disabled: false },
-        ]);
+        c2.plugins.insert(
+            "Foo".into(),
+            vec![
+                Plugin {
+                    name: "p1".into(),
+                    type_name: "T1Updated".into(),
+                    sort_order: 5,
+                    disabled: false,
+                },
+                Plugin {
+                    name: "p3".into(),
+                    type_name: "T3".into(),
+                    sort_order: 30,
+                    disabled: false,
+                },
+            ],
+        );
 
         let merged = merge_configs(vec![c1, c2]);
         let plugins = merged.plugins.get("Foo").unwrap();

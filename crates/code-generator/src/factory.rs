@@ -5,14 +5,32 @@ use di_resolver::FactorySpec;
 /// Generate the PHP source for a Factory class.
 pub fn generate_factory(spec: &FactorySpec) -> String {
     let (ns, class_name) = split_fqcn(&spec.factory_fqcn);
-    let target_fqcn = &spec.target_fqcn;
-
-    format!(
-        r#"<?php
-namespace {ns};
-
-/**
- * Factory class for @see \{target}
+    let is_extension_interface_factory = spec.factory_fqcn.ends_with("ExtensionInterfaceFactory");
+    let target_fqcn =
+        if is_extension_interface_factory && spec.target_fqcn.ends_with("ExtensionInterface") {
+            spec.target_fqcn.trim_end_matches("Interface")
+        } else {
+            spec.target_fqcn.as_str()
+        };
+    let target_fqcn_escaped = format!("\\\\{}", target_fqcn.replace('\\', "\\\\"));
+    let mut out = String::new();
+    out.push_str("<?php\n");
+    if !ns.is_empty() {
+        out.push_str(&format!("namespace {};\n\n", ns));
+    }
+    let class_doc = if is_extension_interface_factory {
+        "ExtensionInterfaceFactory class"
+    } else {
+        "Factory class"
+    };
+    let ctor_doc = if is_extension_interface_factory {
+        "ExtensionInterfaceFactory constructor"
+    } else {
+        "Factory constructor"
+    };
+    out.push_str(&format!(
+        r#"/**
+ * {class_doc} for @see \{target}
  */
 class {class_name}
 {{
@@ -31,12 +49,12 @@ class {class_name}
     protected $_instanceName = null;
 
     /**
-     * Factory constructor
+     * {ctor_doc}
      *
      * @param \Magento\Framework\ObjectManagerInterface $objectManager
      * @param string $instanceName
      */
-    public function __construct(\Magento\Framework\ObjectManagerInterface $objectManager, $instanceName = '\{target}')
+    public function __construct(\Magento\Framework\ObjectManagerInterface $objectManager, $instanceName = '{target_escaped}')
     {{
         $this->_objectManager = $objectManager;
         $this->_instanceName = $instanceName;
@@ -54,10 +72,13 @@ class {class_name}
     }}
 }}
 "#,
-        ns = ns,
+        class_doc = class_doc,
+        ctor_doc = ctor_doc,
         target = target_fqcn,
+        target_escaped = target_fqcn_escaped,
         class_name = class_name,
-    )
+    ));
+    out
 }
 
 /// Return the file path for a factory: `generated/code/Foo/Bar/BazFactory.php`.
@@ -78,7 +99,10 @@ mod tests {
 
     #[test]
     fn test_factory_path() {
-        assert_eq!(factory_path("Foo\\Bar\\WidgetFactory"), "Foo/Bar/WidgetFactory.php");
+        assert_eq!(
+            factory_path("Foo\\Bar\\WidgetFactory"),
+            "Foo/Bar/WidgetFactory.php"
+        );
     }
 
     #[test]
@@ -91,6 +115,11 @@ mod tests {
         assert!(out.contains("namespace Foo\\Bar;"));
         assert!(out.contains("class WidgetFactory"));
         assert!(out.contains("\\Foo\\Bar\\Widget"));
+        assert!(
+            out.contains(
+                "public function __construct(\\Magento\\Framework\\ObjectManagerInterface $objectManager, $instanceName = '\\\\Foo\\\\Bar\\\\Widget')"
+            )
+        );
         assert!(out.contains("public function create(array $data = [])"));
     }
 }

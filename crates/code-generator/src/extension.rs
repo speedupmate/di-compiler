@@ -48,6 +48,13 @@ pub fn generate_extension_interface(spec: &ExtensionSpec) -> String {
         ));
     }
 
+    let methods = methods.trim_end().to_string();
+    let methods_block = if methods.is_empty() {
+        String::new()
+    } else {
+        format!("{methods}\n")
+    };
+
     format!(
         r#"<?php
 namespace {ns};
@@ -57,12 +64,12 @@ namespace {ns};
  */
 interface {class_name} extends \Magento\Framework\Api\ExtensionAttributesInterface
 {{
-{methods}}}
+{methods_block}}}
 "#,
         ns = ns,
         source = spec.source_interface_fqcn,
         class_name = class_name,
-        methods = methods,
+        methods_block = methods_block,
     )
 }
 
@@ -103,6 +110,13 @@ pub fn generate_extension(spec: &ExtensionSpec) -> String {
         ));
     }
 
+    let methods = methods.trim_end().to_string();
+    let methods_block = if methods.is_empty() {
+        String::new()
+    } else {
+        format!("{methods}\n")
+    };
+
     format!(
         r#"<?php
 namespace {ns};
@@ -112,13 +126,13 @@ namespace {ns};
  */
 class {class_name} extends \Magento\Framework\Api\AbstractSimpleObject implements {interface_name}
 {{
-{methods}}}
+{methods_block}}}
 "#,
         ns = ns,
         source = spec.source_interface_fqcn,
         class_name = class_name,
         interface_name = interface_name,
-        methods = methods,
+        methods_block = methods_block,
     )
 }
 
@@ -219,8 +233,8 @@ mod tests {
     fn sample_spec() -> ExtensionSpec {
         ExtensionSpec {
             source_interface_fqcn: "Magento\\GiftMessage\\Api\\Data\\MessageInterface".to_string(),
-            extension_interface_fqcn:
-                "Magento\\GiftMessage\\Api\\Data\\MessageExtensionInterface".to_string(),
+            extension_interface_fqcn: "Magento\\GiftMessage\\Api\\Data\\MessageExtensionInterface"
+                .to_string(),
             extension_class_fqcn: "Magento\\GiftMessage\\Api\\Data\\MessageExtension".to_string(),
             attributes: vec![
                 ExtensionAttributeSpec {

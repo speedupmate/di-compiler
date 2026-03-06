@@ -41,3 +41,7 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [035](TKT-035-hybrid-module-root-resolver.md) | Hybrid module-root resolver (Composer seed + registration fallback) | 09 | Ready | 034 |
 | [036](TKT-036-archive-baseline-diff-reporting.md) | Archive baseline diff reporting in fast-di-compile | 09 | Ready | 034 |
 | [037](TKT-037-comprehensive-readme-and-mit-license.md) | Comprehensive README plan and MIT licensing | 09 | Ready | 036 |
+| [038](TKT-038-interceptor-content-parity-method-surface-and-ctor-inheritance.md) | Interceptor content parity: method surface and constructor inheritance | 08 | Ready | 029, 034 |
+| [039](TKT-039-proxy-content-parity-defaults-and-interface-resolution.md) | Proxy content parity: defaults and interface resolution | 08 | Ready | 034 |
+| [040](TKT-040-extension-factory-content-parity-order-and-target-mapping.md) | Extension/factory content parity: ordering and target mapping | 08 | Ready | 031, 034 |
+| [041](TKT-041-final-content-diff-convergence-and-residual-documentation.md) | Final content diff convergence and residual documentation | 08 | Ready | 038, 039, 040 |

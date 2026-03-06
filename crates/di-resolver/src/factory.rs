@@ -158,6 +158,7 @@ mod tests {
                     name: "dep".to_string(),
                     type_hint: Some(param_type.to_string()),
                     is_optional: false,
+                    default_value: None,
                     is_primitive: false,
                     is_variadic: false,
                     is_promoted: false,

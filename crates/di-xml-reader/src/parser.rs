@@ -62,7 +62,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         if !name.is_empty() {
                             config.virtual_types.insert(
                                 name.clone(),
-                                VirtualType { name: name.clone(), type_name },
+                                VirtualType {
+                                    name: name.clone(),
+                                    type_name,
+                                },
                             );
                             config.type_configs.entry(name).or_default();
                         }
@@ -108,7 +111,12 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         if let Some(arg) = ctx_to_argument(ctx) {
                             let owner = current_type.as_ref().or(current_virtual.as_ref()).cloned();
                             if let Some(owner) = owner {
-                                config.type_configs.entry(owner).or_default().arguments.push(arg);
+                                config
+                                    .type_configs
+                                    .entry(owner)
+                                    .or_default()
+                                    .arguments
+                                    .push(arg);
                             }
                         }
                     }
@@ -166,7 +174,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                             current_type = None;
                             config.virtual_types.insert(
                                 name.clone(),
-                                VirtualType { name: name.clone(), type_name },
+                                VirtualType {
+                                    name: name.clone(),
+                                    type_name,
+                                },
                             );
                             config.type_configs.entry(name).or_default();
                         }
@@ -256,10 +267,8 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                     "argument" if in_arguments || !arg_stack.is_empty() => {
                         if let Some(ctx) = arg_stack.pop() {
                             if let Some(arg) = ctx_to_argument(ctx) {
-                                let owner = current_type
-                                    .as_ref()
-                                    .or(current_virtual.as_ref())
-                                    .cloned();
+                                let owner =
+                                    current_type.as_ref().or(current_virtual.as_ref()).cloned();
                                 if let Some(owner) = owner {
                                     config
                                         .type_configs
@@ -318,17 +327,35 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
             value: normalize(&ctx.text),
             shared: ctx.shared,
         },
-        "string" => Argument::String { name, value: ctx.text },
+        "string" => Argument::String {
+            name,
+            value: ctx.text,
+        },
         "boolean" => Argument::Boolean {
             name,
             value: ctx.text == "true" || ctx.text == "1",
         },
-        "number" => Argument::Number { name, value: ctx.text },
+        "number" => Argument::Number {
+            name,
+            value: ctx.text,
+        },
         "null" => Argument::Null { name },
-        "array" => Argument::Array { name, items: ctx.items },
-        "init_parameter" => Argument::Init { name, value: ctx.text },
-        "const" => Argument::Const { name, value: ctx.text },
-        _ => Argument::String { name, value: ctx.text },
+        "array" => Argument::Array {
+            name,
+            items: ctx.items,
+        },
+        "init_parameter" => Argument::Init {
+            name,
+            value: ctx.text,
+        },
+        "const" => Argument::Const {
+            name,
+            value: ctx.text,
+        },
+        _ => Argument::String {
+            name,
+            value: ctx.text,
+        },
     };
     Some(arg)
 }
@@ -345,7 +372,9 @@ fn local_name(name: &[u8]) -> String {
 fn parse_attrs(e: &quick_xml::events::BytesStart) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for attr in e.attributes().flatten() {
-        let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("").to_string();
+        let key = std::str::from_utf8(attr.key.as_ref())
+            .unwrap_or("")
+            .to_string();
         let val = attr.unescape_value().unwrap_or_default().to_string();
         map.insert(key.clone(), val.clone());
         // Also store by local name for namespace-prefixed attrs (e.g. xsi:type → type)
@@ -372,7 +401,10 @@ mod tests {
 </config>"#;
         let config = parse_di_xml_bytes(xml).unwrap();
         assert_eq!(
-            config.preferences.get("Foo\\Bar\\Interface").map(String::as_str),
+            config
+                .preferences
+                .get("Foo\\Bar\\Interface")
+                .map(String::as_str),
             Some("Foo\\Bar\\Impl")
         );
     }
@@ -414,7 +446,10 @@ mod tests {
 </config>"#;
         let config = parse_di_xml_bytes(xml).unwrap();
         assert!(config.virtual_types.contains_key("MyVirtual"));
-        assert_eq!(config.virtual_types["MyVirtual"].type_name, "Concrete\\Class");
+        assert_eq!(
+            config.virtual_types["MyVirtual"].type_name,
+            "Concrete\\Class"
+        );
     }
 
     #[test]

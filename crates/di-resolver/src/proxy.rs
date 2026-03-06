@@ -31,11 +31,7 @@ pub fn detect_proxies_from_configs(
     scanner_di_configs: &[DiConfig],
 ) -> Vec<ProxySpec> {
     let extra_existing_types = HashSet::new();
-    detect_proxies_from_configs_with_existing(
-        class_map,
-        scanner_di_configs,
-        &extra_existing_types,
-    )
+    detect_proxies_from_configs_with_existing(class_map, scanner_di_configs, &extra_existing_types)
 }
 
 /// Detect proxies with an explicit set of additional loadable class/interface

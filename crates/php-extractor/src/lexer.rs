@@ -436,7 +436,8 @@ impl<'a> Scanner<'a> {
                             part.split('\\').last().unwrap_or(&part).to_string()
                         });
                         if !alias.is_empty() && !part.is_empty() {
-                            self.use_map.insert(alias, format!("{}\\{}", base, part));
+                            self.use_map
+                                .insert(alias.to_ascii_lowercase(), format!("{}\\{}", base, part));
                         }
                     }
                     self.skip_noise();
@@ -463,7 +464,7 @@ impl<'a> Scanner<'a> {
             .try_read_as_alias()
             .unwrap_or_else(|| base.split('\\').last().unwrap_or(&base).to_string());
         if !alias.is_empty() {
-            self.use_map.insert(alias, base);
+            self.use_map.insert(alias.to_ascii_lowercase(), base);
         }
         self.skip_noise();
         if self.peek() == b';' {
@@ -507,7 +508,7 @@ impl<'a> Scanner<'a> {
         }
         // The first segment determines whether there's a use-import match.
         let first = raw.split('\\').next().unwrap_or(raw);
-        if let Some(mapped) = self.use_map.get(first) {
+        if let Some(mapped) = self.use_map.get(&first.to_ascii_lowercase()) {
             if raw.contains('\\') {
                 // e.g. `use Foo\Bar;` + type `Bar\Baz` → `Foo\Bar\Baz`
                 let rest = &raw[first.len() + 1..];
@@ -960,10 +961,14 @@ impl<'a> Scanner<'a> {
 
         self.skip_noise();
         let mut is_optional = is_nullable;
+        let mut default_value = None;
         if self.peek() == b'=' {
             is_optional = true;
             self.advance(1);
-            self.skip_default_value();
+            let value = self.read_default_value();
+            if !value.is_empty() {
+                default_value = Some(value);
+            }
         }
 
         let is_primitive = type_hint.as_deref().map(is_primitive_type).unwrap_or(true);
@@ -972,6 +977,7 @@ impl<'a> Scanner<'a> {
             name,
             type_hint,
             is_optional,
+            default_value,
             is_primitive,
             is_variadic,
             is_promoted,
@@ -1023,16 +1029,21 @@ impl<'a> Scanner<'a> {
 
         self.skip_noise();
         let mut has_default = false;
+        let mut default_value = None;
         if self.peek() == b'=' {
             has_default = true;
             self.advance(1);
-            self.skip_default_value();
+            let value = self.read_default_value();
+            if !value.is_empty() {
+                default_value = Some(value);
+            }
         }
 
         Ok(Some(MethodParam {
             name,
             type_hint,
             has_default,
+            default_value,
             is_variadic,
             is_by_ref,
         }))
@@ -1122,7 +1133,8 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    fn skip_default_value(&mut self) {
+    fn read_default_value(&mut self) -> String {
+        let start = self.pos;
         let mut paren: i32 = 0;
         let mut bracket: i32 = 0;
         loop {
@@ -1171,6 +1183,10 @@ impl<'a> Scanner<'a> {
                 _ => self.advance(1),
             }
         }
+        std::str::from_utf8(&self.src[start..self.pos])
+            .unwrap_or("")
+            .trim()
+            .to_string()
     }
 
     fn skip_to_param_end(&mut self) {

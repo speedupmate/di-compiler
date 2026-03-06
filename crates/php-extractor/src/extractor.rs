@@ -16,7 +16,10 @@ pub fn extract_file(path: &Path) -> ExtractResult {
             ExtractResult::NoClass
         }
         Err(e @ LexError::Unsupported(_)) | Err(e @ LexError::UnexpectedEof) => {
-            log::debug!("Tier1 failed for {}: {e} — trying tree-sitter", path.display());
+            log::debug!(
+                "Tier1 failed for {}: {e} — trying tree-sitter",
+                path.display()
+            );
             match extract_tier2(path) {
                 ExtractResult::Ok(info) => ExtractResult::Ok(info),
                 ExtractResult::NoClass => ExtractResult::NoClass,

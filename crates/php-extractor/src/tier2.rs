@@ -296,6 +296,10 @@ fn parse_ctor_params_ts(params_node: Node, src: &[u8]) -> Vec<ConstructorParam> 
                     .unwrap_or_default();
 
                 let has_default = child.child_by_field_name("default_value").is_some();
+                let default_value = child
+                    .child_by_field_name("default_value")
+                    .map(|n| node_text(n, src).trim().to_string())
+                    .filter(|v| !v.is_empty());
                 let is_nullable = child.child_by_field_name("nullable_type").is_some()
                     || type_hint
                         .as_ref()
@@ -307,6 +311,7 @@ fn parse_ctor_params_ts(params_node: Node, src: &[u8]) -> Vec<ConstructorParam> 
                     name,
                     type_hint,
                     is_optional: has_default || is_nullable,
+                    default_value,
                     is_primitive,
                     is_variadic,
                     is_promoted,
@@ -333,12 +338,17 @@ fn parse_method_params_ts(method: Node, src: &[u8]) -> Vec<MethodParam> {
                         .map(|n| node_text(n, src).trim().trim_start_matches('$').to_string())
                         .unwrap_or_default();
                     let has_default = child.child_by_field_name("default_value").is_some();
+                    let default_value = child
+                        .child_by_field_name("default_value")
+                        .map(|n| node_text(n, src).trim().to_string())
+                        .filter(|v| !v.is_empty());
                     let raw = node_text(child, src);
                     let is_by_ref = raw.contains("&$") || raw.trim_start().starts_with('&');
                     params.push(MethodParam {
                         name,
                         type_hint,
                         has_default,
+                        default_value,
                         is_variadic,
                         is_by_ref,
                     });
