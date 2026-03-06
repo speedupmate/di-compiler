@@ -142,8 +142,13 @@ pub fn find_di_xml_files_for_area(
 /// registrations across ALL areas, not just the global scope.
 pub fn find_all_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     const AREAS: &[&str] = &[
-        "global", "frontend", "adminhtml", "crontab",
-        "webapi_rest", "webapi_soap", "graphql",
+        "global",
+        "frontend",
+        "adminhtml",
+        "crontab",
+        "webapi_rest",
+        "webapi_soap",
+        "graphql",
     ];
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
@@ -173,12 +178,81 @@ fn collect_di_xml_files(
 ) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<(u8, std::path::PathBuf)> = Vec::new();
 
-    // Collect `<base>/<module>/etc/di.xml` and optionally `<base>/<module>/etc/<area>/di.xml`
+    fn push_module_di_paths(
+        module_root: &std::path::Path,
+        priority: u8,
+        area: Option<&str>,
+        out: &mut Vec<(u8, std::path::PathBuf)>,
+    ) {
+        let global = module_root.join("etc/di.xml");
+        if global.exists() {
+            out.push((priority, global));
+        }
+        if let Some(a) = area {
+            let area_di = module_root.join(format!("etc/{}/di.xml", a));
+            if area_di.exists() {
+                out.push((priority, area_di));
+            }
+        }
+    }
+
+    fn should_skip_scan_dir(name: &str) -> bool {
+        matches!(
+            name,
+            ".git" | "node_modules" | "Test" | "Tests" | "test" | "tests" | "dev"
+        )
+    }
+
+    fn discover_module_roots_from_registration(
+        package_root: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        let mut roots = Vec::new();
+        let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(package_root.to_path_buf(), 0)];
+        const MAX_DEPTH: usize = 6;
+
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > MAX_DEPTH {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_file() {
+                    if entry.file_name().to_string_lossy() == "registration.php" {
+                        if let Some(parent) = path.parent() {
+                            roots.push(parent.to_path_buf());
+                        }
+                    }
+                    continue;
+                }
+                if file_type.is_dir() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if should_skip_scan_dir(&name) {
+                        continue;
+                    }
+                    stack.push((path, depth + 1));
+                }
+            }
+        }
+
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    // Collect `<base>/<module>/etc/di.xml` and optionally `<base>/<module>/etc/<area>/di.xml`.
+    // For third-party packages, also honor nested module roots discovered via registration.php.
     fn collect_vendor(
         base: &std::path::Path,
         priority: u8,
         area: Option<&str>,
         out: &mut Vec<(u8, std::path::PathBuf)>,
+        discover_nested_modules: bool,
     ) {
         if !base.is_dir() {
             return;
@@ -187,14 +261,13 @@ fn collect_di_xml_files(
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    let global = p.join("etc/di.xml");
-                    if global.exists() {
-                        out.push((priority, global));
-                    }
-                    if let Some(a) = area {
-                        let area_di = p.join(format!("etc/{}/di.xml", a));
-                        if area_di.exists() {
-                            out.push((priority, area_di));
+                    // Direct module root (classic vendor/{vendor}/{module} layout)
+                    push_module_di_paths(&p, priority, area, out);
+
+                    // Nested module roots, e.g. package/src/<module>/registration.php
+                    if discover_nested_modules {
+                        for module_root in discover_module_roots_from_registration(&p) {
+                            push_module_di_paths(&module_root, priority, area, out);
                         }
                     }
                 }
@@ -203,15 +276,26 @@ fn collect_di_xml_files(
     }
 
     // Priority 1: vendor/magento/*
-    collect_vendor(&magento_root.join("vendor/magento"), 1, area, &mut paths);
+    collect_vendor(
+        &magento_root.join("vendor/magento"),
+        1,
+        area,
+        &mut paths,
+        false,
+    );
 
     // Priority 2: other vendor/vendor/* (non-magento)
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("vendor")) {
         for vendor in vendors.flatten() {
-            if vendor.file_name().to_str().map(|s| s == "magento").unwrap_or(false) {
+            if vendor
+                .file_name()
+                .to_str()
+                .map(|s| s == "magento")
+                .unwrap_or(false)
+            {
                 continue;
             }
-            collect_vendor(&vendor.path(), 2, area, &mut paths);
+            collect_vendor(&vendor.path(), 2, area, &mut paths, true);
         }
     }
 
@@ -252,8 +336,10 @@ fn normalize(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    
+
     use crate::model::{DiConfig, Plugin};
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_get_preference_simple() {
@@ -275,7 +361,7 @@ mod tests {
         let mut config = DiConfig::default();
         config.preferences.insert("A".into(), "B".into());
         config.preferences.insert("B".into(), "A".into()); // cycle
-        // Should not panic or loop forever
+                                                           // Should not panic or loop forever
         let _ = config.get_preference("A");
     }
 
@@ -288,10 +374,13 @@ mod tests {
     #[test]
     fn test_get_instance_type_virtual() {
         let mut config = DiConfig::default();
-        config.virtual_types.insert("MyVirtual".into(), crate::model::VirtualType {
-            name: "MyVirtual".into(),
-            type_name: "ConcreteClass".into(),
-        });
+        config.virtual_types.insert(
+            "MyVirtual".into(),
+            crate::model::VirtualType {
+                name: "MyVirtual".into(),
+                type_name: "ConcreteClass".into(),
+            },
+        );
         assert_eq!(config.get_instance_type("MyVirtual"), "ConcreteClass");
     }
 
@@ -304,14 +393,57 @@ mod tests {
     #[test]
     fn test_get_active_plugins_sorted() {
         let mut config = DiConfig::default();
-        config.plugins.insert("Foo".into(), vec![
-            Plugin { name: "c".into(), type_name: "TC".into(), sort_order: 30, disabled: false },
-            Plugin { name: "b".into(), type_name: "TB".into(), sort_order: 10, disabled: false },
-            Plugin { name: "a".into(), type_name: "TA".into(), sort_order: 10, disabled: true },
-        ]);
+        config.plugins.insert(
+            "Foo".into(),
+            vec![
+                Plugin {
+                    name: "c".into(),
+                    type_name: "TC".into(),
+                    sort_order: 30,
+                    disabled: false,
+                },
+                Plugin {
+                    name: "b".into(),
+                    type_name: "TB".into(),
+                    sort_order: 10,
+                    disabled: false,
+                },
+                Plugin {
+                    name: "a".into(),
+                    type_name: "TA".into(),
+                    sort_order: 10,
+                    disabled: true,
+                },
+            ],
+        );
         let active = config.get_active_plugins("Foo");
         assert_eq!(active.len(), 2); // 'a' is disabled
         assert_eq!(active[0].name, "b"); // lower sort_order first
         assert_eq!(active[1].name, "c");
+    }
+
+    #[test]
+    fn test_find_di_xml_files_includes_nested_registration_modules() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let module_root = root.join("vendor/acme/pkg/src/magento-cms");
+        fs::create_dir_all(module_root.join("etc/frontend")).unwrap();
+        fs::write(module_root.join("registration.php"), "<?php").unwrap();
+        fs::write(
+            module_root.join("etc/di.xml"),
+            r#"<?xml version="1.0"?><config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"></config>"#,
+        )
+        .unwrap();
+        fs::write(
+            module_root.join("etc/frontend/di.xml"),
+            r#"<?xml version="1.0"?><config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"></config>"#,
+        )
+        .unwrap();
+
+        let global = super::find_di_xml_files(root);
+        assert!(global.contains(&module_root.join("etc/di.xml")));
+
+        let frontend = super::find_di_xml_files_for_area(root, "frontend");
+        assert!(frontend.contains(&module_root.join("etc/frontend/di.xml")));
     }
 }

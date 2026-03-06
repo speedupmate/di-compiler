@@ -40,12 +40,23 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
         paths.push(framework);
     }
 
-    // Other third-party vendor modules: vendor/{vendor}/{module}/registration.php
-    // Some modules nest their source under a `src/` subdirectory.
+    // root setup source (no registration.php)
+    let setup = magento_root.join("setup");
+    if setup.is_dir() && !paths.contains(&setup) {
+        paths.push(setup);
+    }
+
+    // Other third-party vendor modules: vendor/{vendor}/{package}/.../registration.php
+    // Discover module roots from registration.php paths inside each package.
     let vendor_dir = magento_root.join("vendor");
     if let Ok(vendors) = std::fs::read_dir(&vendor_dir) {
         for vendor in vendors.flatten() {
-            if vendor.file_name().to_str().map(|s| s == "magento").unwrap_or(false) {
+            if vendor
+                .file_name()
+                .to_str()
+                .map(|s| s == "magento")
+                .unwrap_or(false)
+            {
                 continue; // already handled above
             }
             let vpath = vendor.path();
@@ -58,14 +69,8 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
                     if !mpath.is_dir() {
                         continue;
                     }
-                    // Direct registration.php
-                    if mpath.join("registration.php").exists() {
-                        paths.push(mpath.clone());
-                    }
-                    // Nested src/registration.php (e.g. hyva-themes pattern)
-                    let src = mpath.join("src");
-                    if src.is_dir() && src.join("registration.php").exists() {
-                        paths.push(src);
+                    for module_root in discover_module_roots_from_registration(&mpath) {
+                        paths.push(module_root);
                     }
                 }
             }
@@ -75,6 +80,53 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn discover_module_roots_from_registration(package_root: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(package_root.to_path_buf(), 0)];
+    const MAX_DEPTH: usize = 6;
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_file() {
+                if entry.file_name().to_string_lossy() == "registration.php" {
+                    if let Some(parent) = path.parent() {
+                        roots.push(parent.to_path_buf());
+                    }
+                }
+                continue;
+            }
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if should_skip_scan_dir(&name) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn should_skip_scan_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "node_modules" | "Test" | "Tests" | "test" | "tests" | "dev"
+    )
 }
 
 /// Walk PHP files across the given module paths, excluding Test directories.
@@ -146,7 +198,11 @@ mod tests {
         fs::write(root.join("src/tests/bar_test.php"), "<?php").unwrap();
 
         let files = walk_php_files(&[root.to_path_buf()]);
-        assert_eq!(files.len(), 1, "Only Foo.php should be found, not test files");
+        assert_eq!(
+            files.len(),
+            1,
+            "Only Foo.php should be found, not test files"
+        );
         assert!(files[0].ends_with("Foo.php"));
     }
 
@@ -162,7 +218,31 @@ mod tests {
         let r2 = walk_php_files(&[root.to_path_buf()]);
         assert_eq!(r1, r2);
         // sorted
-        let names: Vec<_> = r1.iter().map(|p| p.file_name().unwrap().to_str().unwrap()).collect();
+        let names: Vec<_> = r1
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
         assert_eq!(names, ["Aaa.php", "Mmm.php", "Zzz.php"]);
+    }
+
+    #[test]
+    fn test_read_module_paths_includes_setup_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("setup/src/Magento/Setup")).unwrap();
+        let paths = read_module_paths(root);
+        assert!(paths.contains(&root.join("setup")));
+    }
+
+    #[test]
+    fn test_read_module_paths_includes_nested_registration_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let module_root = root.join("vendor/acme/pkg/src/deep/module-a");
+        fs::create_dir_all(&module_root).unwrap();
+        fs::write(module_root.join("registration.php"), "<?php").unwrap();
+
+        let paths = read_module_paths(root);
+        assert!(paths.contains(&module_root));
     }
 }
