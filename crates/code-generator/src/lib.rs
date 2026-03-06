@@ -1,19 +1,21 @@
-pub mod interceptor;
+pub mod area_config;
+pub mod extension;
 pub mod factory;
+pub mod interceptor;
+pub mod metadata;
+pub mod plugin_list;
 pub mod proxy;
 pub mod repository;
-pub mod extension;
-pub mod area_config;
-pub mod metadata;
 pub mod writer;
 
-pub use interceptor::{generate_interceptor, interceptor_path};
-pub use factory::{generate_factory, factory_path};
-pub use proxy::{generate_proxy, proxy_path};
+pub use area_config::{generate_area_config, AREAS};
 pub use extension::{
-    generate_extension, generate_extension_interface, extension_path, ExtensionAttributeSpec,
+    extension_path, generate_extension, generate_extension_interface, ExtensionAttributeSpec,
     ExtensionSpec,
 };
+pub use factory::{factory_path, generate_factory};
+pub use interceptor::{generate_interceptor, interceptor_path};
 pub use metadata::{serialize_arguments_php, serialize_interception_php};
-pub use area_config::{generate_area_config, AREAS};
+pub use plugin_list::{compile_plugin_list, generate_plugin_list_php, serialize_plugin_list_php};
+pub use proxy::{generate_proxy, proxy_path};
 pub use writer::write_if_changed;

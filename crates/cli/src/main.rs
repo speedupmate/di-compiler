@@ -23,17 +23,17 @@ use serde::{Deserialize, Serialize};
 
 use code_generator::{
     extension_path, factory_path, generate_area_config, generate_extension,
-    generate_extension_interface, generate_factory, generate_interceptor, generate_proxy,
-    interceptor_path, proxy_path, serialize_interception_php, write_if_changed, ExtensionAttributeSpec,
-    ExtensionSpec, AREAS,
+    generate_extension_interface, generate_factory, generate_interceptor, generate_plugin_list_php,
+    generate_proxy, interceptor_path, proxy_path, serialize_interception_php, write_if_changed,
+    ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
     detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs_with_existing,
     resolve_all_arguments, FactorySpec,
 };
 use di_xml_reader::{
-    find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs, merge_into,
-    parse_di_xml, Argument, DiConfig,
+    find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs,
+    merge_into, parse_di_xml, Argument, DiConfig,
 };
 use php_extractor::{
     extract_file,
@@ -506,6 +506,7 @@ fn main() {
     let _ = write_if_changed(&interception_path, &interception_content);
 
     // Per-area config files — each area merges global + area-specific di.xml overlays.
+    let mut area_di_configs: HashMap<String, DiConfig> = HashMap::new();
     let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
     for area in AREAS {
         let area_di_files = find_di_xml_files_for_area(&magento_root, area);
@@ -537,9 +538,41 @@ fn main() {
         let area_content = generate_area_config(&area_args, &area_di_config);
         let area_path = metadata_root.join(format!("{}.php", area));
         let _ = write_if_changed(&area_path, &area_content);
+        area_di_configs.insert((*area).to_string(), area_di_config);
         pb_area.inc(1);
     }
     pb_area.finish_with_message("done");
+
+    // Scope-specific plugin-list metadata files.
+    let plugin_list_class_definitions: Vec<String> =
+        interceptors.iter().map(|spec| spec.fqcn.clone()).collect();
+    let plugin_scopes = [
+        "global",
+        "adminhtml",
+        "crontab",
+        "frontend",
+        "graphql",
+        "webapi_rest",
+        "webapi_soap",
+    ];
+    let pb_plugins = progress_bar(
+        plugin_scopes.len() as u64,
+        "Generating plugin-list metadata",
+    );
+    for scope in plugin_scopes {
+        if let Some(scope_di_config) = area_di_configs.get(scope) {
+            let content = generate_plugin_list_php(
+                scope_di_config,
+                &class_map,
+                &plugin_list_class_definitions,
+            );
+            let cache_id = plugin_list_cache_id(scope);
+            let path = metadata_root.join(format!("{}.php", cache_id));
+            let _ = write_if_changed(&path, &content);
+        }
+        pb_plugins.inc(1);
+    }
+    pb_plugins.finish_with_message("done");
 
     let total_written = written.load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
@@ -604,6 +637,14 @@ fn print_summary(
     println!("  Proxies:        {}", proxies.len());
     println!("  Classes with resolved args: {}", args_map.len());
     println!("  Total FQCNs (for interception.php): {}", all_fqcns.len());
+}
+
+fn plugin_list_cache_id(scope: &str) -> String {
+    if scope == "global" {
+        "primary|global|plugin-list".to_string()
+    } else {
+        format!("primary|global|{}|plugin-list", scope)
+    }
 }
 
 fn find_extension_attributes_files(magento_root: &Path, module_paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -752,10 +793,7 @@ fn collect_extension_specs(
                 source_interface_fqcn: source_interface.clone(),
                 extension_interface_fqcn: ext_interface,
                 extension_class_fqcn: ext_class,
-                attributes: xml_attrs
-                    .get(source_interface)
-                    .cloned()
-                    .unwrap_or_default(),
+                attributes: xml_attrs.get(source_interface).cloned().unwrap_or_default(),
             },
         );
     }
@@ -780,9 +818,10 @@ fn collect_extension_specs(
             .and_then(|m| m.return_type.as_deref())
             .and_then(first_non_null_type_hint_arm)
             .filter(|t| t.ends_with("ExtensionInterface"));
-        let inferred_from_docblock = parse_get_extension_attributes_return_from_docblock(&info.path)
-            .and_then(|r| first_non_null_type_hint_arm(&r))
-            .filter(|t| t.ends_with("ExtensionInterface"));
+        let inferred_from_docblock =
+            parse_get_extension_attributes_return_from_docblock(&info.path)
+                .and_then(|r| first_non_null_type_hint_arm(&r))
+                .filter(|t| t.ends_with("ExtensionInterface"));
         let Some(ext_interface) = inferred_from_signature.or(inferred_from_docblock) else {
             continue;
         };
@@ -806,7 +845,10 @@ fn collect_extension_specs(
                 source_interface_fqcn: source_interface.clone(),
                 extension_interface_fqcn: ext_interface,
                 extension_class_fqcn: ext_class,
-                attributes: xml_attrs.get(&source_interface).cloned().unwrap_or_default(),
+                attributes: xml_attrs
+                    .get(&source_interface)
+                    .cloned()
+                    .unwrap_or_default(),
             });
     }
 
@@ -819,7 +861,9 @@ fn collect_extension_specs(
     specs
 }
 
-fn derive_extension_names_from_source_interface(source_interface: &str) -> Option<(String, String)> {
+fn derive_extension_names_from_source_interface(
+    source_interface: &str,
+) -> Option<(String, String)> {
     let suffix = "Interface";
     if !source_interface.ends_with(suffix) {
         return None;
