@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 use code_generator::{
     extension_path, factory_path, generate_app_action_list_php, generate_area_config,
     generate_extension, generate_extension_interface, generate_factory, generate_interceptor,
-    generate_plugin_list_php, generate_proxy, interceptor_path, proxy_path,
+    generate_plugin_list_php, generate_proxy, generate_proxy_deferred, generate_search_results,
+    interceptor_path, proxy_deferred_path, proxy_path, search_results_path,
     serialize_interception_php, write_if_changed, ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
@@ -33,11 +34,11 @@ use di_resolver::{
 };
 use di_xml_reader::{
     find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs,
-    merge_into, parse_di_xml, Argument, DiConfig,
+    merge_into, parse_di_xml, Argument, DiConfig, Plugin,
 };
 use php_extractor::{
     extract_file,
-    types::{ClassInfo, ClassKind, ExtractResult},
+    types::{ClassInfo, ClassKind, ExtractResult, MethodParam, MethodSignature},
     walker::{read_module_paths, walk_php_files},
 };
 
@@ -82,6 +83,22 @@ struct Args {
     /// Verbose logging
     #[arg(long, short = 'v')]
     verbose: bool,
+
+    /// Compare output against archive baseline (_code/_metadata) after generation
+    #[arg(long)]
+    compare_archive: bool,
+
+    /// Archive root containing _code and _metadata (default: <magento-root>/generated)
+    #[arg(long)]
+    archive_root: Option<PathBuf>,
+
+    /// Where to write archive diff reports (default: <output>/diff)
+    #[arg(long)]
+    compare_report_dir: Option<PathBuf>,
+
+    /// Exit with code 1 when archive comparison has differences
+    #[arg(long)]
+    compare_fail_on_diff: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,9 +358,8 @@ fn main() {
         }
     }
 
-    let interceptors = detect_interceptors(&class_map, &full_di_config);
     let mut factories =
-        detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs);
+        detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs, &di_config);
     let proxies = detect_proxies_from_configs_with_existing(
         &class_map,
         &scanner_di_configs,
@@ -367,6 +383,58 @@ fn main() {
         });
     }
 
+    let search_results = detect_search_results_specs(
+        &class_map,
+        &full_di_config,
+        &factories,
+        composer_autoload.as_ref(),
+    );
+    let proxy_deferred =
+        detect_proxy_deferred_specs(&class_map, &factories, composer_autoload.as_ref());
+
+    let mut interception_di_config = full_di_config.clone();
+    interception_di_config.plugins = merge_plugins_for_interception(&scanner_di_configs);
+
+    // Interceptors can target generated factory classes (e.g. plugins on
+    // Magento\Setup\...\EntityGeneratorFactory). Magento sees those classes
+    // after factory generation; mirror that by adding synthetic class metadata
+    // before interceptor detection.
+    let mut interception_class_map = class_map.clone();
+    augment_with_composer_plugin_owner_classes(
+        &mut interception_class_map,
+        &interception_di_config,
+        composer_autoload.as_ref(),
+    );
+    for spec in &factories {
+        if interception_class_map.contains_key(&spec.factory_fqcn) {
+            continue;
+        }
+        interception_class_map.insert(
+            spec.factory_fqcn.clone(),
+            synthetic_factory_class_info(&spec.factory_fqcn),
+        );
+    }
+    for spec in &search_results {
+        if interception_class_map.contains_key(&spec.result_fqcn) {
+            continue;
+        }
+        interception_class_map.insert(
+            spec.result_fqcn.clone(),
+            synthetic_search_results_class_info(spec),
+        );
+    }
+    for spec in &proxy_deferred {
+        if interception_class_map.contains_key(&spec.proxy_fqcn) {
+            continue;
+        }
+        interception_class_map.insert(
+            spec.proxy_fqcn.clone(),
+            synthetic_proxy_deferred_class_info(spec),
+        );
+    }
+
+    let interceptors = detect_interceptors(&interception_class_map, &interception_di_config);
+
     let extension_interfaces_to_generate = extension_specs
         .iter()
         .filter(|spec| !class_map.contains_key(&spec.extension_interface_fqcn))
@@ -377,10 +445,12 @@ fn main() {
         .count();
 
     log::info!(
-        "Detected: {} interceptors, {} factories, {} proxies, {} extension interfaces, {} extension classes",
+        "Detected: {} interceptors, {} factories, {} proxies, {} searchResults, {} proxyDeferred, {} extension interfaces, {} extension classes",
         interceptors.len(),
         factories.len(),
         proxies.len(),
+        search_results.len(),
+        proxy_deferred.len(),
         extension_interfaces_to_generate,
         extension_classes_to_generate,
     );
@@ -394,7 +464,7 @@ fn main() {
     // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
     let intercepted_set: std::collections::HashSet<&str> =
         interceptors.iter().map(|s| s.fqcn.as_str()).collect();
-    let all_fqcns: HashMap<String, bool> = class_map
+    let all_fqcns: HashMap<String, bool> = interception_class_map
         .keys()
         .map(|fqcn| {
             let intercepted = intercepted_set.contains(fqcn.as_str());
@@ -415,6 +485,8 @@ fn main() {
         (interceptors.len()
             + factories.len()
             + proxies.len()
+            + search_results.len()
+            + proxy_deferred.len()
             + extension_interfaces_to_generate
             + extension_classes_to_generate) as u64,
         "Generating code",
@@ -423,7 +495,7 @@ fn main() {
 
     // Interceptors
     interceptors.par_iter().for_each(|spec| {
-        let info = class_map.get(&spec.fqcn);
+        let info = interception_class_map.get(&spec.fqcn);
         let content = generate_interceptor(spec, info);
         let rel = interceptor_path(&spec.fqcn);
         let out_path = code_root.join(&rel);
@@ -453,6 +525,33 @@ fn main() {
         let target_info = class_map.get(&spec.target_fqcn);
         let content = generate_proxy(spec, target_info);
         let rel = proxy_path(&spec.proxy_fqcn);
+        let out_path = code_root.join(&rel);
+        if let Ok(changed) = write_if_changed(&out_path, &content) {
+            if changed {
+                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        pb.inc(1);
+    });
+
+    // Search results
+    search_results.par_iter().for_each(|spec| {
+        let content = generate_search_results(&spec.result_fqcn, &spec.source_fqcn);
+        let rel = search_results_path(&spec.result_fqcn);
+        let out_path = code_root.join(&rel);
+        if let Ok(changed) = write_if_changed(&out_path, &content) {
+            if changed {
+                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        pb.inc(1);
+    });
+
+    // Proxy deferred
+    proxy_deferred.par_iter().for_each(|spec| {
+        let target_info = class_map.get(&spec.target_fqcn);
+        let content = generate_proxy_deferred(&spec.proxy_fqcn, &spec.target_fqcn, target_info);
+        let rel = proxy_deferred_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
         if let Ok(changed) = write_if_changed(&out_path, &content) {
             if changed {
@@ -586,6 +685,8 @@ fn main() {
         interceptors.len()
             + factories.len()
             + proxies.len()
+            + search_results.len()
+            + proxy_deferred.len()
             + extension_interfaces_to_generate
             + extension_classes_to_generate
             - total_written
@@ -598,6 +699,36 @@ fn main() {
         }
         cache.save(&cache_path);
         log::debug!("Incremental cache saved to {}", cache_path.display());
+    }
+
+    if args.compare_archive {
+        let archive_root = args
+            .archive_root
+            .clone()
+            .unwrap_or_else(|| magento_root.join("generated"));
+        let report_dir = args
+            .compare_report_dir
+            .clone()
+            .unwrap_or_else(|| generated_root.join("diff"));
+        match compare_against_archive(&generated_root, &archive_root, &report_dir) {
+            Ok(summary) => {
+                log::info!(
+                    "Archive diff: code missing {}, code extra {}, metadata missing {}, metadata extra {} (reports: {})",
+                    summary.code_missing,
+                    summary.code_extra,
+                    summary.metadata_missing,
+                    summary.metadata_extra,
+                    report_dir.display()
+                );
+                if args.compare_fail_on_diff && !summary.is_clean() {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("error: archive compare failed: {e}");
+                std::process::exit(2);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -642,6 +773,398 @@ fn print_summary(
     println!("  Proxies:        {}", proxies.len());
     println!("  Classes with resolved args: {}", args_map.len());
     println!("  Total FQCNs (for interception.php): {}", all_fqcns.len());
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveCompareSummary {
+    code_missing: usize,
+    code_extra: usize,
+    metadata_missing: usize,
+    metadata_extra: usize,
+}
+
+impl ArchiveCompareSummary {
+    fn is_clean(&self) -> bool {
+        self.code_missing == 0
+            && self.code_extra == 0
+            && self.metadata_missing == 0
+            && self.metadata_extra == 0
+    }
+}
+
+#[derive(Debug)]
+struct RelativeDiff {
+    missing: Vec<String>,
+    extra: Vec<String>,
+}
+
+fn compare_against_archive(
+    output_root: &Path,
+    archive_root: &Path,
+    report_dir: &Path,
+) -> std::io::Result<ArchiveCompareSummary> {
+    let archive_code = archive_root.join("_code");
+    let archive_metadata = archive_root.join("_metadata");
+    if !archive_code.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("archive code dir not found: {}", archive_code.display()),
+        ));
+    }
+    if !archive_metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "archive metadata dir not found: {}",
+                archive_metadata.display()
+            ),
+        ));
+    }
+
+    let output_code = output_root.join("code");
+    let output_metadata = output_root.join("metadata");
+
+    let code_diff = diff_relative_files(&archive_code, &output_code)?;
+    let metadata_diff = diff_relative_files(&archive_metadata, &output_metadata)?;
+
+    std::fs::create_dir_all(report_dir)?;
+    write_diff_list(&report_dir.join("code.missing.txt"), &code_diff.missing)?;
+    write_diff_list(&report_dir.join("code.extra.txt"), &code_diff.extra)?;
+    write_diff_list(
+        &report_dir.join("metadata.missing.txt"),
+        &metadata_diff.missing,
+    )?;
+    write_diff_list(&report_dir.join("metadata.extra.txt"), &metadata_diff.extra)?;
+
+    let summary = ArchiveCompareSummary {
+        code_missing: code_diff.missing.len(),
+        code_extra: code_diff.extra.len(),
+        metadata_missing: metadata_diff.missing.len(),
+        metadata_extra: metadata_diff.extra.len(),
+    };
+    let summary_json = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string());
+    std::fs::write(report_dir.join("summary.json"), summary_json)?;
+
+    Ok(summary)
+}
+
+fn diff_relative_files(archive_dir: &Path, output_dir: &Path) -> std::io::Result<RelativeDiff> {
+    let archive_files = collect_relative_files(archive_dir)?;
+    let output_files = collect_relative_files(output_dir)?;
+
+    let mut missing: Vec<String> = archive_files.difference(&output_files).cloned().collect();
+    let mut extra: Vec<String> = output_files.difference(&archive_files).cloned().collect();
+    missing.sort();
+    extra.sort();
+
+    Ok(RelativeDiff { missing, extra })
+}
+
+fn collect_relative_files(root: &Path) -> std::io::Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.insert(rel);
+        }
+    }
+
+    Ok(out)
+}
+
+fn write_diff_list(path: &Path, lines: &[String]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut content = String::new();
+    for line in lines {
+        content.push_str(line);
+        content.push('\n');
+    }
+    std::fs::write(path, content)
+}
+
+fn synthetic_factory_class_info(factory_fqcn: &str) -> ClassInfo {
+    let normalized = factory_fqcn.trim_start_matches('\\');
+    let (namespace, name) = if let Some((ns, class_name)) = normalized.rsplit_once('\\') {
+        (ns.to_string(), class_name.to_string())
+    } else {
+        (String::new(), normalized.to_string())
+    };
+
+    ClassInfo {
+        path: PathBuf::from("__generated__/factory.php"),
+        namespace,
+        name,
+        fqcn: normalized.to_string(),
+        kind: ClassKind::Class,
+        extends: None,
+        implements: vec![],
+        constructor: None,
+        is_abstract: false,
+        is_final: false,
+        public_methods: vec![MethodSignature {
+            name: "create".to_string(),
+            params: vec![MethodParam {
+                name: "data".to_string(),
+                type_hint: Some("array".to_string()),
+                has_default: true,
+                is_variadic: false,
+                is_by_ref: false,
+            }],
+            return_type: None,
+            is_static: false,
+            returns_reference: false,
+        }],
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SearchResultsSpec {
+    result_fqcn: String,
+    source_fqcn: String,
+}
+
+#[derive(Clone, Debug)]
+struct ProxyDeferredSpec {
+    proxy_fqcn: String,
+    target_fqcn: String,
+}
+
+fn detect_search_results_specs(
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    factories: &[FactorySpec],
+    composer_index: Option<&ComposerAutoloadIndex>,
+) -> Vec<SearchResultsSpec> {
+    let mut specs = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut emit = |result_fqcn: String| {
+        let normalized = result_fqcn.trim().trim_start_matches('\\').to_string();
+        if !normalized.ends_with("SearchResults") {
+            return;
+        }
+        if class_map.contains_key(&normalized) || !seen.insert(normalized.clone()) {
+            return;
+        }
+        let Some(source_fqcn) = normalized.strip_suffix("SearchResults") else {
+            return;
+        };
+        let source_fqcn = source_fqcn.to_string();
+        if source_fqcn.is_empty() {
+            return;
+        }
+        if !class_exists_in_scan_or_composer(class_map, composer_index, &source_fqcn) {
+            return;
+        }
+        specs.push(SearchResultsSpec {
+            result_fqcn: normalized,
+            source_fqcn,
+        });
+    };
+
+    for spec in factories {
+        emit(spec.target_fqcn.clone());
+    }
+    for (for_type, to_type) in &di_config.preferences {
+        if for_type.ends_with("SearchResultsInterface") {
+            emit(to_type.clone());
+        }
+    }
+
+    specs.sort_by(|a, b| a.result_fqcn.cmp(&b.result_fqcn));
+    specs
+}
+
+fn detect_proxy_deferred_specs(
+    class_map: &HashMap<String, ClassInfo>,
+    factories: &[FactorySpec],
+    composer_index: Option<&ComposerAutoloadIndex>,
+) -> Vec<ProxyDeferredSpec> {
+    let mut specs = Vec::new();
+    let mut seen = HashSet::new();
+
+    for spec in factories {
+        let normalized = spec.target_fqcn.trim().trim_start_matches('\\').to_string();
+        let Some(target_fqcn) = normalized.strip_suffix("\\ProxyDeferred") else {
+            continue;
+        };
+        let target_fqcn = target_fqcn.to_string();
+        if target_fqcn.is_empty() {
+            continue;
+        }
+        if class_map.contains_key(&normalized) || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        if !class_exists_in_scan_or_composer(class_map, composer_index, &target_fqcn) {
+            continue;
+        }
+        specs.push(ProxyDeferredSpec {
+            proxy_fqcn: normalized,
+            target_fqcn,
+        });
+    }
+
+    specs.sort_by(|a, b| a.proxy_fqcn.cmp(&b.proxy_fqcn));
+    specs
+}
+
+fn class_exists_in_scan_or_composer(
+    class_map: &HashMap<String, ClassInfo>,
+    composer_index: Option<&ComposerAutoloadIndex>,
+    fqcn: &str,
+) -> bool {
+    let normalized = fqcn.trim().trim_start_matches('\\');
+    if class_map.contains_key(normalized) {
+        return true;
+    }
+    composer_index
+        .and_then(|index| index.resolve_class_path(normalized))
+        .is_some()
+}
+
+fn merge_plugins_for_interception(di_configs: &[DiConfig]) -> HashMap<String, Vec<Plugin>> {
+    let mut merged: HashMap<String, HashMap<String, Plugin>> = HashMap::new();
+
+    for cfg in di_configs {
+        for (owner, plugins) in &cfg.plugins {
+            let owner_plugins = merged.entry(owner.clone()).or_default();
+            for plugin in plugins {
+                match owner_plugins.get_mut(&plugin.name) {
+                    None => {
+                        owner_plugins.insert(plugin.name.clone(), plugin.clone());
+                    }
+                    Some(existing) => {
+                        if existing.disabled && !plugin.disabled {
+                            // Any active declaration across areas should keep interception active.
+                            *existing = plugin.clone();
+                        } else if !existing.disabled && plugin.disabled {
+                            // Keep existing active plugin instead of disabling globally.
+                        } else {
+                            // Same active/disabled state: later config wins.
+                            *existing = plugin.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (owner, by_name) in merged {
+        let mut plugins: Vec<Plugin> = by_name.into_values().collect();
+        plugins.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.name.cmp(&b.name)));
+        out.insert(owner, plugins);
+    }
+    out
+}
+
+fn augment_with_composer_plugin_owner_classes(
+    class_map: &mut HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    composer_index: Option<&ComposerAutoloadIndex>,
+) {
+    let Some(index) = composer_index else {
+        return;
+    };
+
+    let mut candidates: HashSet<String> = HashSet::new();
+    for owner in di_config.plugins.keys() {
+        let owner = owner.trim_start_matches('\\').to_string();
+        if !class_map.contains_key(&owner) {
+            candidates.insert(owner.clone());
+        }
+        let resolved = di_config.get_instance_type(&owner);
+        if !class_map.contains_key(&resolved) {
+            candidates.insert(resolved);
+        }
+    }
+
+    for fqcn in candidates {
+        if class_map.contains_key(&fqcn) {
+            continue;
+        }
+        let Some(path) = index.resolve_class_path(&fqcn) else {
+            continue;
+        };
+        if let ExtractResult::Ok(info) = extract_file(&path) {
+            class_map.insert(info.fqcn.clone(), info);
+        }
+    }
+}
+
+fn synthetic_search_results_class_info(spec: &SearchResultsSpec) -> ClassInfo {
+    let normalized = spec.result_fqcn.trim_start_matches('\\');
+    let (namespace, name) = if let Some((ns, class_name)) = normalized.rsplit_once('\\') {
+        (ns.to_string(), class_name.to_string())
+    } else {
+        (String::new(), normalized.to_string())
+    };
+
+    ClassInfo {
+        path: PathBuf::from("__generated__/search_results.php"),
+        namespace,
+        name,
+        fqcn: normalized.to_string(),
+        kind: ClassKind::Class,
+        extends: Some("Magento\\Framework\\Api\\SearchResults".to_string()),
+        implements: vec![],
+        constructor: None,
+        is_abstract: false,
+        is_final: false,
+        public_methods: vec![MethodSignature {
+            name: "getItems".to_string(),
+            params: vec![],
+            return_type: None,
+            is_static: false,
+            returns_reference: false,
+        }],
+    }
+}
+
+fn synthetic_proxy_deferred_class_info(spec: &ProxyDeferredSpec) -> ClassInfo {
+    let normalized = spec.proxy_fqcn.trim_start_matches('\\');
+    let (namespace, name) = if let Some((ns, class_name)) = normalized.rsplit_once('\\') {
+        (ns.to_string(), class_name.to_string())
+    } else {
+        (String::new(), normalized.to_string())
+    };
+
+    ClassInfo {
+        path: PathBuf::from("__generated__/proxy_deferred.php"),
+        namespace,
+        name,
+        fqcn: normalized.to_string(),
+        kind: ClassKind::Class,
+        extends: Some(spec.target_fqcn.clone()),
+        implements: vec![
+            "Magento\\Framework\\ObjectManager\\NoninterceptableInterface".to_string(),
+        ],
+        constructor: None,
+        is_abstract: false,
+        is_final: false,
+        public_methods: vec![],
+    }
 }
 
 fn plugin_list_cache_id(scope: &str) -> String {
@@ -964,9 +1487,13 @@ impl ComposerAutoloadIndex {
     }
 
     fn is_loadable(&self, fqcn: &str) -> bool {
+        self.resolve_class_path(fqcn).is_some()
+    }
+
+    fn resolve_class_path(&self, fqcn: &str) -> Option<PathBuf> {
         let fqcn = fqcn.trim().trim_start_matches('\\');
         if fqcn.is_empty() {
-            return false;
+            return None;
         }
 
         // PSR-4
@@ -979,8 +1506,9 @@ impl ComposerAutoloadIndex {
             }
             let rel_path = relative.replace('\\', "/");
             for dir in dirs {
-                if dir.join(format!("{rel_path}.php")).is_file() {
-                    return true;
+                let candidate = dir.join(format!("{rel_path}.php"));
+                if candidate.is_file() {
+                    return Some(candidate);
                 }
             }
         }
@@ -995,13 +1523,14 @@ impl ComposerAutoloadIndex {
             }
             let rel_path = relative.replace(['\\', '_'], "/");
             for dir in dirs {
-                if dir.join(format!("{rel_path}.php")).is_file() {
-                    return true;
+                let candidate = dir.join(format!("{rel_path}.php"));
+                if candidate.is_file() {
+                    return Some(candidate);
                 }
             }
         }
 
-        false
+        None
     }
 }
 

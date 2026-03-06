@@ -38,3 +38,5 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [032](TKT-032-plugin-list-metadata-generation.md) | Plugin-list metadata generation | 08 | Ready | 027, 030 |
 | [033](TKT-033-app-action-list-and-archive-layout-parity.md) | App action list and archive layout parity | 08 | Ready | 032 |
 | [034](TKT-034-runtime-map-coverage-and-final-diff-closure.md) | Runtime-map coverage and final diff closure | 08 | Ready | 031, 032, 033 |
+| [035](TKT-035-hybrid-module-root-resolver.md) | Hybrid module-root resolver (Composer seed + registration fallback) | 09 | Ready | 034 |
+| [036](TKT-036-archive-baseline-diff-reporting.md) | Archive baseline diff reporting in fast-di-compile | 09 | Ready | 034 |
