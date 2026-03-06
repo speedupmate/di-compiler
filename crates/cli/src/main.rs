@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -202,6 +203,7 @@ fn main() {
         magento_root.display(),
         generated_root.display()
     );
+    let total_started = Instant::now();
 
     // Incremental cache
     let cache_path = generated_root.join(".di-compiler-cache.json");
@@ -214,6 +216,7 @@ fn main() {
     // -----------------------------------------------------------------------
     // Phase 1 + 2: Walk PHP files + extract ClassInfo (parallel)
     // -----------------------------------------------------------------------
+    let phase_1_2_started = Instant::now();
     let module_paths = read_module_paths(&magento_root);
     let php_files = walk_php_files(&module_paths);
     log::info!("Found {} PHP files", php_files.len());
@@ -261,10 +264,12 @@ fn main() {
         fallbacks,
         failures
     );
+    log_phase_elapsed("Phase 1+2", phase_1_2_started);
 
     // -----------------------------------------------------------------------
     // Phase 3a: Parse + merge global di.xml files (for per-area metadata)
     // -----------------------------------------------------------------------
+    let phase_3a_started = Instant::now();
     let di_xml_files = find_di_xml_files(&magento_root);
     log::info!("Found {} di.xml files (global)", di_xml_files.len());
 
@@ -290,6 +295,7 @@ fn main() {
     pb.finish_with_message("done");
 
     let di_config = merge_configs(global_di_configs.clone());
+    log_phase_elapsed("Phase 3a", phase_3a_started);
 
     // -----------------------------------------------------------------------
     // Phase 3b: Parse + merge ALL di.xml files (all areas) for detection
@@ -297,6 +303,7 @@ fn main() {
     // Interceptor/factory/proxy detection must consider plugins registered in
     // area-specific di.xml files (e.g. etc/adminhtml/di.xml), not just global.
     // -----------------------------------------------------------------------
+    let phase_3b_started = Instant::now();
     let all_di_xml_files = find_all_di_xml_files(&magento_root);
     log::info!("Found {} di.xml files (all areas)", all_di_xml_files.len());
 
@@ -332,17 +339,21 @@ fn main() {
         di_config.plugins.len(),
         di_config.virtual_types.len(),
     );
+    log_phase_elapsed("Phase 3b", phase_3b_started);
 
     // -----------------------------------------------------------------------
     // Phase 3c: Collect extension-attributes metadata (for Extension* artifacts)
     // -----------------------------------------------------------------------
+    let phase_3c_started = Instant::now();
     let extension_attr_files = find_extension_attributes_files(&magento_root, &module_paths);
     let extension_attr_map = parse_extension_attributes_files(&extension_attr_files);
     let extension_specs = collect_extension_specs(&class_map, &extension_attr_map);
+    log_phase_elapsed("Phase 3c", phase_3c_started);
 
     // -----------------------------------------------------------------------
     // Phase 4: Detection (uses full_di_config = all areas merged)
     // -----------------------------------------------------------------------
+    let phase_4_started = Instant::now();
     let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
     let proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
     let mut extra_existing_proxy_targets: HashSet<String> = HashSet::new();
@@ -465,10 +476,12 @@ fn main() {
         extension_interfaces_to_generate,
         extension_classes_to_generate,
     );
+    log_phase_elapsed("Phase 4", phase_4_started);
 
     // -----------------------------------------------------------------------
     // Phase 5: Resolve arguments (global config for per-area override later)
     // -----------------------------------------------------------------------
+    let phase_5_started = Instant::now();
     let args_map = resolve_all_arguments(&class_map, &di_config); // global only; per-area overrides applied later
     log::info!("Resolved arguments for {} classes", args_map.len());
 
@@ -482,16 +495,19 @@ fn main() {
             (fqcn.clone(), intercepted)
         })
         .collect();
+    log_phase_elapsed("Phase 5", phase_5_started);
 
     if args.dry_run {
         log::info!("Dry run — skipping file writes");
         print_summary(&interceptors, &factories, &proxies, &args_map, &all_fqcns);
+        log_phase_elapsed("Total", total_started);
         return;
     }
 
     // -----------------------------------------------------------------------
     // Phase 6: Generate PHP code files (parallel)
     // -----------------------------------------------------------------------
+    let phase_6_started = Instant::now();
     let pb = progress_bar(
         (interceptors.len()
             + factories.len()
@@ -560,27 +576,40 @@ fn main() {
         pb.inc(1);
     });
 
-    let mut reflected_proxy_methods: HashMap<String, Vec<MethodSignature>> = HashMap::new();
-    for spec in &proxies {
-        if reflected_proxy_methods.contains_key(&spec.target_fqcn) {
-            continue;
-        }
-        let Some(mut reflected_methods) = reflect_interceptable_methods(
-            &spec.target_fqcn,
-            &args.magento_root,
-            &args.fallback_php,
-        ) else {
-            continue;
-        };
-        for method in reflected_methods.iter_mut() {
-            normalize_reflected_method_signature(
-                method,
-                &spec.target_fqcn,
-                &interception_class_map,
-            );
-        }
-        reflected_proxy_methods.insert(spec.target_fqcn.clone(), reflected_methods);
-    }
+    let unique_proxy_targets: Vec<String> = {
+        let mut seen = HashSet::new();
+        proxies
+            .iter()
+            .filter_map(|spec| {
+                if seen.insert(spec.target_fqcn.clone()) {
+                    Some(spec.target_fqcn.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let reflected_proxy_methods: HashMap<String, Vec<MethodSignature>> = unique_proxy_targets
+        .par_iter()
+        .filter_map(|target_fqcn| {
+            let target_info =
+                target_info_with_inherited_public_methods(target_fqcn, &interception_class_map)?;
+            if !interceptor_methods_need_reflection_normalization(&target_info.public_methods) {
+                return None;
+            }
+            let mut reflected_methods =
+                reflect_interceptable_methods(target_fqcn, &args.magento_root, &args.fallback_php)?;
+            for method in reflected_methods.iter_mut() {
+                normalize_reflected_method_signature(method, target_fqcn, &interception_class_map);
+            }
+            Some((target_fqcn.clone(), reflected_methods))
+        })
+        .collect();
+    log::info!(
+        "Proxy reflection precompute: {} reflected targets ({} unique targets)",
+        reflected_proxy_methods.len(),
+        unique_proxy_targets.len()
+    );
     let reflected_proxy_methods = Arc::new(reflected_proxy_methods);
 
     // Proxies
@@ -692,10 +721,12 @@ fn main() {
         pb.inc(1);
     });
     pb.finish_with_message("done");
+    log_phase_elapsed("Phase 6", phase_6_started);
 
     // -----------------------------------------------------------------------
     // Phase 7: Generate metadata files
     // -----------------------------------------------------------------------
+    let phase_7_started = Instant::now();
     log::info!("Generating metadata files");
 
     // interception.php
@@ -776,6 +807,7 @@ fn main() {
     let app_action_list = generate_app_action_list_php(&class_map);
     let app_action_list_path = metadata_root.join("app_action_list.php");
     let _ = write_if_changed(&app_action_list_path, &app_action_list);
+    log_phase_elapsed("Phase 7", phase_7_started);
 
     let total_written = written.load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
@@ -801,6 +833,7 @@ fn main() {
     }
 
     if args.compare_archive {
+        let compare_archive_started = Instant::now();
         let archive_root = args
             .archive_root
             .clone()
@@ -822,30 +855,37 @@ fn main() {
                     report_dir.display()
                 );
                 if args.compare_fail_on_diff && !summary.is_clean() {
+                    log_phase_elapsed("Total", total_started);
                     std::process::exit(1);
                 }
             }
             Err(e) => {
                 eprintln!("error: archive compare failed: {e}");
+                log_phase_elapsed("Total", total_started);
                 std::process::exit(2);
             }
         }
+        log_phase_elapsed("Archive compare", compare_archive_started);
     }
 
     // -----------------------------------------------------------------------
     // Phase 8: Validation (optional)
     // -----------------------------------------------------------------------
     if args.validate {
+        let phase_8_started = Instant::now();
         // --php-generated is required (enforced earlier in main)
         let php_gen = args.php_generated.as_deref().unwrap();
         log::info!("Validating against {}", php_gen.display());
         let result = validator::validate(php_gen, &generated_root);
         println!("{}", result.summary());
+        log_phase_elapsed("Phase 8", phase_8_started);
         if !result.is_clean() {
+            log_phase_elapsed("Total", total_started);
             std::process::exit(1);
         }
     }
 
+    log_phase_elapsed("Total", total_started);
     log::info!("fast-di-compile finished successfully");
 }
 
@@ -859,6 +899,16 @@ fn progress_bar(len: u64, msg: &str) -> ProgressBar {
     );
     pb.set_message(msg.to_string());
     pb
+}
+
+fn log_phase_elapsed(phase: &str, started: Instant) {
+    let elapsed = started.elapsed();
+    log::info!(
+        "{} elapsed: {:.3}s ({} ms)",
+        phase,
+        elapsed.as_secs_f64(),
+        elapsed.as_millis()
+    );
 }
 
 fn print_summary(
