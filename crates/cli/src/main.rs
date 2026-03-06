@@ -560,10 +560,66 @@ fn main() {
         pb.inc(1);
     });
 
+    let mut reflected_proxy_methods: HashMap<String, Vec<MethodSignature>> = HashMap::new();
+    for spec in &proxies {
+        if reflected_proxy_methods.contains_key(&spec.target_fqcn) {
+            continue;
+        }
+        let Some(mut reflected_methods) = reflect_interceptable_methods(
+            &spec.target_fqcn,
+            &args.magento_root,
+            &args.fallback_php,
+        ) else {
+            continue;
+        };
+        for method in reflected_methods.iter_mut() {
+            normalize_reflected_method_signature(
+                method,
+                &spec.target_fqcn,
+                &interception_class_map,
+            );
+        }
+        reflected_proxy_methods.insert(spec.target_fqcn.clone(), reflected_methods);
+    }
+    let reflected_proxy_methods = Arc::new(reflected_proxy_methods);
+
     // Proxies
     proxies.par_iter().for_each(|spec| {
-        let target_info =
+        let mut target_info =
             target_info_with_inherited_public_methods(&spec.target_fqcn, &interception_class_map);
+        if let (Some(info), Some(reflected_methods)) = (
+            target_info.as_mut(),
+            reflected_proxy_methods.get(&spec.target_fqcn),
+        ) {
+            let current_names: HashSet<String> =
+                info.public_methods.iter().map(|m| m.name.clone()).collect();
+            let reflected_names: HashSet<String> =
+                reflected_methods.iter().map(|m| m.name.clone()).collect();
+
+            if current_names == reflected_names
+                && info.public_methods.len() == reflected_methods.len()
+            {
+                // Safe full replacement when method surface matches.
+                info.public_methods = reflected_methods.clone();
+            } else {
+                // Conservative fallback: preserve current surface/order and only
+                // normalize overlapping signatures.
+                let reflected_by_name: HashMap<String, MethodSignature> = reflected_methods
+                    .iter()
+                    .map(|m| (m.name.clone(), m.clone()))
+                    .collect();
+                info.public_methods = info
+                    .public_methods
+                    .iter()
+                    .map(|m| {
+                        reflected_by_name
+                            .get(&m.name)
+                            .cloned()
+                            .unwrap_or_else(|| m.clone())
+                    })
+                    .collect();
+            }
+        }
         let content = generate_proxy(spec, target_info.as_ref());
         let rel = proxy_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
