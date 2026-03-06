@@ -35,3 +35,9 @@ Expected hot paths: string allocation in lexer, di.xml parse, file I/O.
 ## Tickets In This Phase
 
 TKT-025 through TKT-026
+
+## Current Snapshot (2026-03-06)
+
+- Baseline phase timers and major hot-path reductions have been implemented in CLI.
+- Ongoing reflection/discovery hardening work is tracked in Phase 09:
+  - [09-performance-hardening](09-performance-hardening.md)

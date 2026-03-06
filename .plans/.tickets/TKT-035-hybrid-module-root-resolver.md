@@ -4,7 +4,7 @@ title: Hybrid module-root resolver (Composer seed + registration fallback)
 phase: 09-performance-hardening
 feature: module-root-discovery-hybrid
 owner: Unassigned
-status: Ready
+status: In Progress
 estimate: M
 depends_on: [TKT-034]
 touches:
@@ -39,6 +39,12 @@ Introduce a single shared module-root resolver used by both PHP extraction and D
 - Avoid duplicating root-discovery logic in `php-extractor` and `di-xml-reader`.
 - Canonicalize duplicate roots (e.g. package root and nested `src` root) and keep deterministic ordering.
 - Preserve current behavior for module layouts that do not rely on Composer autoload declarations.
+
+## Progress Update (2026-03-06)
+
+- Nested module root discovery via `registration.php` paths is in place (`26412e3`).
+- DI XML discovery now caches vendor root DFS results to remove repeated traversal overhead (`248c9a9`).
+- Remaining scope for this ticket: shared resolver abstraction and Composer-seeded discovery path.
 
 ## Risks
 

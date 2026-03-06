@@ -19,6 +19,13 @@ Close remaining content-level diffs between `generated/code` and `generated/_cod
   - Extension artifact ordering drift
   - Factory edge cases (`*ExtensionInterfaceFactory`, global namespace factory)
 
+Current archive compare snapshot (2026-03-06):
+
+- code missing `0`, extra `39`, changed `32`
+- metadata missing `0`, extra `0`, changed `16`
+- Completed slices: TKT-038, TKT-039
+- Open slices: TKT-040, TKT-041
+
 ## Implementation Steps
 
 1. Fix interceptor content parity slice:

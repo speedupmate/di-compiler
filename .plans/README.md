@@ -26,9 +26,11 @@ Canonical compare baseline for this repo is:
 | 06 | [CLI](phases/06-cli.md) | 01–05 complete |
 | 07 | [Performance](phases/07-performance.md) | Validator stable, no correctness regressions |
 | 08 | [Parity Closure](phases/08-parity-closure.md) | Required before production adoption |
+| 09 | [Performance Hardening](phases/09-performance-hardening.md) | Active optimization stream while parity closure remains in progress |
 
 ## Current Planning Assumptions
 
 - Phase terminology remains `phases/`.
 - Existing `.plans` structure is preserved and updated in place.
 - External tracker mirrors local tickets; technical source-of-truth remains in repo docs.
+- Phase 09 is now active for hot-path performance hardening work (reflection + discovery caching).

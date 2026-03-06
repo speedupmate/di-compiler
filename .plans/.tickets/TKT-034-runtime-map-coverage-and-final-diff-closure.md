@@ -4,7 +4,7 @@ title: Runtime-map coverage and final diff closure
 phase: 08-parity-closure
 feature: runtime-map-generator-coverage
 owner: Unassigned
-status: Ready
+status: In Progress
 estimate: L
 depends_on: [TKT-031, TKT-032, TKT-033]
 touches:
@@ -31,6 +31,13 @@ Close remaining parity gaps tied to unimplemented generator entity types and dri
 
 - Map residual diffs to specific generator entity categories.
 - Implement missing generators required by this install, or provide explicit compatibility gating if not required.
+
+## Current Snapshot (2026-03-06)
+
+- Runtime-map/file-presence closure is substantially improved; missing counts are currently `0` for code and metadata.
+- Final zero-diff closure is still open:
+  - code extra `39`, code changed `32`
+  - metadata changed `16`
 
 ## Risks
 

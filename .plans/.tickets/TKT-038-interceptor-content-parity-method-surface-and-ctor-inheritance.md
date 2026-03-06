@@ -4,7 +4,7 @@ title: Interceptor content parity: method surface and constructor inheritance
 phase: 08-parity-closure
 feature: code-content-parity-closure
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-029, TKT-034]
 touches:
@@ -33,6 +33,11 @@ Close the dominant interceptor content drift patterns by constraining method emi
 - Keep plugin-driven method filtering strict; avoid “emit everything” fallback in unresolved plugin-class scenarios.
 - Preserve current interceptable-method exclusions (`__construct`, `_resetState`, etc.).
 - Add constructor-chain lookup across parent classes for interceptor constructor rendering.
+
+## Implementation Update (2026-03-06)
+
+- Landed via commit `d31d697`.
+- Follow-up reflection normalization and timing instrumentation in `a5048e4` and `248c9a9` retained interceptor parity behavior while reducing runtime cost.
 
 ## Risks
 

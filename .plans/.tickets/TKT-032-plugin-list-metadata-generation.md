@@ -4,7 +4,7 @@ title: Plugin-list metadata generation
 phase: 08-parity-closure
 feature: plugin-list-metadata-generation
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-027, TKT-030]
 touches:
@@ -31,6 +31,11 @@ Generate plugin-list compiled metadata files currently missing from Rust output.
 
 - Implement scope-aware plugin list output names and content format.
 - Keep deterministic ordering to avoid unstable diffs.
+
+## Implementation Update (2026-03-06)
+
+- Landed via commit `dde719b`.
+- Scope-specific plugin-list metadata files are emitted and included in archive compare workflow.
 
 ## Risks
 

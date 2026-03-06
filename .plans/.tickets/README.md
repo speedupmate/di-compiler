@@ -35,13 +35,14 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [029](TKT-029-interceptor-method-and-signature-parity.md) | Interceptor method and signature parity | 08 | Ready | 028 |
 | [030](TKT-030-scanner-parity-xml-php.md) | Scanner parity for XML and PHP triggers | 08 | Ready | 014 |
 | [031](TKT-031-extension-attributes-and-service-data-generation.md) | Extension attributes and service data generation | 08 | Ready | 030 |
-| [032](TKT-032-plugin-list-metadata-generation.md) | Plugin-list metadata generation | 08 | Ready | 027, 030 |
-| [033](TKT-033-app-action-list-and-archive-layout-parity.md) | App action list and archive layout parity | 08 | Ready | 032 |
-| [034](TKT-034-runtime-map-coverage-and-final-diff-closure.md) | Runtime-map coverage and final diff closure | 08 | Ready | 031, 032, 033 |
-| [035](TKT-035-hybrid-module-root-resolver.md) | Hybrid module-root resolver (Composer seed + registration fallback) | 09 | Ready | 034 |
-| [036](TKT-036-archive-baseline-diff-reporting.md) | Archive baseline diff reporting in fast-di-compile | 09 | Ready | 034 |
-| [037](TKT-037-comprehensive-readme-and-mit-license.md) | Comprehensive README plan and MIT licensing | 09 | Ready | 036 |
-| [038](TKT-038-interceptor-content-parity-method-surface-and-ctor-inheritance.md) | Interceptor content parity: method surface and constructor inheritance | 08 | Ready | 029, 034 |
-| [039](TKT-039-proxy-content-parity-defaults-and-interface-resolution.md) | Proxy content parity: defaults and interface resolution | 08 | Ready | 034 |
+| [032](TKT-032-plugin-list-metadata-generation.md) | Plugin-list metadata generation | 08 | Done | 027, 030 |
+| [033](TKT-033-app-action-list-and-archive-layout-parity.md) | App action list and archive layout parity | 08 | Done | 032 |
+| [034](TKT-034-runtime-map-coverage-and-final-diff-closure.md) | Runtime-map coverage and final diff closure | 08 | In Progress | 031, 032, 033 |
+| [035](TKT-035-hybrid-module-root-resolver.md) | Hybrid module-root resolver (Composer seed + registration fallback) | 09 | In Progress | 034 |
+| [036](TKT-036-archive-baseline-diff-reporting.md) | Archive baseline diff reporting in fast-di-compile | 09 | Done | 034 |
+| [037](TKT-037-comprehensive-readme-and-mit-license.md) | Comprehensive README plan and MIT licensing | 09 | Done | 036 |
+| [038](TKT-038-interceptor-content-parity-method-surface-and-ctor-inheritance.md) | Interceptor content parity: method surface and constructor inheritance | 08 | Done | 029, 034 |
+| [039](TKT-039-proxy-content-parity-defaults-and-interface-resolution.md) | Proxy content parity: defaults and interface resolution | 08 | Done | 034 |
 | [040](TKT-040-extension-factory-content-parity-order-and-target-mapping.md) | Extension/factory content parity: ordering and target mapping | 08 | Ready | 031, 034 |
-| [041](TKT-041-final-content-diff-convergence-and-residual-documentation.md) | Final content diff convergence and residual documentation | 08 | Ready | 038, 039, 040 |
+| [041](TKT-041-final-content-diff-convergence-and-residual-documentation.md) | Final content diff convergence and residual documentation | 08 | In Progress | 038, 039, 040 |
+| [042](TKT-042-persistent-php-worker-reflection-hotpath.md) | Persistent PHP worker for reflection hot paths | 09 | In Progress | 035 |

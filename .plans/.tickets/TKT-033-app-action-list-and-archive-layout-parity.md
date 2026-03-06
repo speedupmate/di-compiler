@@ -4,7 +4,7 @@ title: App action list and archive layout parity
 phase: 08-parity-closure
 feature: app-action-list-and-output-layout
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-032]
 touches:
@@ -31,6 +31,11 @@ Implement missing app action list metadata output and remove ambiguity around co
 
 - Add generation path for `app_action_list.php`.
 - Keep docs and CLI usage aligned to archived baseline comparison process.
+
+## Implementation Update (2026-03-06)
+
+- `app_action_list.php` generation landed via commit `6cabaf8`.
+- Archive layout compare/reporting hardening followed in `d50699a`.
 
 ## Risks
 

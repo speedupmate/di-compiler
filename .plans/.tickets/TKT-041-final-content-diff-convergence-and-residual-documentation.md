@@ -4,7 +4,7 @@ title: Final content diff convergence and residual documentation
 phase: 08-parity-closure
 feature: code-content-parity-closure
 owner: Unassigned
-status: Ready
+status: In Progress
 estimate: S
 depends_on: [TKT-038, TKT-039, TKT-040]
 touches:
@@ -26,6 +26,13 @@ test_plan:
 ## Scope
 
 Complete the final content-parity convergence pass and document residual differences that remain by design or dependency constraints.
+
+## Current Snapshot (2026-03-06)
+
+- Active residual set from archive compare:
+  - code missing `0`, extra `39`, changed `32`
+  - metadata missing `0`, extra `0`, changed `16`
+- TKT-038 and TKT-039 are complete; TKT-040 remains open and blocks final convergence.
 
 ## Risks
 

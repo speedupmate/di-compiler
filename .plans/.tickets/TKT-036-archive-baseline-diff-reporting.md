@@ -4,7 +4,7 @@ title: Archive baseline diff reporting in fast-di-compile
 phase: 09-performance-hardening
 feature: archive-baseline-diff-reporting
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: [TKT-034]
 touches:
@@ -32,6 +32,11 @@ Add a first-class archive comparison step to `fast-di-compile` so every build ca
 - Keep the compare step optional behind explicit CLI flags.
 - Keep report format deterministic and machine-friendly (`*.txt` + `summary.json`).
 - Use relative paths in report files so results remain portable between environments.
+
+## Implementation Update (2026-03-06)
+
+- Landed via commit `d50699a`.
+- `--compare-archive`, `--archive-root`, `--compare-report-dir`, and optional fail-on-diff gating are now first-class CLI flow.
 
 ## Risks
 

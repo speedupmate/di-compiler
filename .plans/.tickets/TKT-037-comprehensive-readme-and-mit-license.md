@@ -4,7 +4,7 @@ title: Comprehensive README plan and MIT licensing
 phase: 09-performance-hardening
 feature: project-docs-and-licensing
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: [TKT-036]
 touches:
@@ -54,3 +54,8 @@ Define and implement a full project README and formal MIT licensing so new contr
 
 - README can drift if CLI flags or output format change without documentation updates.
 - Ambiguous parity wording can cause contributors to “fix” expected scanner/runtime differences incorrectly.
+
+## Implementation Update (2026-03-06)
+
+- Landed via commit `1880873`.
+- Root README and MIT licensing are in place and aligned with current CLI usage.

@@ -11,9 +11,10 @@
 //!   8. Incremental writes (skip unchanged — TKT-022/026)
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use clap::Parser;
@@ -154,6 +155,211 @@ impl IncrementalCache {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent PHP worker pool
+// ---------------------------------------------------------------------------
+
+/// PHP script run as a long-lived worker: reads "cmd:FQCN\n" from stdin,
+/// writes one JSON line to stdout per request. Autoload is loaded once.
+const WORKER_PHP: &str = r#"<?php
+declare(strict_types=1);
+ini_set('display_errors', '0');
+ini_set('display_startup_errors', '0');
+$root = $argv[1] ?? '';
+if ($root === '' || !file_exists($root . '/vendor/autoload.php')) {
+    fwrite(STDERR, "php-worker: missing magento root\n");
+    exit(1);
+}
+@require $root . '/vendor/autoload.php';
+function tstr($t): ?string {
+    if ($t === null) return null;
+    if ($t instanceof ReflectionNamedType) {
+        $name = $t->getName();
+        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') return '?' . $name;
+        return $name;
+    }
+    if ($t instanceof ReflectionUnionType) {
+        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p->getName();
+        return implode('|', $parts);
+    }
+    if ($t instanceof ReflectionIntersectionType) {
+        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p->getName();
+        return implode('&', $parts);
+    }
+    return null;
+}
+function reflect_methods(string $class): ?array {
+    if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) return null;
+    $ref = new ReflectionClass($class);
+    $rows = [];
+    foreach ($ref->getMethods(ReflectionMethod::IS_PUBLIC) as $m) {
+        if ($m->isConstructor() || $m->isFinal() || $m->isStatic() || $m->isDestructor()) continue;
+        $name = $m->getName();
+        if (in_array($name, ['__sleep','__wakeup','__clone','_resetState'], true)) continue;
+        $params = [];
+        foreach ($m->getParameters() as $p) {
+            $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
+            if ($hd) $dv = var_export($p->getDefaultValue(), true);
+            $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
+                'has_default'=>$hd,'default_value'=>$dv,
+                'is_variadic'=>$p->isVariadic(),'is_by_ref'=>$p->isPassedByReference()];
+        }
+        $rows[] = ['name'=>$name,'params'=>$params,
+            'return_type'=>tstr($m->getReturnType()),'returns_reference'=>$m->returnsReference()];
+    }
+    return $rows;
+}
+function reflect_ctor(string $class): ?array {
+    if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) return null;
+    $ref = new ReflectionClass($class);
+    $ctor = $ref->getConstructor();
+    if ($ctor === null) return null;
+    $params = [];
+    foreach ($ctor->getParameters() as $p) {
+        $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
+        if ($hd) $dv = var_export($p->getDefaultValue(), true);
+        $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
+            'has_default'=>$hd,'default_value'=>$dv,'is_variadic'=>$p->isVariadic()];
+    }
+    return $params;
+}
+$stdin = fopen('php://stdin', 'r');
+while (($line = fgets($stdin)) !== false) {
+    $line = rtrim($line, "\r\n");
+    if ($line === 'exit') break;
+    $colon = strpos($line, ':');
+    if ($colon === false) { fwrite(STDOUT, "null\n"); fflush(STDOUT); continue; }
+    $cmd = substr($line, 0, $colon);
+    $class = ltrim(substr($line, $colon + 1), '\\');
+    try {
+        $result = match($cmd) {
+            'methods' => reflect_methods($class),
+            'ctor'    => reflect_ctor($class),
+            default   => null,
+        };
+        fwrite(STDOUT, json_encode($result) . "\n");
+    } catch (\Throwable $e) {
+        fwrite(STDOUT, "null\n");
+    }
+    fflush(STDOUT);
+}
+"#;
+
+struct PhpWorker {
+    child: std::process::Child,
+    stdin: Option<BufWriter<std::process::ChildStdin>>,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl PhpWorker {
+    fn spawn(php_bin: &str, magento_root: &Path, script_path: &Path) -> Option<Self> {
+        let mut child = Command::new(php_bin)
+            .arg("-d")
+            .arg("display_errors=0")
+            .arg("-d")
+            .arg("display_startup_errors=0")
+            .arg(script_path)
+            .arg(magento_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = BufWriter::new(child.stdin.take()?);
+        let stdout = BufReader::new(child.stdout.take()?);
+        Some(PhpWorker {
+            child,
+            stdin: Some(stdin),
+            stdout,
+        })
+    }
+
+    /// Send a request line and read back one JSON line. Returns None if the
+    /// worker pipe is broken (worker died).
+    fn request(&mut self, line: &str) -> Option<String> {
+        let w = self.stdin.as_mut()?;
+        w.write_all(line.as_bytes()).ok()?;
+        w.write_all(b"\n").ok()?;
+        w.flush().ok()?;
+        let mut resp = String::new();
+        self.stdout.read_line(&mut resp).ok()?;
+        if resp.is_empty() {
+            return None;
+        } // EOF — worker died
+        Some(resp.trim_end_matches('\n').to_string())
+    }
+}
+
+impl Drop for PhpWorker {
+    fn drop(&mut self) {
+        drop(self.stdin.take()); // closing stdin signals PHP loop to exit
+        let _ = self.child.wait();
+    }
+}
+
+struct PhpWorkerPool {
+    workers: Mutex<Vec<PhpWorker>>,
+    php_bin: String,
+    magento_root: PathBuf,
+    script_path: PathBuf,
+}
+
+impl PhpWorkerPool {
+    fn new(php_bin: String, magento_root: PathBuf, script_path: PathBuf) -> Self {
+        PhpWorkerPool {
+            workers: Mutex::new(Vec::new()),
+            php_bin,
+            magento_root,
+            script_path,
+        }
+    }
+
+    fn checkout(&self) -> Option<PhpWorker> {
+        self.workers
+            .lock()
+            .unwrap()
+            .pop()
+            .or_else(|| PhpWorker::spawn(&self.php_bin, &self.magento_root, &self.script_path))
+    }
+
+    fn checkin(&self, w: PhpWorker) {
+        self.workers.lock().unwrap().push(w);
+    }
+
+    /// Run a single request, automatically retrying once with a fresh worker
+    /// if the checked-out worker has died.
+    fn request(&self, line: &str) -> Option<String> {
+        for _ in 0..2 {
+            let mut w = self.checkout()?;
+            match w.request(line) {
+                Some(resp) => {
+                    self.checkin(w);
+                    return Some(resp);
+                }
+                None => { /* worker died — drop it, loop spawns a fresh one */ }
+            }
+        }
+        None
+    }
+}
+
+static PHP_WORKER_POOL: OnceLock<PhpWorkerPool> = OnceLock::new();
+
+fn init_php_worker_pool(php_bin: &str, magento_root: &Path) -> PathBuf {
+    let script_path =
+        std::env::temp_dir().join(format!("fast-di-worker-{}.php", std::process::id()));
+    std::fs::write(&script_path, WORKER_PHP)
+        .expect("failed to write PHP worker script to temp dir");
+    PHP_WORKER_POOL.get_or_init(|| {
+        PhpWorkerPool::new(
+            php_bin.to_string(),
+            magento_root.to_path_buf(),
+            script_path.clone(),
+        )
+    });
+    script_path
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -197,6 +403,9 @@ fn main() {
         .unwrap_or_else(|| magento_root.join("generated"));
     let code_root = generated_root.join("code");
     let metadata_root = generated_root.join("metadata");
+
+    // Initialise the persistent PHP worker pool (one autoload per worker process).
+    let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root);
 
     log::info!(
         "fast-di-compile starting\n  magento_root: {}\n  output:       {}",
@@ -890,6 +1099,9 @@ fn main() {
 
     log_phase_elapsed("Total", total_started);
     log::info!("fast-di-compile finished successfully");
+
+    // Clean up the temp PHP worker script.
+    let _ = std::fs::remove_file(&worker_script_path);
 }
 
 fn progress_bar(len: u64, msg: &str) -> ProgressBar {
@@ -1748,8 +1960,8 @@ fn lcfirst_nonempty(s: &str) -> Option<String> {
 
 fn reflect_interceptable_methods(
     fqcn: &str,
-    magento_root: &Path,
-    php_bin: &str,
+    _magento_root: &Path,
+    _php_bin: &str,
 ) -> Option<Vec<MethodSignature>> {
     #[derive(Deserialize)]
     struct ReflectionParam {
@@ -1777,97 +1989,13 @@ fn reflect_interceptable_methods(
         returns_reference: bool,
     }
 
-    let script = r#"
-$root = $argv[1] ?? '';
-$class = ltrim($argv[2] ?? '', '\\');
-if ($root === '' || $class === '') {
-    echo 'null';
-    exit(0);
-}
-@require $root . '/vendor/autoload.php';
-if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) {
-    echo 'null';
-    exit(0);
-}
-function tstr($t) {
-    if ($t === null) return null;
-    if ($t instanceof ReflectionNamedType) {
-        $name = $t->getName();
-        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') {
-            return '?' . $name;
-        }
-        return $name;
-    }
-    if ($t instanceof ReflectionUnionType) {
-        $parts = [];
-        foreach ($t->getTypes() as $part) {
-            $parts[] = $part->getName();
-        }
-        return implode('|', $parts);
-    }
-    if ($t instanceof ReflectionIntersectionType) {
-        $parts = [];
-        foreach ($t->getTypes() as $part) {
-            $parts[] = $part->getName();
-        }
-        return implode('&', $parts);
-    }
-    return null;
-}
-$ref = new ReflectionClass($class);
-$rows = [];
-foreach ($ref->getMethods(ReflectionMethod::IS_PUBLIC) as $m) {
-    if ($m->isConstructor() || $m->isFinal() || $m->isStatic() || $m->isDestructor()) {
-        continue;
-    }
-    $name = $m->getName();
-    if (in_array($name, ['__sleep', '__wakeup', '__clone', '_resetState'], true)) {
-        continue;
-    }
-    $params = [];
-    foreach ($m->getParameters() as $p) {
-        $defaultValue = null;
-        $hasDefault = $p->isDefaultValueAvailable() && !$p->isVariadic();
-        if ($hasDefault) {
-            $defaultValue = var_export($p->getDefaultValue(), true);
-        }
-        $params[] = [
-            'name' => $p->getName(),
-            'type_hint' => tstr($p->getType()),
-            'has_default' => $hasDefault,
-            'default_value' => $defaultValue,
-            'is_variadic' => $p->isVariadic(),
-            'is_by_ref' => $p->isPassedByReference(),
-        ];
-    }
-    $rows[] = [
-        'name' => $name,
-        'params' => $params,
-        'return_type' => tstr($m->getReturnType()),
-        'returns_reference' => $m->returnsReference(),
-    ];
-}
-echo json_encode($rows);
-"#;
-
-    let output = Command::new(php_bin)
-        .arg("-d")
-        .arg("display_errors=0")
-        .arg("-d")
-        .arg("display_startup_errors=0")
-        .arg("-r")
-        .arg(script)
-        .arg(magento_root)
-        .arg(fqcn.trim_start_matches('\\'))
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    let pool = PHP_WORKER_POOL.get()?;
+    let request = format!("methods:{}", fqcn.trim_start_matches('\\'));
+    let json_raw = pool.request(&request)?;
+    let json_trimmed = json_raw.trim();
+    if json_trimmed == "null" || json_trimmed.is_empty() {
         return None;
     }
-
-    let json_raw = String::from_utf8(output.stdout).ok()?;
-    let json_trimmed = json_raw.trim();
     let json_slice = if json_trimmed.starts_with('[') {
         json_trimmed
     } else {
@@ -1943,8 +2071,8 @@ fn constructor_params_need_reflection(params: &[ConstructorParam]) -> bool {
 
 fn reflect_constructor_params(
     fqcn: &str,
-    magento_root: &Path,
-    php_bin: &str,
+    _magento_root: &Path,
+    _php_bin: &str,
 ) -> Option<Vec<ConstructorParam>> {
     #[derive(Deserialize)]
     struct ReflectionParam {
@@ -1959,85 +2087,13 @@ fn reflect_constructor_params(
         is_variadic: bool,
     }
 
-    let script = r#"
-$root = $argv[1] ?? '';
-$class = ltrim($argv[2] ?? '', '\\');
-if ($root === '' || $class === '') {
-    echo '[]';
-    exit(0);
-}
-@require $root . '/vendor/autoload.php';
-if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) {
-    echo '[]';
-    exit(0);
-}
-function tstr($t) {
-    if ($t === null) return null;
-    if ($t instanceof ReflectionNamedType) {
-        $name = $t->getName();
-        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') {
-            return '?' . $name;
-        }
-        return $name;
-    }
-    if ($t instanceof ReflectionUnionType) {
-        $parts = [];
-        foreach ($t->getTypes() as $part) {
-            $parts[] = $part->getName();
-        }
-        return implode('|', $parts);
-    }
-    if ($t instanceof ReflectionIntersectionType) {
-        $parts = [];
-        foreach ($t->getTypes() as $part) {
-            $parts[] = $part->getName();
-        }
-        return implode('&', $parts);
-    }
-    return null;
-}
-$ref = new ReflectionClass($class);
-$ctor = $ref->getConstructor();
-if ($ctor === null) {
-    echo 'null';
-    exit(0);
-}
-$params = [];
-foreach ($ctor->getParameters() as $p) {
-    $defaultValue = null;
-    $hasDefault = $p->isDefaultValueAvailable() && !$p->isVariadic();
-    if ($hasDefault) {
-        $defaultValue = var_export($p->getDefaultValue(), true);
-    }
-    $params[] = [
-        'name' => $p->getName(),
-        'type_hint' => tstr($p->getType()),
-        'has_default' => $hasDefault,
-        'default_value' => $defaultValue,
-        'is_variadic' => $p->isVariadic(),
-    ];
-}
-echo json_encode($params);
-"#;
-
-    let output = Command::new(php_bin)
-        .arg("-d")
-        .arg("display_errors=0")
-        .arg("-d")
-        .arg("display_startup_errors=0")
-        .arg("-r")
-        .arg(script)
-        .arg(magento_root)
-        .arg(fqcn.trim_start_matches('\\'))
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    let pool = PHP_WORKER_POOL.get()?;
+    let request = format!("ctor:{}", fqcn.trim_start_matches('\\'));
+    let json_raw = pool.request(&request)?;
+    let json_trimmed = json_raw.trim();
+    if json_trimmed == "null" || json_trimmed.is_empty() {
         return None;
     }
-
-    let json_raw = String::from_utf8(output.stdout).ok()?;
-    let json_trimmed = json_raw.trim();
     let json_slice = if json_trimmed.starts_with('[') {
         json_trimmed
     } else {

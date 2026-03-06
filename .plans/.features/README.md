@@ -37,4 +37,5 @@ One file per feature. Status values: Planned | In Progress | Implemented.
 | 30 | [plugin-list-metadata-generation](30-plugin-list-metadata-generation.md) | 08 | Planned |
 | 31 | [app-action-list-and-output-layout](31-app-action-list-and-output-layout.md) | 08 | Planned |
 | 32 | [runtime-map-generator-coverage](32-runtime-map-generator-coverage.md) | 08 | Planned |
-| 33 | [code-content-parity-closure](33-code-content-parity-closure.md) | 08 | Planned |
+| 33 | [code-content-parity-closure](33-code-content-parity-closure.md) | 08 | In Progress |
+| 34 | [php-reflection-worker-pool](34-php-reflection-worker-pool.md) | 09 | In Progress |
