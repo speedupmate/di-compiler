@@ -22,10 +22,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use code_generator::{
-    extension_path, factory_path, generate_area_config, generate_extension,
-    generate_extension_interface, generate_factory, generate_interceptor, generate_plugin_list_php,
-    generate_proxy, interceptor_path, proxy_path, serialize_interception_php, write_if_changed,
-    ExtensionAttributeSpec, ExtensionSpec, AREAS,
+    extension_path, factory_path, generate_app_action_list_php, generate_area_config,
+    generate_extension, generate_extension_interface, generate_factory, generate_interceptor,
+    generate_plugin_list_php, generate_proxy, interceptor_path, proxy_path,
+    serialize_interception_php, write_if_changed, ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
     detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs_with_existing,
@@ -573,6 +573,11 @@ fn main() {
         pb_plugins.inc(1);
     }
     pb_plugins.finish_with_message("done");
+
+    // App action list metadata.
+    let app_action_list = generate_app_action_list_php(&class_map);
+    let app_action_list_path = metadata_root.join("app_action_list.php");
+    let _ = write_if_changed(&app_action_list_path, &app_action_list);
 
     let total_written = written.load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
