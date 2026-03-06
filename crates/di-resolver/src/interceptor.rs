@@ -75,10 +75,18 @@ pub fn detect_interceptors(
             .collect();
         plugin_refs.sort_by_key(|p| p.sort_order);
 
+        // Even for directly intercepted classes, runtime plugin resolution includes
+        // plugins declared on ancestors in the extends chain. Use the inherited
+        // plugin method surface to avoid dropping parent-plugin methods.
         let intercepted_method_names =
-            derive_intercepted_methods_from_plugins(&plugin_refs, class_map, di_config);
-        let public_methods =
-            select_interceptor_methods(owner_name, class_map, Some(&intercepted_method_names));
+            derive_intercepted_methods_from_ancestor_plugins(owner_name, class_map, di_config);
+        let public_methods = if intercepted_method_names.is_empty() {
+            // When plugin class methods cannot be resolved, avoid emitting the full
+            // inherited method surface. Fall back to target-declared methods only.
+            select_interceptor_methods(owner_name, class_map, None, false)
+        } else {
+            select_interceptor_methods(owner_name, class_map, Some(&intercepted_method_names), true)
+        };
 
         specs.push(InterceptorSpec {
             fqcn: owner_name.clone(),
@@ -121,10 +129,17 @@ pub fn detect_interceptors(
         }
         // Check inheritance chain.
         if has_intercepted_ancestor(fqcn, class_map, &intercepted_set, &mut ancestor_cache) {
+            let inherited_method_names =
+                derive_intercepted_methods_from_ancestor_plugins(fqcn, class_map, di_config);
+            let public_methods = if inherited_method_names.is_empty() {
+                select_interceptor_methods(fqcn, class_map, None, false)
+            } else {
+                select_interceptor_methods(fqcn, class_map, Some(&inherited_method_names), true)
+            };
             specs.push(InterceptorSpec {
                 fqcn: fqcn.clone(),
                 plugins: vec![], // resolved at runtime by plugin framework
-                public_methods: select_interceptor_methods(fqcn, class_map, None),
+                public_methods,
             });
         }
     }
@@ -137,19 +152,34 @@ fn select_interceptor_methods(
     fqcn: &str,
     class_map: &HashMap<String, ClassInfo>,
     intercepted_method_names: Option<&HashSet<String>>,
+    include_inherited: bool,
 ) -> Vec<MethodSignature> {
-    let methods = collect_public_methods_with_inheritance(fqcn, class_map);
+    let methods = if include_inherited {
+        collect_public_methods_with_inheritance(fqcn, class_map)
+    } else {
+        collect_public_methods_declared_only(fqcn, class_map)
+    };
     methods
         .into_iter()
         .filter(|m| is_interceptable_method(m))
         .filter(|m| {
             if let Some(names) = intercepted_method_names {
-                names.is_empty() || names.contains(&m.name)
+                names.contains(&m.name)
             } else {
                 true
             }
         })
         .collect()
+}
+
+fn collect_public_methods_declared_only(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> Vec<MethodSignature> {
+    class_map
+        .get(fqcn)
+        .map(|info| info.public_methods.clone())
+        .unwrap_or_default()
 }
 
 fn collect_public_methods_with_inheritance(
@@ -194,6 +224,52 @@ fn derive_intercepted_methods_from_plugins(
         for method in &plugin_info.public_methods {
             if let Some(intercepted_method) = plugin_method_to_intercepted(&method.name) {
                 methods.insert(intercepted_method);
+            }
+        }
+    }
+
+    methods
+}
+
+fn derive_intercepted_methods_from_ancestor_plugins(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> HashSet<String> {
+    let mut methods = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![fqcn.to_string()];
+
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+
+        if let Some(plugins) = di_config.plugins.get(&current) {
+            let plugin_refs: Vec<PluginRef> = plugins
+                .iter()
+                .filter(|p| !p.disabled)
+                .map(|p| PluginRef {
+                    name: p.name.clone(),
+                    type_name: p.type_name.clone(),
+                    sort_order: p.sort_order,
+                })
+                .collect();
+            if !plugin_refs.is_empty() {
+                methods.extend(derive_intercepted_methods_from_plugins(
+                    &plugin_refs,
+                    class_map,
+                    di_config,
+                ));
+            }
+        }
+
+        if let Some(info) = class_map.get(&current) {
+            if let Some(parent) = &info.extends {
+                stack.push(parent.clone());
+            }
+            for interface in &info.implements {
+                stack.push(interface.clone());
             }
         }
     }
@@ -465,5 +541,73 @@ mod tests {
             .map(|m| m.name.as_str())
             .collect();
         assert_eq!(names, vec!["run"]);
+    }
+
+    #[test]
+    fn test_unresolved_plugin_class_falls_back_to_declared_methods_only() {
+        let mut base = make_class("Foo\\Base", false);
+        base.public_methods = vec![make_method("baseMethod", false)];
+
+        let mut target = make_class("Foo\\Bar", false);
+        target.extends = Some("Foo\\Base".to_string());
+        target.public_methods = vec![make_method("run", false)];
+
+        let mut class_map = HashMap::new();
+        class_map.insert("Foo\\Base".to_string(), base);
+        class_map.insert("Foo\\Bar".to_string(), target);
+
+        let mut di_config = DiConfig::default();
+        di_config.plugins.insert(
+            "Foo\\Bar".to_string(),
+            vec![make_plugin("p", "Foo\\MissingPluginClass", 10, false)],
+        );
+
+        let specs = detect_interceptors(&class_map, &di_config);
+        assert_eq!(specs.len(), 1);
+        let names: Vec<&str> = specs[0]
+            .public_methods
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["run"]);
+    }
+
+    #[test]
+    fn test_inherited_interceptor_uses_ancestor_plugin_method_surface() {
+        let mut parent = make_class("Foo\\Parent", false);
+        parent.public_methods = vec![make_method("getForm", false)];
+
+        let mut child = make_class("Foo\\Child", false);
+        child.extends = Some("Foo\\Parent".to_string());
+        child.public_methods = vec![
+            make_method("getSupportTopics", false),
+            make_method("getIssuesTopics", false),
+        ];
+
+        let mut plugin = make_class("Foo\\Plugin", false);
+        plugin.public_methods = vec![make_method("afterGetForm", false)];
+
+        let mut class_map = HashMap::new();
+        class_map.insert("Foo\\Parent".to_string(), parent);
+        class_map.insert("Foo\\Child".to_string(), child);
+        class_map.insert("Foo\\Plugin".to_string(), plugin);
+
+        let mut di_config = DiConfig::default();
+        di_config.plugins.insert(
+            "Foo\\Parent".to_string(),
+            vec![make_plugin("p", "Foo\\Plugin", 10, false)],
+        );
+
+        let specs = detect_interceptors(&class_map, &di_config);
+        let child_spec = specs
+            .iter()
+            .find(|s| s.fqcn == "Foo\\Child")
+            .expect("child interceptor");
+        let names: Vec<&str> = child_spec
+            .public_methods
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["getForm"]);
     }
 }

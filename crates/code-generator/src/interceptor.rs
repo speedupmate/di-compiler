@@ -38,11 +38,11 @@ pub fn generate_interceptor(spec: &InterceptorSpec, target_info: Option<&ClassIn
         out.push_str("        parent::__construct(");
         out.push_str(&render_param_names(params));
         out.push_str(");\n");
-        out.push_str("    }\n\n");
+        out.push_str("    }\n");
     } else {
         out.push_str("    public function __construct()\n    {\n");
         out.push_str("        $this->___init();\n");
-        out.push_str("    }\n\n");
+        out.push_str("    }\n");
     }
 
     // Intercepted methods
@@ -52,6 +52,7 @@ pub fn generate_interceptor(spec: &InterceptorSpec, target_info: Option<&ClassIn
         .filter_map(|method| render_intercepted_method(method))
         .collect();
     if !rendered_methods.is_empty() {
+        out.push('\n');
         out.push_str(&rendered_methods.join("\n"));
     }
 
@@ -131,8 +132,11 @@ fn render_params(params: &[php_extractor::types::ConstructorParam]) -> String {
                 s.push_str("...");
             }
             s.push_str(&format!("${}", p.name));
-            if p.is_optional && !p.is_variadic {
-                s.push_str(" = null");
+            if !p.is_variadic {
+                if let Some(default_value) = &p.default_value {
+                    s.push_str(" = ");
+                    s.push_str(default_value);
+                }
             }
             s
         })
@@ -170,8 +174,11 @@ fn render_method_params(params: &[MethodParam]) -> String {
                 s.push('&');
             }
             s.push_str(&format!("${}", p.name));
-            if p.has_default && !p.is_variadic {
-                s.push_str(" = null");
+            if !p.is_variadic {
+                if let Some(default_value) = &p.default_value {
+                    s.push_str(" = ");
+                    s.push_str(default_value);
+                }
             }
             s
         })
@@ -204,22 +211,38 @@ pub fn render_type_hint(th: &str) -> String {
 
     // Union types: split on `|`
     if core.contains('|') {
-        let parts: Vec<String> = core
+        let raw_parts: Vec<&str> = core
             .split('|')
-            .map(|p| {
-                let p = p.trim();
-                if PRIMITIVES.contains(&p) {
-                    p.to_string()
-                } else {
-                    format!("\\{}", p)
-                }
-            })
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let has_null = raw_parts.iter().any(|p| *p == "null");
+        let non_null: Vec<&str> = raw_parts.iter().copied().filter(|p| *p != "null").collect();
+        if has_null && non_null.len() == 1 && !PRIMITIVES.contains(&non_null[0]) {
+            let rendered = render_type_part(non_null[0], PRIMITIVES);
+            if nullable.is_empty() {
+                return format!("?{}", rendered);
+            }
+            return format!("{}{}", nullable, rendered);
+        }
+
+        let parts: Vec<String> = raw_parts
+            .into_iter()
+            .map(|p| render_type_part(p, PRIMITIVES))
             .collect();
         return format!("{}{}", nullable, parts.join("|"));
     }
 
     // Plain class name
     format!("{}\\{}", nullable, core)
+}
+
+fn render_type_part(p: &str, primitives: &[&str]) -> String {
+    if primitives.contains(&p) {
+        p.to_string()
+    } else {
+        format!("\\{}", p.trim_start_matches('\\'))
+    }
 }
 
 /// Namespace for generated interceptor class: `<TargetFQCN>`.
@@ -341,6 +364,7 @@ mod tests {
                     name: "value".to_string(),
                     type_hint: Some("?Foo\\Bar|null".to_string()),
                     has_default: false,
+                    default_value: None,
                     is_variadic: false,
                     is_by_ref: true,
                 },
@@ -348,6 +372,7 @@ mod tests {
                     name: "rest".to_string(),
                     type_hint: Some("Baz\\Qux".to_string()),
                     has_default: false,
+                    default_value: None,
                     is_variadic: true,
                     is_by_ref: false,
                 },
@@ -359,7 +384,7 @@ mod tests {
 
         let rendered = render_intercepted_method(&method).unwrap();
         assert!(rendered.contains("public function & resolve("));
-        assert!(rendered.contains("?\\Foo\\Bar|null &$value"));
+        assert!(rendered.contains("&$value"));
         assert!(rendered.contains("\\Baz\\Qux ...$rest"));
         assert!(rendered.contains(") : string|null"));
     }

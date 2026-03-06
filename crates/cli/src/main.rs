@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -38,7 +39,10 @@ use di_xml_reader::{
 };
 use php_extractor::{
     extract_file,
-    types::{ClassInfo, ClassKind, ExtractResult, MethodParam, MethodSignature},
+    types::{
+        ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
+        MethodSignature,
+    },
     walker::{read_module_paths, walk_php_files},
 };
 
@@ -433,7 +437,14 @@ fn main() {
         );
     }
 
-    let interceptors = detect_interceptors(&interception_class_map, &interception_di_config);
+    let mut interceptors = detect_interceptors(&interception_class_map, &interception_di_config);
+    enrich_interceptor_specs_with_reflection(
+        &mut interceptors,
+        &interception_class_map,
+        &interception_di_config,
+        &magento_root,
+        &args.fallback_php,
+    );
 
     let extension_interfaces_to_generate = extension_specs
         .iter()
@@ -492,11 +503,40 @@ fn main() {
         "Generating code",
     );
     let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflected_ctor_params: HashMap<String, Vec<ConstructorParam>> = interceptors
+        .iter()
+        .filter_map(|spec| {
+            let info = interceptor_target_info_with_inherited_constructor(
+                &spec.fqcn,
+                &interception_class_map,
+            )?;
+            let needs_reflection = match info.constructor.as_ref() {
+                Some(constructor) => constructor_params_need_reflection(&constructor.params),
+                None => true,
+            };
+            if !needs_reflection {
+                return None;
+            }
+            let params =
+                reflect_constructor_params(&spec.fqcn, &args.magento_root, &args.fallback_php)?;
+            Some((spec.fqcn.clone(), params))
+        })
+        .collect();
+    let reflected_ctor_params = Arc::new(reflected_ctor_params);
 
     // Interceptors
     interceptors.par_iter().for_each(|spec| {
-        let info = interception_class_map.get(&spec.fqcn);
-        let content = generate_interceptor(spec, info);
+        let mut effective_info =
+            interceptor_target_info_with_inherited_constructor(&spec.fqcn, &interception_class_map);
+        if let (Some(info), Some(params)) = (
+            effective_info.as_mut(),
+            reflected_ctor_params.get(&spec.fqcn),
+        ) {
+            info.constructor = Some(Constructor {
+                params: params.clone(),
+            });
+        }
+        let content = generate_interceptor(spec, effective_info.as_ref());
         let rel = interceptor_path(&spec.fqcn);
         let out_path = code_root.join(&rel);
         if let Ok(changed) = write_if_changed(&out_path, &content) {
@@ -522,8 +562,9 @@ fn main() {
 
     // Proxies
     proxies.par_iter().for_each(|spec| {
-        let target_info = class_map.get(&spec.target_fqcn);
-        let content = generate_proxy(spec, target_info);
+        let target_info =
+            target_info_with_inherited_public_methods(&spec.target_fqcn, &interception_class_map);
+        let content = generate_proxy(spec, target_info.as_ref());
         let rel = proxy_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
         if let Ok(changed) = write_if_changed(&out_path, &content) {
@@ -549,8 +590,10 @@ fn main() {
 
     // Proxy deferred
     proxy_deferred.par_iter().for_each(|spec| {
-        let target_info = class_map.get(&spec.target_fqcn);
-        let content = generate_proxy_deferred(&spec.proxy_fqcn, &spec.target_fqcn, target_info);
+        let target_info =
+            target_info_with_inherited_public_methods(&spec.target_fqcn, &interception_class_map);
+        let content =
+            generate_proxy_deferred(&spec.proxy_fqcn, &spec.target_fqcn, target_info.as_ref());
         let rel = proxy_deferred_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
         if let Ok(changed) = write_if_changed(&out_path, &content) {
@@ -713,11 +756,13 @@ fn main() {
         match compare_against_archive(&generated_root, &archive_root, &report_dir) {
             Ok(summary) => {
                 log::info!(
-                    "Archive diff: code missing {}, code extra {}, metadata missing {}, metadata extra {} (reports: {})",
+                    "Archive diff: code missing {}, code extra {}, code changed {}, metadata missing {}, metadata extra {}, metadata changed {} (reports: {})",
                     summary.code_missing,
                     summary.code_extra,
+                    summary.code_changed,
                     summary.metadata_missing,
                     summary.metadata_extra,
+                    summary.metadata_changed,
                     report_dir.display()
                 );
                 if args.compare_fail_on_diff && !summary.is_clean() {
@@ -779,16 +824,20 @@ fn print_summary(
 struct ArchiveCompareSummary {
     code_missing: usize,
     code_extra: usize,
+    code_changed: usize,
     metadata_missing: usize,
     metadata_extra: usize,
+    metadata_changed: usize,
 }
 
 impl ArchiveCompareSummary {
     fn is_clean(&self) -> bool {
         self.code_missing == 0
             && self.code_extra == 0
+            && self.code_changed == 0
             && self.metadata_missing == 0
             && self.metadata_extra == 0
+            && self.metadata_changed == 0
     }
 }
 
@@ -796,6 +845,7 @@ impl ArchiveCompareSummary {
 struct RelativeDiff {
     missing: Vec<String>,
     extra: Vec<String>,
+    changed: Vec<String>,
 }
 
 fn compare_against_archive(
@@ -830,17 +880,24 @@ fn compare_against_archive(
     std::fs::create_dir_all(report_dir)?;
     write_diff_list(&report_dir.join("code.missing.txt"), &code_diff.missing)?;
     write_diff_list(&report_dir.join("code.extra.txt"), &code_diff.extra)?;
+    write_diff_list(&report_dir.join("code.changed.txt"), &code_diff.changed)?;
     write_diff_list(
         &report_dir.join("metadata.missing.txt"),
         &metadata_diff.missing,
     )?;
     write_diff_list(&report_dir.join("metadata.extra.txt"), &metadata_diff.extra)?;
+    write_diff_list(
+        &report_dir.join("metadata.changed.txt"),
+        &metadata_diff.changed,
+    )?;
 
     let summary = ArchiveCompareSummary {
         code_missing: code_diff.missing.len(),
         code_extra: code_diff.extra.len(),
+        code_changed: code_diff.changed.len(),
         metadata_missing: metadata_diff.missing.len(),
         metadata_extra: metadata_diff.extra.len(),
+        metadata_changed: metadata_diff.changed.len(),
     };
     let summary_json = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(report_dir.join("summary.json"), summary_json)?;
@@ -854,10 +911,25 @@ fn diff_relative_files(archive_dir: &Path, output_dir: &Path) -> std::io::Result
 
     let mut missing: Vec<String> = archive_files.difference(&output_files).cloned().collect();
     let mut extra: Vec<String> = output_files.difference(&archive_files).cloned().collect();
+    let mut changed = Vec::new();
+
+    for rel in archive_files.intersection(&output_files) {
+        let archive_path = archive_dir.join(rel);
+        let output_path = output_dir.join(rel);
+        if files_differ(&archive_path, &output_path)? {
+            changed.push(rel.clone());
+        }
+    }
+
     missing.sort();
     extra.sort();
+    changed.sort();
 
-    Ok(RelativeDiff { missing, extra })
+    Ok(RelativeDiff {
+        missing,
+        extra,
+        changed,
+    })
 }
 
 fn collect_relative_files(root: &Path) -> std::io::Result<HashSet<String>> {
@@ -903,8 +975,24 @@ fn write_diff_list(path: &Path, lines: &[String]) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
+fn files_differ(left: &Path, right: &Path) -> std::io::Result<bool> {
+    let left_meta = std::fs::metadata(left)?;
+    let right_meta = std::fs::metadata(right)?;
+    if left_meta.len() != right_meta.len() {
+        return Ok(true);
+    }
+    let left_bytes = std::fs::read(left)?;
+    let right_bytes = std::fs::read(right)?;
+    Ok(left_bytes != right_bytes)
+}
+
 fn synthetic_factory_class_info(factory_fqcn: &str) -> ClassInfo {
     let normalized = factory_fqcn.trim_start_matches('\\');
+    let target_fqcn = normalized
+        .strip_suffix("Factory")
+        .unwrap_or(normalized)
+        .to_string();
+    let escaped_target = target_fqcn.replace('\\', "\\\\");
     let (namespace, name) = if let Some((ns, class_name)) = normalized.rsplit_once('\\') {
         (ns.to_string(), class_name.to_string())
     } else {
@@ -919,7 +1007,28 @@ fn synthetic_factory_class_info(factory_fqcn: &str) -> ClassInfo {
         kind: ClassKind::Class,
         extends: None,
         implements: vec![],
-        constructor: None,
+        constructor: Some(Constructor {
+            params: vec![
+                ConstructorParam {
+                    name: "objectManager".to_string(),
+                    type_hint: Some("Magento\\Framework\\ObjectManagerInterface".to_string()),
+                    is_optional: false,
+                    default_value: None,
+                    is_primitive: false,
+                    is_variadic: false,
+                    is_promoted: false,
+                },
+                ConstructorParam {
+                    name: "instanceName".to_string(),
+                    type_hint: None,
+                    is_optional: true,
+                    default_value: Some(format!("'\\\\{}'", escaped_target)),
+                    is_primitive: false,
+                    is_variadic: false,
+                    is_promoted: false,
+                },
+            ],
+        }),
         is_abstract: false,
         is_final: false,
         public_methods: vec![MethodSignature {
@@ -928,6 +1037,7 @@ fn synthetic_factory_class_info(factory_fqcn: &str) -> ClassInfo {
                 name: "data".to_string(),
                 type_hint: Some("array".to_string()),
                 has_default: true,
+                default_value: Some("[]".to_string()),
                 is_variadic: false,
                 is_by_ref: false,
             }],
@@ -1099,6 +1209,18 @@ fn augment_with_composer_plugin_owner_classes(
             candidates.insert(resolved);
         }
     }
+    for plugins in di_config.plugins.values() {
+        for plugin in plugins {
+            let plugin_type = plugin.type_name.trim_start_matches('\\').to_string();
+            if !class_map.contains_key(&plugin_type) {
+                candidates.insert(plugin_type.clone());
+            }
+            let resolved_plugin_type = di_config.get_instance_type(&plugin_type);
+            if !class_map.contains_key(&resolved_plugin_type) {
+                candidates.insert(resolved_plugin_type);
+            }
+        }
+    }
 
     for fqcn in candidates {
         if class_map.contains_key(&fqcn) {
@@ -1111,6 +1233,662 @@ fn augment_with_composer_plugin_owner_classes(
             class_map.insert(info.fqcn.clone(), info);
         }
     }
+}
+
+fn interceptor_target_info_with_inherited_constructor(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> Option<ClassInfo> {
+    let normalized = fqcn.trim_start_matches('\\');
+    let mut info = class_map.get(normalized)?.clone();
+    if info.constructor.is_some() {
+        return Some(info);
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cursor = info.extends.clone();
+    while let Some(parent) = cursor {
+        if !seen.insert(parent.clone()) {
+            break;
+        }
+        let Some(parent_info) = class_map.get(&parent) else {
+            break;
+        };
+        if parent_info.constructor.is_some() {
+            info.constructor = parent_info.constructor.clone();
+            break;
+        }
+        cursor = parent_info.extends.clone();
+    }
+
+    Some(info)
+}
+
+fn target_info_with_inherited_public_methods(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> Option<ClassInfo> {
+    let normalized = fqcn.trim_start_matches('\\');
+    let mut info = class_map.get(normalized)?.clone();
+    info.public_methods = collect_public_methods_with_inheritance(normalized, class_map);
+    Some(info)
+}
+
+fn collect_public_methods_with_inheritance(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> Vec<MethodSignature> {
+    let mut methods = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut seen_types: HashSet<String> = HashSet::new();
+    let mut stack = vec![fqcn.to_string()];
+
+    while let Some(current) = stack.pop() {
+        if !seen_types.insert(current.clone()) {
+            continue;
+        }
+        let Some(info) = class_map.get(&current) else {
+            continue;
+        };
+
+        for method in &info.public_methods {
+            if seen_names.insert(method.name.clone()) {
+                methods.push(method.clone());
+            }
+        }
+
+        if let Some(parent) = &info.extends {
+            stack.push(parent.clone());
+        }
+        for interface in &info.implements {
+            stack.push(interface.clone());
+        }
+    }
+
+    methods
+}
+
+fn enrich_interceptor_specs_with_reflection(
+    specs: &mut [di_resolver::InterceptorSpec],
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    magento_root: &Path,
+    php_bin: &str,
+) {
+    let mut reflection_cache: HashMap<String, Option<Vec<MethodSignature>>> = HashMap::new();
+    let mut plugin_method_cache: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+
+    for spec in specs.iter_mut() {
+        let needs_signature_normalization =
+            interceptor_methods_need_reflection_normalization(&spec.public_methods);
+        let expected = if spec.plugins.is_empty() {
+            HashSet::new()
+        } else {
+            derive_intercepted_method_names_from_plugins(
+                &spec.plugins,
+                class_map,
+                di_config,
+                magento_root,
+                php_bin,
+                &mut plugin_method_cache,
+            )
+        };
+        if spec.plugins.is_empty() && !needs_signature_normalization {
+            continue;
+        }
+        if !spec.plugins.is_empty() && expected.is_empty() && !needs_signature_normalization {
+            continue;
+        }
+
+        let current: HashSet<String> = spec.public_methods.iter().map(|m| m.name.clone()).collect();
+        let missing_expected = !spec.plugins.is_empty() && !expected.is_subset(&current);
+        if !missing_expected && !needs_signature_normalization {
+            continue;
+        }
+
+        let reflected = reflection_cache
+            .entry(spec.fqcn.clone())
+            .or_insert_with(|| reflect_interceptable_methods(&spec.fqcn, magento_root, php_bin))
+            .clone();
+
+        let Some(mut reflected_methods) = reflected else {
+            continue;
+        };
+        for method in reflected_methods.iter_mut() {
+            normalize_reflected_method_signature(method, &spec.fqcn, class_map);
+        }
+
+        let reflected_by_name: HashMap<String, MethodSignature> = reflected_methods
+            .iter()
+            .map(|m| (m.name.clone(), m.clone()))
+            .collect();
+
+        if !missing_expected {
+            // Keep resolver-selected method set/order, but normalize signatures/defaults
+            // from reflection where available to match Magento output.
+            spec.public_methods = spec
+                .public_methods
+                .iter()
+                .map(|m| {
+                    reflected_by_name
+                        .get(&m.name)
+                        .cloned()
+                        .unwrap_or_else(|| m.clone())
+                })
+                .collect();
+            continue;
+        }
+
+        let reflected_filtered: Vec<MethodSignature> = reflected_methods
+            .into_iter()
+            .filter(|m| expected.contains(&m.name))
+            .collect();
+        if !reflected_filtered.is_empty() {
+            spec.public_methods = reflected_filtered;
+        }
+    }
+}
+
+fn interceptor_methods_need_reflection_normalization(methods: &[MethodSignature]) -> bool {
+    methods.iter().any(|method| {
+        method
+            .return_type
+            .as_deref()
+            .map(|rt| matches!(rt, "self" | "parent" | "static") || rt.contains('|'))
+            .unwrap_or(false)
+            || method.params.iter().any(|param| {
+                param
+                    .type_hint
+                    .as_deref()
+                    .map(|th| matches!(th, "self" | "parent" | "static") || th.contains('|'))
+                    .unwrap_or(false)
+                    || param
+                        .default_value
+                        .as_deref()
+                        .map(|dv| {
+                            let t = dv.trim();
+                            t.contains("::")
+                                || t.eq_ignore_ascii_case("null")
+                                || t.starts_with("array (")
+                        })
+                        .unwrap_or(false)
+            })
+    })
+}
+
+fn normalize_reflected_method_signature(
+    method: &mut MethodSignature,
+    target_fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) {
+    if let Some(rt) = method.return_type.as_mut() {
+        *rt = normalize_reflected_type_hint(rt, target_fqcn, class_map);
+    }
+    for param in method.params.iter_mut() {
+        if let Some(th) = param.type_hint.as_mut() {
+            *th = normalize_reflected_type_hint(th, target_fqcn, class_map);
+        }
+    }
+}
+
+fn normalize_reflected_type_hint(
+    raw: &str,
+    target_fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> String {
+    const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
+        ("bool", 1),
+        ("int", 2),
+        ("float", 3),
+        ("string", 4),
+        ("array", 5),
+        ("callable", 6),
+        ("iterable", 7),
+        ("object", 8),
+        ("static", 9),
+        ("mixed", 10),
+        ("void", 11),
+        ("false", 12),
+        ("true", 13),
+        ("null", 14),
+        ("never", 15),
+    ];
+
+    let normalized_target = target_fqcn.trim_start_matches('\\');
+    let current_info = class_map.get(normalized_target);
+
+    let (nullable, core) = if let Some(rest) = raw.strip_prefix('?') {
+        ("?", rest)
+    } else {
+        ("", raw)
+    };
+
+    let normalize_single = |part: &str| -> String {
+        match part {
+            "self" | "static" => normalized_target.to_string(),
+            "parent" => current_info
+                .and_then(|info| info.extends.clone())
+                .unwrap_or_else(|| "parent".to_string()),
+            _ => part.trim_start_matches('\\').to_string(),
+        }
+    };
+
+    if core.contains('|') {
+        let mut parts: Vec<String> = core
+            .split('|')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(normalize_single)
+            .collect();
+        let precedence_of = |value: &str| -> u8 {
+            let lower = value.to_ascii_lowercase();
+            BUILTIN_PRECEDENCE
+                .iter()
+                .find_map(|(name, rank)| (*name == lower).then_some(*rank))
+                .unwrap_or(0)
+        };
+        parts.sort_by(|a, b| {
+            precedence_of(a)
+                .cmp(&precedence_of(b))
+                .then_with(|| a.cmp(b))
+        });
+        return format!("{}{}", nullable, parts.join("|"));
+    }
+
+    format!("{}{}", nullable, normalize_single(core))
+}
+
+fn derive_intercepted_method_names_from_plugins(
+    plugins: &[di_resolver::PluginRef],
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    magento_root: &Path,
+    php_bin: &str,
+    plugin_method_cache: &mut HashMap<String, Option<HashSet<String>>>,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+
+    for plugin in plugins {
+        let resolved = di_config.get_instance_type(&plugin.type_name);
+        let mut candidates = vec![
+            resolved.trim_start_matches('\\').to_string(),
+            plugin.type_name.trim_start_matches('\\').to_string(),
+        ];
+        candidates.sort();
+        candidates.dedup();
+        candidates.retain(|c| !c.is_empty());
+
+        for candidate in &candidates {
+            if let Some(plugin_info) = class_map.get(candidate) {
+                for method in &plugin_info.public_methods {
+                    if let Some(name) = plugin_method_to_intercepted(&method.name) {
+                        names.insert(name);
+                    }
+                }
+            }
+
+            let reflected = plugin_method_cache
+                .entry(candidate.clone())
+                .or_insert_with(|| {
+                    reflect_interceptable_methods(candidate, magento_root, php_bin).map(|methods| {
+                        let mut method_names = HashSet::new();
+                        for method in methods {
+                            if let Some(name) = plugin_method_to_intercepted(&method.name) {
+                                method_names.insert(name);
+                            }
+                        }
+                        method_names
+                    })
+                })
+                .clone();
+            if let Some(method_names) = reflected {
+                names.extend(method_names);
+            }
+        }
+    }
+
+    names
+}
+
+fn plugin_method_to_intercepted(method: &str) -> Option<String> {
+    if let Some(rest) = method.strip_prefix("before") {
+        return lcfirst_nonempty(rest);
+    }
+    if let Some(rest) = method.strip_prefix("around") {
+        return lcfirst_nonempty(rest);
+    }
+    if let Some(rest) = method.strip_prefix("after") {
+        return lcfirst_nonempty(rest);
+    }
+    None
+}
+
+fn lcfirst_nonempty(s: &str) -> Option<String> {
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    let mut out = first.to_lowercase().to_string();
+    out.push_str(chars.as_str());
+    Some(out)
+}
+
+fn reflect_interceptable_methods(
+    fqcn: &str,
+    magento_root: &Path,
+    php_bin: &str,
+) -> Option<Vec<MethodSignature>> {
+    #[derive(Deserialize)]
+    struct ReflectionParam {
+        name: String,
+        #[serde(default)]
+        type_hint: Option<String>,
+        #[serde(default)]
+        has_default: bool,
+        #[serde(default)]
+        default_value: Option<String>,
+        #[serde(default)]
+        is_variadic: bool,
+        #[serde(default)]
+        is_by_ref: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct ReflectionMethod {
+        name: String,
+        #[serde(default)]
+        params: Vec<ReflectionParam>,
+        #[serde(default)]
+        return_type: Option<String>,
+        #[serde(default)]
+        returns_reference: bool,
+    }
+
+    let script = r#"
+$root = $argv[1] ?? '';
+$class = ltrim($argv[2] ?? '', '\\');
+if ($root === '' || $class === '') {
+    echo 'null';
+    exit(0);
+}
+@require $root . '/vendor/autoload.php';
+if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) {
+    echo 'null';
+    exit(0);
+}
+function tstr($t) {
+    if ($t === null) return null;
+    if ($t instanceof ReflectionNamedType) {
+        $name = $t->getName();
+        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') {
+            return '?' . $name;
+        }
+        return $name;
+    }
+    if ($t instanceof ReflectionUnionType) {
+        $parts = [];
+        foreach ($t->getTypes() as $part) {
+            $parts[] = $part->getName();
+        }
+        return implode('|', $parts);
+    }
+    if ($t instanceof ReflectionIntersectionType) {
+        $parts = [];
+        foreach ($t->getTypes() as $part) {
+            $parts[] = $part->getName();
+        }
+        return implode('&', $parts);
+    }
+    return null;
+}
+$ref = new ReflectionClass($class);
+$rows = [];
+foreach ($ref->getMethods(ReflectionMethod::IS_PUBLIC) as $m) {
+    if ($m->isConstructor() || $m->isFinal() || $m->isStatic() || $m->isDestructor()) {
+        continue;
+    }
+    $name = $m->getName();
+    if (in_array($name, ['__sleep', '__wakeup', '__clone', '_resetState'], true)) {
+        continue;
+    }
+    $params = [];
+    foreach ($m->getParameters() as $p) {
+        $defaultValue = null;
+        $hasDefault = $p->isDefaultValueAvailable() && !$p->isVariadic();
+        if ($hasDefault) {
+            $defaultValue = var_export($p->getDefaultValue(), true);
+        }
+        $params[] = [
+            'name' => $p->getName(),
+            'type_hint' => tstr($p->getType()),
+            'has_default' => $hasDefault,
+            'default_value' => $defaultValue,
+            'is_variadic' => $p->isVariadic(),
+            'is_by_ref' => $p->isPassedByReference(),
+        ];
+    }
+    $rows[] = [
+        'name' => $name,
+        'params' => $params,
+        'return_type' => tstr($m->getReturnType()),
+        'returns_reference' => $m->returnsReference(),
+    ];
+}
+echo json_encode($rows);
+"#;
+
+    let output = Command::new(php_bin)
+        .arg("-d")
+        .arg("display_errors=0")
+        .arg("-d")
+        .arg("display_startup_errors=0")
+        .arg("-r")
+        .arg(script)
+        .arg(magento_root)
+        .arg(fqcn.trim_start_matches('\\'))
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json_raw = String::from_utf8(output.stdout).ok()?;
+    let json_trimmed = json_raw.trim();
+    let json_slice = if json_trimmed.starts_with('[') {
+        json_trimmed
+    } else {
+        let start = json_trimmed.find('[')?;
+        let end = json_trimmed.rfind(']')?;
+        if end < start {
+            return None;
+        }
+        &json_trimmed[start..=end]
+    };
+    let rows: Vec<ReflectionMethod> = serde_json::from_str(json_slice).ok()?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for method in rows {
+        let params = method
+            .params
+            .into_iter()
+            .map(|p| MethodParam {
+                name: p.name,
+                type_hint: p.type_hint.map(|t| t.trim_start_matches('\\').to_string()),
+                has_default: p.has_default,
+                default_value: p.default_value.map(|v| normalize_php_default_value(&v)),
+                is_variadic: p.is_variadic,
+                is_by_ref: p.is_by_ref,
+            })
+            .collect();
+        out.push(MethodSignature {
+            name: method.name,
+            params,
+            return_type: method
+                .return_type
+                .map(|t| t.trim_start_matches('\\').to_string()),
+            is_static: false,
+            returns_reference: method.returns_reference,
+        });
+    }
+    Some(out)
+}
+
+fn normalize_php_default_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        return "null".to_string();
+    }
+    if let Some(inner) = trimmed
+        .strip_prefix("array (")
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        if inner.trim().is_empty() {
+            return "[]".to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn constructor_params_need_reflection(params: &[ConstructorParam]) -> bool {
+    params.iter().any(|param| {
+        param
+            .type_hint
+            .as_deref()
+            .map(|th| matches!(th, "self" | "parent" | "static"))
+            .unwrap_or(false)
+            || param
+                .default_value
+                .as_deref()
+                .map(|dv| {
+                    let t = dv.trim();
+                    t.contains("::") || t.eq_ignore_ascii_case("null") || t.starts_with("array (")
+                })
+                .unwrap_or(false)
+    })
+}
+
+fn reflect_constructor_params(
+    fqcn: &str,
+    magento_root: &Path,
+    php_bin: &str,
+) -> Option<Vec<ConstructorParam>> {
+    #[derive(Deserialize)]
+    struct ReflectionParam {
+        name: String,
+        #[serde(default)]
+        type_hint: Option<String>,
+        #[serde(default)]
+        has_default: bool,
+        #[serde(default)]
+        default_value: Option<String>,
+        #[serde(default)]
+        is_variadic: bool,
+    }
+
+    let script = r#"
+$root = $argv[1] ?? '';
+$class = ltrim($argv[2] ?? '', '\\');
+if ($root === '' || $class === '') {
+    echo '[]';
+    exit(0);
+}
+@require $root . '/vendor/autoload.php';
+if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) {
+    echo '[]';
+    exit(0);
+}
+function tstr($t) {
+    if ($t === null) return null;
+    if ($t instanceof ReflectionNamedType) {
+        $name = $t->getName();
+        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') {
+            return '?' . $name;
+        }
+        return $name;
+    }
+    if ($t instanceof ReflectionUnionType) {
+        $parts = [];
+        foreach ($t->getTypes() as $part) {
+            $parts[] = $part->getName();
+        }
+        return implode('|', $parts);
+    }
+    if ($t instanceof ReflectionIntersectionType) {
+        $parts = [];
+        foreach ($t->getTypes() as $part) {
+            $parts[] = $part->getName();
+        }
+        return implode('&', $parts);
+    }
+    return null;
+}
+$ref = new ReflectionClass($class);
+$ctor = $ref->getConstructor();
+if ($ctor === null) {
+    echo 'null';
+    exit(0);
+}
+$params = [];
+foreach ($ctor->getParameters() as $p) {
+    $defaultValue = null;
+    $hasDefault = $p->isDefaultValueAvailable() && !$p->isVariadic();
+    if ($hasDefault) {
+        $defaultValue = var_export($p->getDefaultValue(), true);
+    }
+    $params[] = [
+        'name' => $p->getName(),
+        'type_hint' => tstr($p->getType()),
+        'has_default' => $hasDefault,
+        'default_value' => $defaultValue,
+        'is_variadic' => $p->isVariadic(),
+    ];
+}
+echo json_encode($params);
+"#;
+
+    let output = Command::new(php_bin)
+        .arg("-d")
+        .arg("display_errors=0")
+        .arg("-d")
+        .arg("display_startup_errors=0")
+        .arg("-r")
+        .arg(script)
+        .arg(magento_root)
+        .arg(fqcn.trim_start_matches('\\'))
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json_raw = String::from_utf8(output.stdout).ok()?;
+    let json_trimmed = json_raw.trim();
+    let json_slice = if json_trimmed.starts_with('[') {
+        json_trimmed
+    } else {
+        let start = json_trimmed.find('[')?;
+        let end = json_trimmed.rfind(']')?;
+        if end < start {
+            return None;
+        }
+        &json_trimmed[start..=end]
+    };
+
+    let rows: Option<Vec<ReflectionParam>> = serde_json::from_str(json_slice).ok()?;
+    let rows = rows?;
+    Some(
+        rows.into_iter()
+            .map(|p| ConstructorParam {
+                name: p.name,
+                type_hint: p.type_hint.map(|t| t.trim_start_matches('\\').to_string()),
+                is_optional: p.has_default,
+                default_value: p.default_value.map(|v| normalize_php_default_value(&v)),
+                is_primitive: false,
+                is_variadic: p.is_variadic,
+                is_promoted: false,
+            })
+            .collect(),
+    )
 }
 
 fn synthetic_search_results_class_info(spec: &SearchResultsSpec) -> ClassInfo {
@@ -1363,10 +2141,15 @@ fn collect_extension_specs(
         specs_by_interface
             .entry(ext_interface.clone())
             .and_modify(|spec| {
-                spec.source_interface_fqcn = source_interface.clone();
-                spec.extension_class_fqcn = ext_class.clone();
-                if let Some(attrs) = xml_attrs.get(&source_interface) {
-                    spec.attributes = attrs.clone();
+                // Keep the first resolved owner by default (XML path is already
+                // deterministic and should remain authoritative). Only replace
+                // when we can enrich an empty-attributes spec from XML.
+                if spec.attributes.is_empty() {
+                    if let Some(attrs) = xml_attrs.get(&source_interface) {
+                        spec.source_interface_fqcn = source_interface.clone();
+                        spec.extension_class_fqcn = ext_class.clone();
+                        spec.attributes = attrs.clone();
+                    }
                 }
             })
             .or_insert_with(|| ExtensionSpec {
