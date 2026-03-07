@@ -222,4 +222,29 @@ mod tests {
             "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool"
         );
     }
+
+    #[test]
+    fn test_virtual_type_override_with_non_empty_type_replaces_previous_base_type() {
+        let mut c1 = DiConfig::default();
+        c1.virtual_types.insert(
+            "FooVirtual".into(),
+            VirtualType {
+                name: "FooVirtual".into(),
+                type_name: "BaseA".into(),
+            },
+        );
+
+        let mut c2 = DiConfig::default();
+        c2.virtual_types.insert(
+            "FooVirtual".into(),
+            VirtualType {
+                name: "FooVirtual".into(),
+                type_name: "BaseB".into(),
+            },
+        );
+
+        let merged = merge_configs(vec![c1, c2]);
+        let vt = merged.virtual_types.get("FooVirtual").unwrap();
+        assert_eq!(vt.type_name, "BaseB");
+    }
 }

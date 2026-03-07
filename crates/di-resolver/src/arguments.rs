@@ -565,6 +565,114 @@ mod tests {
         }
     }
 
+    fn make_class_with_constructor(fqcn: &str, params: Vec<ConstructorParam>) -> ClassInfo {
+        let parts: Vec<&str> = fqcn.rsplitn(2, '\\').collect();
+        let (name, ns) = if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (fqcn.to_string(), String::new())
+        };
+        ClassInfo {
+            path: PathBuf::from("dummy.php"),
+            namespace: ns,
+            name,
+            fqcn: fqcn.to_string(),
+            kind: ClassKind::Class,
+            extends: None,
+            implements: vec![],
+            constructor: Some(Constructor { params }),
+            is_abstract: false,
+            is_final: false,
+            public_methods: vec![],
+        }
+    }
+
+    fn preprocessor_pool_fixture() -> (HashMap<String, ClassInfo>, DiConfig) {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool".to_string(),
+            make_class_with_constructor(
+                "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool",
+                vec![
+                    ConstructorParam {
+                        name: "objectManager".to_string(),
+                        type_hint: Some("Magento\\Framework\\ObjectManagerInterface".to_string()),
+                        is_optional: false,
+                        default_value: None,
+                        is_primitive: false,
+                        is_variadic: false,
+                        is_promoted: false,
+                    },
+                    ConstructorParam {
+                        name: "sorter".to_string(),
+                        type_hint: Some(
+                            "Magento\\Framework\\View\\Asset\\PreProcessor\\Helper\\SortInterface"
+                                .to_string(),
+                        ),
+                        is_optional: false,
+                        default_value: None,
+                        is_primitive: false,
+                        is_variadic: false,
+                        is_promoted: false,
+                    },
+                    ConstructorParam {
+                        name: "defaultPreprocessor".to_string(),
+                        type_hint: None,
+                        is_optional: false,
+                        default_value: None,
+                        is_primitive: false,
+                        is_variadic: false,
+                        is_promoted: false,
+                    },
+                    ConstructorParam {
+                        name: "preprocessors".to_string(),
+                        type_hint: Some("array".to_string()),
+                        is_optional: true,
+                        default_value: Some("[]".to_string()),
+                        is_primitive: true,
+                        is_variadic: false,
+                        is_promoted: false,
+                    },
+                ],
+            ),
+        );
+
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "AssetPreProcessorPool".to_string(),
+            di_xml_reader::VirtualType {
+                name: "AssetPreProcessorPool".to_string(),
+                type_name: "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool".to_string(),
+            },
+        );
+        di_config.type_configs.insert(
+            "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::String {
+                    name: "defaultPreprocessor".to_string(),
+                    value: "Magento\\Framework\\View\\Asset\\PreProcessor\\Passthrough"
+                        .to_string(),
+                }],
+            },
+        );
+        di_config.type_configs.insert(
+            "AssetPreProcessorPool".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "preprocessors".to_string(),
+                    items: vec![Argument::String {
+                        name: "less".to_string(),
+                        value: "custom".to_string(),
+                    }],
+                }],
+            },
+        );
+
+        (class_map, di_config)
+    }
+
     #[test]
     fn test_resolves_object_param_as_shared_instance() {
         let mut class_map = HashMap::new();
@@ -666,5 +774,88 @@ mod tests {
         let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
         let args = &map["App\\Service"];
         assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
+    }
+
+    #[test]
+    fn test_named_virtual_type_inherits_base_constructor_and_virtual_overrides() {
+        let (class_map, di_config) = preprocessor_pool_fixture();
+        let map = resolve_all_arguments_for_named_types(
+            &["AssetPreProcessorPool".to_string()],
+            &class_map,
+            &di_config,
+            &HashMap::new(),
+        );
+        let args = &map["AssetPreProcessorPool"];
+
+        let by_name: HashMap<_, _> = args.iter().map(|a| (a.name.as_str(), &a.resolved)).collect();
+
+        assert!(matches!(
+            by_name.get("objectManager").copied(),
+            Some(ResolvedArgValue::SharedInstance(v))
+            if v == "Magento\\Framework\\ObjectManagerInterface"
+        ));
+        assert!(matches!(
+            by_name.get("sorter").copied(),
+            Some(ResolvedArgValue::SharedInstance(v))
+            if v == "Magento\\Framework\\View\\Asset\\PreProcessor\\Helper\\SortInterface"
+        ));
+        assert!(matches!(
+            by_name.get("defaultPreprocessor").copied(),
+            Some(ResolvedArgValue::Scalar(ResolvedScalar::String(v)))
+            if v == "Magento\\Framework\\View\\Asset\\PreProcessor\\Passthrough"
+        ));
+        assert!(matches!(
+            by_name.get("preprocessors").copied(),
+            Some(ResolvedArgValue::PlainArray(items))
+            if items.len() == 1
+                && items[0].name == "less"
+                && matches!(&items[0].value, ResolvedArrayValue::Scalar(ResolvedScalar::String(v)) if v == "custom")
+        ));
+    }
+
+    #[test]
+    fn test_named_virtual_type_resolution_normalizes_leading_backslash() {
+        let (class_map, di_config) = preprocessor_pool_fixture();
+        let map = resolve_all_arguments_for_named_types(
+            &["\\AssetPreProcessorPool".to_string()],
+            &class_map,
+            &di_config,
+            &HashMap::new(),
+        );
+        let args = map.get("\\AssetPreProcessorPool").expect("resolved args");
+        assert!(args.iter().any(|a| a.name == "objectManager"));
+        assert!(args.iter().any(|a| a.name == "sorter"));
+    }
+
+    #[test]
+    fn test_init_parameter_without_constructor_default_sets_global_arg_ref_without_default() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("mode", None)]),
+        );
+
+        let mut di_config = DiConfig::default();
+        di_config.type_configs.insert(
+            "App\\Service".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Init {
+                    name: "mode".to_string(),
+                    value: "App\\State::MODE".to_string(),
+                }],
+            },
+        );
+
+        let mut const_map = HashMap::new();
+        const_map.insert("App\\State::MODE".to_string(), "MAGE_MODE".to_string());
+
+        let map = resolve_all_arguments(&class_map, &di_config, &const_map);
+        let args = &map["App\\Service"];
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::GlobalArgRef { arg_name, default }
+            if arg_name == "MAGE_MODE" && default.is_none()
+        ));
     }
 }

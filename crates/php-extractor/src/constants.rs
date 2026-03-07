@@ -147,7 +147,21 @@ impl<'a> ConstScanner<'a> {
                         other => { out.push(b'\\'); out.push(other); self.advance(1); }
                     }
                 }
-                b'$' | b'{' => return None, // interpolation — skip
+                b'$' | b'{' => {
+                    // Interpolated string constants are unsupported; fast-forward
+                    // to the closing quote so scanning can continue.
+                    while !self.is_eof() {
+                        match self.peek() {
+                            b'\\' => self.advance(2),
+                            b'"' => {
+                                self.advance(1);
+                                break;
+                            }
+                            _ => self.advance(1),
+                        }
+                    }
+                    return None;
+                }
                 b'"' => { self.advance(1); break; }
                 b => { out.push(b); self.advance(1); }
             }
@@ -182,7 +196,7 @@ impl<'a> ConstScanner<'a> {
         }
     }
 
-    fn try_read_const(&mut self, _start: usize, result: &mut HashMap<String, String>) {
+fn try_read_const(&mut self, _start: usize, result: &mut HashMap<String, String>) {
         // Skip whitespace after `const`
         self.skip_ws();
         // Read constant name
@@ -214,5 +228,85 @@ impl<'a> ConstScanner<'a> {
         if let Some(v) = value {
             result.insert(const_name, v);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(src: &str) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        let mut scanner = ConstScanner::new(src.as_bytes());
+        scanner.scan(&mut out);
+        out
+    }
+
+    #[test]
+    fn extracts_single_and_double_quoted_constants() {
+        let src = r#"
+            <?php
+            class C {
+                const FOO = 'bar';
+                const BAZ = "qux";
+            }
+        "#;
+        let out = scan(src);
+        assert_eq!(out.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(out.get("BAZ").map(String::as_str), Some("qux"));
+    }
+
+    #[test]
+    fn ignores_non_string_constants_and_comments() {
+        let src = r#"
+            <?php
+            // const COMMENTED = 'x';
+            /* const BLOCK = "y"; */
+            class C {
+                const NUM = 42;
+                const BOOL = true;
+                const ARR = [];
+                const OK = 'good';
+            }
+        "#;
+        let out = scan(src);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("OK").map(String::as_str), Some("good"));
+    }
+
+    #[test]
+    fn handles_escaped_quotes() {
+        let src = r#"
+            <?php
+            class C {
+                const A = 'it\'s';
+                const B = "a\"b";
+            }
+        "#;
+        let out = scan(src);
+        assert_eq!(out.get("A").map(String::as_str), Some("it's"));
+        assert_eq!(out.get("B").map(String::as_str), Some("a\"b"));
+    }
+
+    #[test]
+    fn skips_interpolated_double_quoted_constants() {
+        let src = r#"
+            <?php
+            class C {
+                const BAD1 = "foo $bar";
+                const BAD2 = "{$bar}";
+                const GOOD = "plain";
+            }
+        "#;
+        let out = scan(src);
+        assert_eq!(out.get("GOOD").map(String::as_str), Some("plain"));
+        assert!(!out.contains_key("BAD1"));
+        assert!(!out.contains_key("BAD2"));
+    }
+
+    #[test]
+    fn missing_file_returns_empty_map() {
+        let out = extract_string_constants(Path::new("/tmp/does-not-exist-constants.php"));
+        assert!(out.is_empty());
     }
 }

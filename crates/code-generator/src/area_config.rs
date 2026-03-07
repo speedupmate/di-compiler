@@ -315,4 +315,26 @@ mod tests {
         assert!(out.contains("'_a_' => 'MAGE_MODE'"));
         assert!(out.contains("'_d_' => NULL,"));
     }
+
+    #[test]
+    fn test_nested_global_arg_ref_always_emits_default_key() {
+        let mut args = HashMap::new();
+        args.insert(
+            "App\\Service".to_string(),
+            vec![ResolvedArg {
+                name: "nested".to_string(),
+                resolved: ResolvedArgValue::Array(vec![ResolvedArg {
+                    name: "mode".to_string(),
+                    resolved: ResolvedArgValue::GlobalArgRef {
+                        arg_name: "MAGE_MODE".to_string(),
+                        default: None,
+                    },
+                }]),
+            }],
+        );
+        let out = generate_area_config(&args, &DiConfig::default());
+        assert!(out.contains("'mode' =>"));
+        assert!(out.contains("'_a_' => 'MAGE_MODE'"));
+        assert!(out.contains("'_d_' => NULL,"));
+    }
 }

@@ -453,4 +453,26 @@ mod tests {
         assert!(out.contains("'_a_' => 'MAGE_MODE'"));
         assert!(out.contains("'_d_' => NULL,"));
     }
+
+    #[test]
+    fn test_configured_array_global_arg_ref_emits_default_key() {
+        let mut map = HashMap::new();
+        map.insert(
+            "App\\Service".to_string(),
+            vec![ResolvedArg {
+                name: "nested".to_string(),
+                resolved: ResolvedArgValue::Array(vec![ResolvedArg {
+                    name: "mode".to_string(),
+                    resolved: ResolvedArgValue::GlobalArgRef {
+                        arg_name: "MAGE_MODE".to_string(),
+                        default: None,
+                    },
+                }]),
+            }],
+        );
+        let out = serialize_arguments_php(&map);
+        assert!(out.contains("'mode' =>"));
+        assert!(out.contains("'_a_' => 'MAGE_MODE'"));
+        assert!(out.contains("'_d_' => NULL,"));
+    }
 }
