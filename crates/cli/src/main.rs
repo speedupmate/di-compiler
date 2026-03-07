@@ -1010,7 +1010,7 @@ fn main() {
         generated_class_map.len(),
         reflected_metadata_ctors
     );
-    let interception_preferences = build_interception_preferences(&interceptors);
+    let interception_preferences = build_interception_preferences(&interceptors, &metadata_base_di_config);
     let all_fqcns = build_interception_registry(
         &interception_type_names,
         &interceptors,
@@ -1507,14 +1507,35 @@ fn build_interception_type_names(
 
 fn build_interception_preferences(
     interceptors: &[di_resolver::InterceptorSpec],
+    di_config: &DiConfig,
 ) -> HashMap<String, String> {
-    interceptors
+    // Direct class → class\Interceptor for every intercepted class.
+    let mut map: HashMap<String, String> = interceptors
         .iter()
         .map(|spec| {
             let target = spec.fqcn.trim_start_matches('\\').to_string();
             (target.clone(), format!("{target}\\Interceptor"))
         })
-        .collect()
+        .collect();
+
+    let intercepted: HashSet<String> = map.keys().cloned().collect();
+
+    // Virtual types whose concrete is intercepted go in the preferences section
+    // (not instanceTypes) and are filtered from the arguments section.
+    // e.g. AdyenPaymentAchFacade (VT → Adapter) where Adapter is intercepted
+    //   => add AdyenPaymentAchFacade → Adapter\Interceptor to preferences
+    for (vt_name, vt) in &di_config.virtual_types {
+        let vt_name = vt_name.trim_start_matches('\\');
+        if map.contains_key(vt_name) {
+            continue;
+        }
+        let concrete = vt.type_name.trim_start_matches('\\');
+        if intercepted.contains(concrete) {
+            map.insert(vt_name.to_string(), format!("{concrete}\\Interceptor"));
+        }
+    }
+
+    map
 }
 
 fn build_interception_registry(

@@ -4,7 +4,7 @@ title: Area-config and interception metadata coverage for virtual/generated type
 phase: 08-parity-closure
 feature: runtime-map-generator-coverage
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-043]
 touches:
@@ -34,6 +34,28 @@ Implement metadata completeness for the shared universe defined in TKT-043:
 
 - Keep key normalization aligned with Magento compiled metadata key shapes.
 - Prefer deterministic iteration order to avoid unstable changed-file output.
+
+## Implementation (2026-03-07)
+
+Three-part fix in `crates/cli/src/main.rs`:
+
+1. **`build_interception_preferences`**: Extended to include virtual types whose
+   concrete class is intercepted. e.g. a virtual type `VirtualFacade` (VT → `ConcreteClass`)
+   where `ConcreteClass` is intercepted → adds `VirtualFacade => ConcreteClass\Interceptor`
+   to the preferences map. This is the correct PHP behaviour: intercepted-concrete
+   virtual types appear in the `preferences` section, not `instanceTypes`.
+
+2. **Arguments filter**: Changed from a blanket virtual-type exclusion to filtering
+   only via `interception_preferences`. Non-intercepted virtual types now correctly
+   appear in the `arguments` section (matching PHP). Intercepted-concrete virtual
+   types are excluded from arguments via their presence in `interception_preferences`.
+
+3. **`instanceTypes` section**: Kept as bare concrete class name throughout (no
+   Interceptor suffix). PHP puts the Interceptor form only in `preferences`.
+
+**Result**: All 7 area config files have identical line counts to PHP output.
+Remaining diffs are pure key-ordering noise (BTreeMap vs PHP inode order).
+`interception.php` is also byte-for-byte identical on a clean output directory.
 
 ## Risks
 

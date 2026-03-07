@@ -4,7 +4,7 @@ title: Area config code generator
 phase: 04-code-generator
 feature: area-config-codegen
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-015]
 touches:

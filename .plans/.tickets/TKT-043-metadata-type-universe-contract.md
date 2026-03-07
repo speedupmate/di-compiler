@@ -4,7 +4,7 @@ title: Metadata type-universe contract (real + virtual + generated)
 phase: 08-parity-closure
 feature: runtime-map-generator-coverage
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-034]
 touches:

@@ -49,9 +49,11 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                     "type" if !in_arguments => {
                         let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
                         if !name.is_empty() {
-                            current_type = Some(name.clone());
                             current_virtual = None;
-                            config.type_configs.entry(name).or_default();
+                            let entry = config.type_configs.entry(name).or_default();
+                            if let Some(shared_str) = attrs.get("shared") {
+                                entry.shared = Some(shared_str != "false");
+                            }
                             // self-closing <type .../> — no body, clear immediately
                             current_type = None;
                         }
