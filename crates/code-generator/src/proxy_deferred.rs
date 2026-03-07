@@ -109,6 +109,9 @@ pub fn generate_proxy_deferred(
             out.push_str(&rendered);
         }
     }
+    if out.ends_with("\n\n") {
+        out.truncate(out.len() - 1);
+    }
     out.push_str("}\n");
     out
 }

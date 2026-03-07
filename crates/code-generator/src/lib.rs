@@ -12,7 +12,7 @@ pub mod search_results;
 pub mod writer;
 
 pub use app_action_list::{generate_app_action_list_php, serialize_app_action_list_php};
-pub use area_config::{generate_area_config, AREAS};
+pub use area_config::{generate_area_config, generate_area_config_with_extra_preferences, AREAS};
 pub use extension::{
     extension_path, generate_extension, generate_extension_interface, ExtensionAttributeSpec,
     ExtensionSpec,

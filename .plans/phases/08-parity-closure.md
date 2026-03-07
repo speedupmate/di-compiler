@@ -36,7 +36,7 @@ This phase is correctness-only. No performance-only changes are accepted unless 
 
 ## Ticket Pack
 
-TKT-027 through TKT-034
+TKT-027 through TKT-041, TKT-043 through TKT-046
 
 ## Recommended External Tracker Shape
 

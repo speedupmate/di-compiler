@@ -12,11 +12,13 @@
 //!   Array             → `['_vac_' => [...]]`
 //!   Global arg ref    → `['_a_'   => 'name', '_d_' => default]`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use php_extractor::ClassInfo;
 
-use crate::graph::{ResolvedArg, ResolvedArgValue, ResolvedScalar};
+use crate::graph::{
+    ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
+};
 use di_xml_reader::{Argument, DiConfig};
 
 /// Resolve constructor arguments for all classes.
@@ -38,35 +40,64 @@ pub fn resolve_all_arguments(
     result
 }
 
+/// Resolve constructor arguments for an explicit set of type names.
+///
+/// Unlike `resolve_all_arguments`, this supports names that are not present in
+/// `class_map` (for example virtual types and generated artifacts) by falling
+/// back to their resolved instance type when possible.
+pub fn resolve_all_arguments_for_named_types(
+    type_names: &[String],
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> HashMap<String, Vec<ResolvedArg>> {
+    let mut result = HashMap::new();
+    for type_name in type_names {
+        let resolved = resolve_for_type_name(type_name, class_map, di_config);
+        if !resolved.is_empty() {
+            result.insert(type_name.clone(), resolved);
+        }
+    }
+    result
+}
+
 /// Resolve constructor args for a single class.
 pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> Vec<ResolvedArg> {
+    let di_args = merged_di_arguments_for_type_name(fqcn, di_config);
+    let di_arg_map: HashMap<&str, &Argument> =
+        di_args.iter().map(|a| (argument_name(a), *a)).collect();
     let Some(ctor) = &info.constructor else {
         return vec![];
     };
-
-    // Collect di.xml arguments for this type (following preference chain)
-    let instance_type = di_config.get_instance_type(fqcn);
-    let di_args = di_config.get_arguments(&instance_type);
-    let di_arg_map: HashMap<&str, &Argument> =
-        di_args.iter().map(|a| (argument_name(a), *a)).collect();
 
     let mut resolved = Vec::new();
 
     for param in &ctor.params {
         // Check if di.xml overrides this param
         if let Some(di_arg) = di_arg_map.get(param.name.as_str()) {
+            let type_hint = param
+                .type_hint
+                .as_deref()
+                .and_then(first_non_null_class_type_hint_arm);
             resolved.push(ResolvedArg {
                 name: param.name.clone(),
-                resolved: resolve_di_argument(di_arg, di_config),
+                resolved: if type_hint.is_some() {
+                    resolve_configured_instance_argument(di_arg, di_config)
+                } else {
+                    resolve_configured_non_object_argument(di_arg, param.default_value.as_deref(), di_config)
+                },
             });
             continue;
         }
 
-        // Fall back to type-hint based resolution
-        let value = if param.is_variadic || param.type_hint.is_none() || param.is_primitive {
+        // Magento precedence:
+        // 1) non-required param => default value (non-object argument)
+        // 2) required typed param => instance argument
+        // 3) fallback => null
+        let value = if param.is_variadic {
             ResolvedArgValue::Null
-        } else {
-            if let Some(type_hint) = param
+        } else if param.is_optional {
+            resolve_non_object_default(param.default_value.as_deref())
+        } else if let Some(type_hint) = param
                 .type_hint
                 .as_deref()
                 .and_then(first_non_null_class_type_hint_arm)
@@ -77,9 +108,8 @@ pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> 
                 } else {
                     ResolvedArgValue::NonSharedInstance(concrete)
                 }
-            } else {
-                ResolvedArgValue::Null
-            }
+        } else {
+            ResolvedArgValue::Null
         };
 
         resolved.push(ResolvedArg {
@@ -89,6 +119,144 @@ pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> 
     }
 
     resolved
+}
+
+fn resolve_for_type_name(
+    type_name: &str,
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> Vec<ResolvedArg> {
+    let normalized = normalize(type_name);
+    let is_virtual = di_config.virtual_types.contains_key(&normalized);
+    if let Some(info) = class_info_with_inherited_constructor(&normalized, class_map) {
+        if info.constructor.is_none() && is_virtual {
+            let di_args = merged_di_arguments_for_type_name(&normalized, di_config);
+            if !di_args.is_empty() {
+                return di_args
+                    .iter()
+                    .map(|arg| ResolvedArg {
+                        name: argument_name(arg).to_string(),
+                        resolved: resolve_di_argument(arg, di_config),
+                    })
+                    .collect();
+            }
+        }
+        return resolve_for_class(&normalized, &info, di_config);
+    }
+
+    let instance_type = normalize(&di_config.get_instance_type(&normalized));
+    if instance_type != normalized {
+        if let Some(mut info) = class_info_with_inherited_constructor(&instance_type, class_map) {
+            // Keep constructor shape from resolved concrete type, but resolve
+            // DI overrides against the requested logical type name.
+            info.fqcn = normalized.clone();
+            if info.constructor.is_none() && is_virtual {
+                let di_args = merged_di_arguments_for_type_name(&normalized, di_config);
+                if !di_args.is_empty() {
+                    return di_args
+                        .iter()
+                        .map(|arg| ResolvedArg {
+                            name: argument_name(arg).to_string(),
+                            resolved: resolve_di_argument(arg, di_config),
+                        })
+                        .collect();
+                }
+            }
+            return resolve_for_class(&normalized, &info, di_config);
+        }
+    }
+
+    if !is_virtual {
+        return Vec::new();
+    }
+
+    let di_args = merged_di_arguments_for_type_name(&normalized, di_config);
+    if di_args.is_empty() {
+        return Vec::new();
+    }
+    di_args
+        .iter()
+        .map(|arg| ResolvedArg {
+            name: argument_name(arg).to_string(),
+            resolved: resolve_di_argument(arg, di_config),
+        })
+        .collect()
+}
+
+fn class_info_with_inherited_constructor(
+    fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> Option<ClassInfo> {
+    let mut info = class_map.get(fqcn)?.clone();
+    if info.constructor.is_some() {
+        return Some(info);
+    }
+    let mut seen = HashSet::new();
+    let mut cursor = info.extends.clone();
+    while let Some(parent) = cursor {
+        if !seen.insert(parent.clone()) {
+            break;
+        }
+        let Some(parent_info) = class_map.get(&parent) else {
+            break;
+        };
+        if parent_info.constructor.is_some() {
+            info.constructor = parent_info.constructor.clone();
+            break;
+        }
+        cursor = parent_info.extends.clone();
+    }
+    Some(info)
+}
+
+fn merged_di_arguments_for_type_name<'a>(
+    type_name: &str,
+    di_config: &'a DiConfig,
+) -> Vec<&'a Argument> {
+    let chain = virtual_type_chain(type_name, di_config);
+
+    // Merge from concrete/base → most specific logical type.
+    let mut merged: Vec<&Argument> = Vec::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    for current in chain.iter().rev() {
+        let args = di_config.get_arguments(current);
+        for arg in args {
+            let name = argument_name(arg).to_string();
+            if let Some(idx) = by_name.get(&name).copied() {
+                merged[idx] = arg;
+            } else {
+                by_name.insert(name, merged.len());
+                merged.push(arg);
+            }
+        }
+    }
+
+    merged
+}
+
+fn virtual_type_chain(type_name: &str, di_config: &DiConfig) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = normalize(type_name);
+    loop {
+        if !seen.insert(current.clone()) {
+            break;
+        }
+        chain.push(current.clone());
+        let Some(vt) = di_config.virtual_types.get(&current) else {
+            break;
+        };
+        let next = normalize(&vt.type_name);
+        if next.is_empty() || next == current {
+            break;
+        }
+        current = next;
+    }
+    chain
+}
+
+fn normalize(s: &str) -> String {
+    s.trim().trim_start_matches('\\').to_string()
 }
 
 fn first_non_null_class_type_hint_arm(type_hint: &str) -> Option<String> {
@@ -125,21 +293,148 @@ fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue
         }
         Argument::Null { .. } => ResolvedArgValue::Null,
         Argument::Array { items, .. } => {
-            let resolved_items: Vec<ResolvedArg> = items
-                .iter()
-                .map(|item| ResolvedArg {
-                    name: argument_name(item).to_string(),
-                    resolved: resolve_di_argument(item, di_config),
-                })
-                .collect();
-            ResolvedArgValue::Array(resolved_items)
+            if is_configured_argument_array(items) {
+                let resolved_items: Vec<ResolvedArg> = items
+                    .iter()
+                    .map(|item| ResolvedArg {
+                        name: argument_name(item).to_string(),
+                        resolved: resolve_di_argument(item, di_config),
+                    })
+                    .collect();
+                ResolvedArgValue::Array(resolved_items)
+            } else {
+                let values: Vec<ResolvedArrayItem> = items
+                    .iter()
+                    .map(|item| ResolvedArrayItem {
+                        name: argument_name(item).to_string(),
+                        value: resolve_plain_array_value(item),
+                    })
+                    .collect();
+                ResolvedArgValue::PlainArray(values)
+            }
         }
-        Argument::Init { value, .. } => {
-            ResolvedArgValue::Scalar(ResolvedScalar::String(value.clone()))
-        }
+        Argument::Init { value, .. } => ResolvedArgValue::GlobalArgRef {
+            arg_name: value.clone(),
+            default: None,
+        },
         Argument::Const { value, .. } => {
             ResolvedArgValue::Scalar(ResolvedScalar::String(value.clone()))
         }
+    }
+}
+
+fn resolve_configured_instance_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue {
+    match arg {
+        Argument::Object { value, shared, .. } => {
+            let concrete = di_config.get_preference(value);
+            let is_shared = shared.unwrap_or_else(|| di_config.is_shared(&concrete));
+            if is_shared {
+                ResolvedArgValue::SharedInstance(concrete)
+            } else {
+                ResolvedArgValue::NonSharedInstance(concrete)
+            }
+        }
+        _ => resolve_di_argument(arg, di_config),
+    }
+}
+
+fn resolve_configured_non_object_argument(
+    arg: &Argument,
+    constructor_default: Option<&str>,
+    di_config: &DiConfig,
+) -> ResolvedArgValue {
+    match arg {
+        Argument::Init { value, .. } => ResolvedArgValue::GlobalArgRef {
+            arg_name: value.clone(),
+            default: constructor_default.map(|d| d.to_string()),
+        },
+        _ => resolve_di_argument(arg, di_config),
+    }
+}
+
+fn resolve_non_object_default(default_value: Option<&str>) -> ResolvedArgValue {
+    let Some(raw) = default_value else {
+        return ResolvedArgValue::Null;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        return ResolvedArgValue::Null;
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return ResolvedArgValue::Scalar(ResolvedScalar::Bool(true));
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return ResolvedArgValue::Scalar(ResolvedScalar::Bool(false));
+    }
+    if trimmed == "[]" {
+        return ResolvedArgValue::PlainArray(Vec::new());
+    }
+    if let Some(s) = parse_quoted_php_string(trimmed) {
+        return ResolvedArgValue::Scalar(ResolvedScalar::String(s));
+    }
+    if is_numeric_literal(trimmed) {
+        return ResolvedArgValue::Scalar(ResolvedScalar::Number(trimmed.to_string()));
+    }
+    ResolvedArgValue::Scalar(ResolvedScalar::String(trimmed.to_string()))
+}
+
+fn parse_quoted_php_string(input: &str) -> Option<String> {
+    if input.len() < 2 {
+        return None;
+    }
+    if let Some(inner) = input.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        let value = inner.replace("\\\\", "\\").replace("\\'", "'");
+        return Some(value);
+    }
+    if let Some(inner) = input.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        let value = inner.replace("\\\\", "\\").replace("\\\"", "\"");
+        return Some(value);
+    }
+    None
+}
+
+fn is_numeric_literal(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('-').or_else(|| s.strip_prefix('+')) {
+        if rest.is_empty() {
+            return false;
+        }
+        return rest.parse::<f64>().is_ok();
+    }
+    s.parse::<f64>().is_ok()
+}
+
+fn is_configured_argument_array(items: &[Argument]) -> bool {
+    items.iter().any(|item| match item {
+        Argument::Object { .. } | Argument::Init { .. } => true,
+        Argument::Array { items, .. } => is_configured_argument_array(items),
+        _ => false,
+    })
+}
+
+fn resolve_plain_array_value(arg: &Argument) -> ResolvedArrayValue {
+    match arg {
+        Argument::String { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
+        Argument::Boolean { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::Bool(*value)),
+        Argument::Number { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::Number(value.clone())),
+        Argument::Null { .. } => ResolvedArrayValue::Null,
+        Argument::Const { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
+        Argument::Array { items, .. } => ResolvedArrayValue::Array(
+            items
+                .iter()
+                .map(|item| ResolvedArrayItem {
+                    name: argument_name(item).to_string(),
+                    value: resolve_plain_array_value(item),
+                })
+                .collect(),
+        ),
+        // Fallbacks: treat configured-only forms as scalar strings when they
+        // unexpectedly appear in a non-configured array branch.
+        Argument::Object { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
+        Argument::Init { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
     }
 }
 

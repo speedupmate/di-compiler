@@ -21,7 +21,9 @@
 
 use std::collections::HashMap;
 
-use di_resolver::{ResolvedArg, ResolvedArgValue, ResolvedScalar};
+use di_resolver::{
+    ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
+};
 
 /// Serialize a `<?php return array (...);` arguments map.
 ///
@@ -92,6 +94,11 @@ fn serialize_resolved_arg(out: &mut String, name: &str, value: &ResolvedArgValue
             }
             out.push_str(&format!("{}  ),\n", pad));
         }
+        ResolvedArgValue::PlainArray(items) => {
+            out.push_str(&format!("{}  '_v_' => \n{}  array (\n", pad, pad));
+            serialize_plain_array_items(out, items, indent + 4);
+            out.push_str(&format!("{}  ),\n", pad));
+        }
         ResolvedArgValue::GlobalArgRef { arg_name, default } => {
             out.push_str(&format!("{}  '_a_' => '{}',\n", pad, escape_php(arg_name)));
             if let Some(default) = default {
@@ -104,6 +111,29 @@ fn serialize_resolved_arg(out: &mut String, name: &str, value: &ResolvedArgValue
         }
     }
     out.push_str(&format!("{}),\n", pad));
+}
+
+fn serialize_plain_array_items(out: &mut String, items: &[ResolvedArrayItem], indent: usize) {
+    let pad = " ".repeat(indent);
+    for item in items {
+        out.push_str(&format!("{}'{}' => ", pad, escape_php(&item.name)));
+        serialize_plain_array_value(out, &item.value, indent);
+        out.push_str(",\n");
+    }
+}
+
+fn serialize_plain_array_value(out: &mut String, value: &ResolvedArrayValue, indent: usize) {
+    let pad = " ".repeat(indent);
+    match value {
+        ResolvedArrayValue::Scalar(s) => out.push_str(&render_scalar(s)),
+        ResolvedArrayValue::Null => out.push_str("NULL"),
+        ResolvedArrayValue::Array(items) => {
+            out.push_str("\n");
+            out.push_str(&format!("{}array (\n", pad));
+            serialize_plain_array_items(out, items, indent + 2);
+            out.push_str(&format!("{})", pad));
+        }
+    }
 }
 
 /// Escape a PHP string value (backslash and single-quote).

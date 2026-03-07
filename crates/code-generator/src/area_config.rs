@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use di_resolver::{ResolvedArg, ResolvedArgValue};
+use di_resolver::{ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue};
 use di_xml_reader::DiConfig;
 
 use crate::metadata::{escape_php, render_scalar, render_untyped_default};
@@ -19,6 +19,16 @@ use crate::metadata::{escape_php, render_scalar, render_untyped_default};
 pub fn generate_area_config(
     args_map: &HashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
+) -> String {
+    generate_area_config_with_extra_preferences(args_map, di_config, &HashMap::new())
+}
+
+/// Generate area config while injecting additional preferences that should
+/// appear in metadata output (for example interception preferences).
+pub fn generate_area_config_with_extra_preferences(
+    args_map: &HashMap<String, Vec<ResolvedArg>>,
+    di_config: &DiConfig,
+    extra_preferences: &HashMap<String, String>,
 ) -> String {
     let mut out = String::from("<?php return array (\n");
 
@@ -41,7 +51,11 @@ pub fn generate_area_config(
 
     // Section: preferences
     out.push_str("  'preferences' => \n  array (\n");
-    let mut sorted_prefs: Vec<(&String, &String)> = di_config.preferences.iter().collect();
+    let mut merged_preferences = di_config.preferences.clone();
+    for (from, to) in extra_preferences {
+        merged_preferences.insert(from.clone(), to.clone());
+    }
+    let mut sorted_prefs: Vec<(&String, &String)> = merged_preferences.iter().collect();
     sorted_prefs.sort_by_key(|(k, _)| k.as_str());
     for (from, to) in sorted_prefs {
         out.push_str(&format!(
@@ -99,6 +113,11 @@ fn serialize_arg_indent(out: &mut String, name: &str, value: &ResolvedArgValue, 
             }
             out.push_str(&format!("{}  ),\n", pad));
         }
+        PlainArray(items) => {
+            out.push_str(&format!("{}  '_v_' => \n{}  array (\n", pad, pad));
+            serialize_plain_array_items(out, items, indent + 4);
+            out.push_str(&format!("{}  ),\n", pad));
+        }
         GlobalArgRef { arg_name, default } => {
             out.push_str(&format!("{}  '_a_' => '{}',\n", pad, escape_php(arg_name)));
             if let Some(d) = default {
@@ -111,6 +130,29 @@ fn serialize_arg_indent(out: &mut String, name: &str, value: &ResolvedArgValue, 
         }
     }
     out.push_str(&format!("{}),\n", pad));
+}
+
+fn serialize_plain_array_items(out: &mut String, items: &[ResolvedArrayItem], indent: usize) {
+    let pad = " ".repeat(indent);
+    for item in items {
+        out.push_str(&format!("{}'{}' => ", pad, escape_php(&item.name)));
+        serialize_plain_array_value(out, &item.value, indent);
+        out.push_str(",\n");
+    }
+}
+
+fn serialize_plain_array_value(out: &mut String, value: &ResolvedArrayValue, indent: usize) {
+    let pad = " ".repeat(indent);
+    match value {
+        ResolvedArrayValue::Scalar(s) => out.push_str(&render_scalar(s)),
+        ResolvedArrayValue::Null => out.push_str("NULL"),
+        ResolvedArrayValue::Array(items) => {
+            out.push_str("\n");
+            out.push_str(&format!("{}array (\n", pad));
+            serialize_plain_array_items(out, items, indent + 2);
+            out.push_str(&format!("{})", pad));
+        }
+    }
 }
 
 /// Standard area names in Magento DI.

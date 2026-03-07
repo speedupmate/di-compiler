@@ -14,8 +14,9 @@ Close remaining content-level diffs between `generated/code` and `generated/_cod
 ## Current Gap
 
 - Path parity is near closure, but content parity still shows multi-pattern drift:
-  - Interceptor over-generation and constructor signature loss
-  - Proxy default-value and interface/class fallback mismatches
+  - Metadata key-space gaps (arguments/interception/plugin-list) tied to incomplete type-universe coverage
+  - Plugin-list processed-key inflation (`_execute___self` family) and scope leakage
+  - Proxy ordering/surface/class-shape mismatches
   - Extension artifact ordering drift
   - Factory edge cases (`*ExtensionInterfaceFactory`, global namespace factory)
 
@@ -24,21 +25,21 @@ Current archive compare snapshot (2026-03-06):
 - code missing `0`, extra `39`, changed `32`
 - metadata missing `0`, extra `0`, changed `16`
 - Completed slices: TKT-038, TKT-039
-- Open slices: TKT-040, TKT-041
+- Open slices: TKT-040, TKT-041, TKT-043, TKT-044, TKT-045, TKT-046
 
 ## Implementation Steps
 
-1. Fix interceptor content parity slice:
-   - resolve plugin method sets more reliably
-   - avoid fallback behavior that emits full inherited method surfaces
-   - preserve inherited constructor signatures for interceptor generation
-2. Fix proxy content parity slice:
-   - preserve literal default values from signatures
-   - classify proxy targets as interface/class using composer fallback when not in scanned class map
-3. Fix extension/factory content parity slice:
+1. Establish metadata type-universe contract (TKT-043), then apply it to:
+   - area/global argument resolution for virtual/generated keys (TKT-044)
+   - interception registry completeness for virtual/generated keys (TKT-044)
+   - plugin-list key-space/scope parity (TKT-045)
+2. Fix proxy content parity slice (TKT-046):
+   - method ordering and method-surface parity
+   - class-shape (`extends`/`implements`) and return-type fidelity
+3. Fix extension/factory content parity slice (TKT-040):
    - align extension attribute method ordering with baseline behavior
    - handle `*ExtensionInterfaceFactory` target mapping and global-namespace factory output
-4. Re-run archive compare with changed-file reporting and iterate until content-diff trend reaches low residual set.
+4. Run TKT-041 final convergence pass with categorized residuals and documentation.
 
 ## Test Plan
 

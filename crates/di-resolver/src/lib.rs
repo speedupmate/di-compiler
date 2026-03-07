@@ -4,11 +4,13 @@ pub mod graph;
 pub mod interceptor;
 pub mod proxy;
 
-pub use arguments::{resolve_all_arguments, resolve_for_class};
+pub use arguments::{
+    resolve_all_arguments, resolve_all_arguments_for_named_types, resolve_for_class,
+};
 pub use factory::{detect_factories, detect_factories_from_configs};
 pub use graph::{
     FactorySpec, InterceptorSpec, PluginRef, ProxySpec, ResolvedArg, ResolvedArgValue,
-    ResolvedGraph, ResolvedScalar, ResolvedType,
+    ResolvedArrayItem, ResolvedArrayValue, ResolvedGraph, ResolvedScalar, ResolvedType,
 };
 pub use interceptor::detect_interceptors;
 pub use proxy::{

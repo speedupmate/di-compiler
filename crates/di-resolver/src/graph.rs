@@ -61,10 +61,24 @@ pub enum ResolvedArgValue {
     Scalar(ResolvedScalar),
     Null,
     Array(Vec<ResolvedArg>),
+    PlainArray(Vec<ResolvedArrayItem>),
     GlobalArgRef {
         arg_name: String,
         default: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedArrayItem {
+    pub name: String,
+    pub value: ResolvedArrayValue,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResolvedArrayValue {
+    Scalar(ResolvedScalar),
+    Null,
+    Array(Vec<ResolvedArrayItem>),
 }
 
 #[derive(Debug, Clone)]

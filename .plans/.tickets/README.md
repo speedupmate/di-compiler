@@ -44,5 +44,9 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [038](TKT-038-interceptor-content-parity-method-surface-and-ctor-inheritance.md) | Interceptor content parity: method surface and constructor inheritance | 08 | Done | 029, 034 |
 | [039](TKT-039-proxy-content-parity-defaults-and-interface-resolution.md) | Proxy content parity: defaults and interface resolution | 08 | Done | 034 |
 | [040](TKT-040-extension-factory-content-parity-order-and-target-mapping.md) | Extension/factory content parity: ordering and target mapping | 08 | Ready | 031, 034 |
-| [041](TKT-041-final-content-diff-convergence-and-residual-documentation.md) | Final content diff convergence and residual documentation | 08 | In Progress | 038, 039, 040 |
+| [041](TKT-041-final-content-diff-convergence-and-residual-documentation.md) | Final content diff convergence and residual documentation | 08 | In Progress | 040, 044, 045, 046 |
 | [042](TKT-042-persistent-php-worker-reflection-hotpath.md) | Persistent PHP worker for reflection hot paths | 09 | In Progress | 035 |
+| [043](TKT-043-metadata-type-universe-contract.md) | Metadata type-universe contract (real + virtual + generated) | 08 | Ready | 034 |
+| [044](TKT-044-area-config-and-interception-virtual-generated-coverage.md) | Area-config and interception metadata coverage for virtual/generated types | 08 | Ready | 043 |
+| [045](TKT-045-plugin-list-key-space-and-scope-parity.md) | Plugin-list key-space and scope parity | 08 | Ready | 043, 044 |
+| [046](TKT-046-proxy-method-surface-order-and-shape-parity.md) | Proxy method surface, order, and class-shape parity | 08 | Ready | 039, 042 |

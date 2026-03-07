@@ -6,7 +6,7 @@ feature: code-content-parity-closure
 owner: Unassigned
 status: In Progress
 estimate: S
-depends_on: [TKT-038, TKT-039, TKT-040]
+depends_on: [TKT-040, TKT-044, TKT-045, TKT-046]
 touches:
   - rust/di-compiler/crates/cli/src/main.rs
   - rust/di-compiler/README.md
@@ -32,7 +32,8 @@ Complete the final content-parity convergence pass and document residual differe
 - Active residual set from archive compare:
   - code missing `0`, extra `39`, changed `32`
   - metadata missing `0`, extra `0`, changed `16`
-- TKT-038 and TKT-039 are complete; TKT-040 remains open and blocks final convergence.
+- Completed: TKT-038, TKT-039
+- Open blockers: TKT-040, TKT-044, TKT-045, TKT-046
 
 ## Risks
 

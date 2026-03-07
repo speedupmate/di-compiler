@@ -25,15 +25,16 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use code_generator::{
-    extension_path, factory_path, generate_app_action_list_php, generate_area_config,
-    generate_extension, generate_extension_interface, generate_factory, generate_interceptor,
-    generate_plugin_list_php, generate_proxy, generate_proxy_deferred, generate_search_results,
-    interceptor_path, proxy_deferred_path, proxy_path, search_results_path,
-    serialize_interception_php, write_if_changed, ExtensionAttributeSpec, ExtensionSpec, AREAS,
+    extension_path, factory_path, generate_app_action_list_php,
+    generate_area_config_with_extra_preferences, generate_extension, generate_extension_interface,
+    generate_factory, generate_interceptor, generate_plugin_list_php, generate_proxy,
+    generate_proxy_deferred, generate_search_results, interceptor_path, proxy_deferred_path,
+    proxy_path, search_results_path, serialize_interception_php, write_if_changed,
+    ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
     detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs_with_existing,
-    resolve_all_arguments, FactorySpec,
+    resolve_all_arguments, resolve_all_arguments_for_named_types, FactorySpec,
 };
 use di_xml_reader::{
     find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs,
@@ -194,7 +195,7 @@ function reflect_methods(string $class): ?array {
     foreach ($ref->getMethods(ReflectionMethod::IS_PUBLIC) as $m) {
         if ($m->isConstructor() || $m->isFinal() || $m->isStatic() || $m->isDestructor()) continue;
         $name = $m->getName();
-        if (in_array($name, ['__sleep','__wakeup','__clone','_resetState'], true)) continue;
+        if (in_array($name, ['__sleep','__wakeup','__clone'], true)) continue;
         $params = [];
         foreach ($m->getParameters() as $p) {
             $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
@@ -207,6 +208,18 @@ function reflect_methods(string $class): ?array {
             'return_type'=>tstr($m->getReturnType()),'returns_reference'=>$m->returnsReference()];
     }
     return $rows;
+}
+function reflect_kind(string $class): ?string {
+    if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) return null;
+    $ref = new ReflectionClass($class);
+    if ($ref->isInterface()) return 'interface';
+    if ($ref->isTrait()) return 'trait';
+    return 'class';
+}
+function reflect_const(string $expr) {
+    $expr = ltrim($expr, '\\');
+    if ($expr === '' || !defined($expr)) return null;
+    return constant($expr);
 }
 function reflect_ctor(string $class): ?array {
     if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) return null;
@@ -233,6 +246,8 @@ while (($line = fgets($stdin)) !== false) {
     try {
         $result = match($cmd) {
             'methods' => reflect_methods($class),
+            'kind'    => reflect_kind($class),
+            'const'   => reflect_const($class),
             'ctor'    => reflect_ctor($class),
             default   => null,
         };
@@ -699,7 +714,7 @@ fn main() {
     // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
     let intercepted_set: std::collections::HashSet<&str> =
         interceptors.iter().map(|s| s.fqcn.as_str()).collect();
-    let all_fqcns: HashMap<String, bool> = interception_class_map
+    let all_fqcns_phase5: HashMap<String, bool> = interception_class_map
         .keys()
         .map(|fqcn| {
             let intercepted = intercepted_set.contains(fqcn.as_str());
@@ -710,7 +725,13 @@ fn main() {
 
     if args.dry_run {
         log::info!("Dry run — skipping file writes");
-        print_summary(&interceptors, &factories, &proxies, &args_map, &all_fqcns);
+        print_summary(
+            &interceptors,
+            &factories,
+            &proxies,
+            &args_map,
+            &all_fqcns_phase5,
+        );
         log_phase_elapsed("Total", total_started);
         return;
     }
@@ -800,64 +821,69 @@ fn main() {
             })
             .collect()
     };
+    let reflected_proxy_kinds: HashMap<String, ClassKind> = unique_proxy_targets
+        .par_iter()
+        .filter_map(|target_fqcn| {
+            if interception_class_map.contains_key(target_fqcn) {
+                return None;
+            }
+            let kind = reflect_class_kind(target_fqcn, &args.magento_root, &args.fallback_php)?;
+            Some((target_fqcn.clone(), kind))
+        })
+        .collect();
     let reflected_proxy_methods: HashMap<String, Vec<MethodSignature>> = unique_proxy_targets
         .par_iter()
         .filter_map(|target_fqcn| {
-            let target_info =
-                target_info_with_inherited_public_methods(target_fqcn, &interception_class_map)?;
-            if !interceptor_methods_need_reflection_normalization(&target_info.public_methods) {
-                return None;
-            }
             let mut reflected_methods =
                 reflect_interceptable_methods(target_fqcn, &args.magento_root, &args.fallback_php)?;
             for method in reflected_methods.iter_mut() {
-                normalize_reflected_method_signature(method, target_fqcn, &interception_class_map);
+                normalize_reflected_method_signature_for_proxy(
+                    method,
+                    target_fqcn,
+                    &interception_class_map,
+                );
             }
             Some((target_fqcn.clone(), reflected_methods))
         })
         .collect();
     log::info!(
-        "Proxy reflection precompute: {} reflected targets ({} unique targets)",
+        "Proxy reflection precompute: {} reflected targets, {} reflected kinds ({} unique targets)",
         reflected_proxy_methods.len(),
+        reflected_proxy_kinds.len(),
         unique_proxy_targets.len()
     );
     let reflected_proxy_methods = Arc::new(reflected_proxy_methods);
+    let reflected_proxy_kinds = Arc::new(reflected_proxy_kinds);
 
     // Proxies
     proxies.par_iter().for_each(|spec| {
         let mut target_info =
             target_info_with_inherited_public_methods(&spec.target_fqcn, &interception_class_map);
-        if let (Some(info), Some(reflected_methods)) = (
-            target_info.as_mut(),
-            reflected_proxy_methods.get(&spec.target_fqcn),
-        ) {
-            let current_names: HashSet<String> =
-                info.public_methods.iter().map(|m| m.name.clone()).collect();
-            let reflected_names: HashSet<String> =
-                reflected_methods.iter().map(|m| m.name.clone()).collect();
-
-            if current_names == reflected_names
-                && info.public_methods.len() == reflected_methods.len()
-            {
-                // Safe full replacement when method surface matches.
-                info.public_methods = reflected_methods.clone();
-            } else {
-                // Conservative fallback: preserve current surface/order and only
-                // normalize overlapping signatures.
-                let reflected_by_name: HashMap<String, MethodSignature> = reflected_methods
-                    .iter()
-                    .map(|m| (m.name.clone(), m.clone()))
-                    .collect();
-                info.public_methods = info
-                    .public_methods
-                    .iter()
-                    .map(|m| {
-                        reflected_by_name
-                            .get(&m.name)
-                            .cloned()
-                            .unwrap_or_else(|| m.clone())
-                    })
-                    .collect();
+        if target_info.is_none() {
+            if let Some(kind) = reflected_proxy_kinds.get(&spec.target_fqcn) {
+                target_info = Some(synthetic_proxy_target_info(&spec.target_fqcn, kind.clone()));
+            }
+        }
+        if let Some(info) = target_info.as_mut() {
+            if let Some(reflected_methods) = reflected_proxy_methods.get(&spec.target_fqcn) {
+                // Reflection order/surface is Magento's source of truth for
+                // proxy methods (declaration order including inherited publics).
+                let mut methods = reflected_methods.clone();
+                if let Some(pos) = info.public_methods.iter().position(|m| m.name == "_resetState") {
+                    if !methods.iter().any(|m| m.name == "_resetState") {
+                        methods.insert(
+                            pos.min(methods.len()),
+                            MethodSignature {
+                                name: "_resetState".to_string(),
+                                params: vec![],
+                                return_type: Some("void".to_string()),
+                                is_static: false,
+                                returns_reference: false,
+                            },
+                        );
+                    }
+                }
+                info.public_methods = methods;
             }
         }
         let content = generate_proxy(spec, target_info.as_ref());
@@ -940,6 +966,57 @@ fn main() {
     let phase_7_started = Instant::now();
     log::info!("Generating metadata files");
 
+    // Metadata type universe: include real classes, generated classes, and
+    // DI-declared logical types (virtual types/preferences/plugins/type configs).
+    let resolved_const_values =
+        resolve_php_constants_in_config(&full_di_config, &args.magento_root, &args.fallback_php);
+    let mut metadata_base_di_config = di_config.clone();
+    apply_resolved_constants_to_di_config(&mut metadata_base_di_config, &resolved_const_values);
+
+    let generated_class_map = extract_generated_class_map(&code_root);
+    let mut metadata_class_map = merged_class_map(&interception_class_map, &generated_class_map);
+    let argument_type_names = build_argument_type_names(
+        &interception_class_map,
+        &generated_class_map,
+        &metadata_base_di_config,
+        &interceptors,
+        &factories,
+        &proxies,
+        &search_results,
+        &proxy_deferred,
+        &extension_specs,
+    );
+    let interception_type_names = build_interception_type_names(
+        &interception_class_map,
+        &generated_class_map,
+        &metadata_base_di_config,
+        &interceptors,
+        &factories,
+        &proxies,
+        &search_results,
+        &proxy_deferred,
+        &extension_specs,
+    );
+    let reflected_metadata_ctors = enrich_constructor_defaults_with_reflection(
+        &mut metadata_class_map,
+        &args.magento_root,
+        &args.fallback_php,
+    );
+    log::info!(
+        "Metadata universe: args {} / interception {} type names (base {}, generated {}, ctor reflections {})",
+        argument_type_names.len(),
+        interception_type_names.len(),
+        interception_class_map.len(),
+        generated_class_map.len(),
+        reflected_metadata_ctors
+    );
+    let interception_preferences = build_interception_preferences(&interceptors);
+    let all_fqcns = build_interception_registry(
+        &interception_type_names,
+        &interceptors,
+        &interception_di_config,
+    );
+
     // interception.php
     let interception_content = serialize_interception_php(&all_fqcns);
     let interception_path = metadata_root.join("interception.php");
@@ -960,22 +1037,42 @@ fn main() {
                     .filter(|p| !di_xml_files_set.contains(p))
                     .collect();
                 if area_only.is_empty() {
-                    di_config.clone()
+                    metadata_base_di_config.clone()
                 } else {
                     let extra_configs: Vec<_> = area_only
                         .iter()
                         .filter_map(|p| parse_di_xml(p).ok())
                         .collect();
-                    let mut merged_area = di_config.clone();
+                    let mut merged_area = metadata_base_di_config.clone();
                     merge_into(&mut merged_area, merge_configs(extra_configs));
+                    apply_resolved_constants_to_di_config(&mut merged_area, &resolved_const_values);
                     merged_area
                 }
             } else {
-                di_config.clone()
+                metadata_base_di_config.clone()
             };
 
-            let area_args = resolve_all_arguments(&class_map, &area_di_config);
-            let area_content = generate_area_config(&area_args, &area_di_config);
+            let mut area_di_config_for_args = area_di_config.clone();
+            for (from, to) in &interception_preferences {
+                area_di_config_for_args
+                    .preferences
+                    .insert(from.clone(), to.clone());
+            }
+
+            let area_args = resolve_all_arguments_for_named_types(
+                &argument_type_names,
+                &metadata_class_map,
+                &area_di_config_for_args,
+            );
+            let area_args: HashMap<String, Vec<di_resolver::ResolvedArg>> = area_args
+                .into_iter()
+                .filter(|(fqcn, _)| !interception_preferences.contains_key(fqcn))
+                .collect();
+            let area_content = generate_area_config_with_extra_preferences(
+                &area_args,
+                &area_di_config,
+                &interception_preferences,
+            );
             let area_path = metadata_root.join(format!("{}.php", area));
             let _ = write_if_changed(&area_path, &area_content);
             pb_area.inc(1);
@@ -985,8 +1082,7 @@ fn main() {
     pb_area.finish_with_message("done");
 
     // Scope-specific plugin-list metadata files.
-    let plugin_list_class_definitions: Vec<String> =
-        interceptors.iter().map(|spec| spec.fqcn.clone()).collect();
+    let plugin_list_class_definitions: Vec<String> = Vec::new();
     let plugin_scopes = [
         "global",
         "adminhtml",
@@ -1002,8 +1098,12 @@ fn main() {
     );
     for scope in plugin_scopes {
         if let Some(scope_di_config) = area_di_configs.get(scope) {
+            let mut plugin_di_config = scope_di_config.clone();
+            if scope != "global" {
+                plugin_di_config.virtual_types.clear();
+            }
             let content = generate_plugin_list_php(
-                scope_di_config,
+                &plugin_di_config,
                 &class_map,
                 &plugin_list_class_definitions,
             );
@@ -1124,6 +1224,317 @@ fn log_phase_elapsed(phase: &str, started: Instant) {
         elapsed.as_secs_f64(),
         elapsed.as_millis()
     );
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedConstValue {
+    String(String),
+    Number(String),
+    Bool(bool),
+    Null,
+}
+
+fn resolve_php_constants_in_config(
+    di_config: &DiConfig,
+    magento_root: &Path,
+    php_bin: &str,
+) -> HashMap<String, ResolvedConstValue> {
+    let mut const_exprs = HashSet::new();
+    for type_config in di_config.type_configs.values() {
+        collect_const_expressions(&type_config.arguments, &mut const_exprs);
+    }
+    if const_exprs.is_empty() {
+        return HashMap::new();
+    }
+
+    let const_vec: Vec<String> = const_exprs.into_iter().collect();
+    const_vec
+        .par_iter()
+        .filter_map(|expr| {
+            let value = reflect_constant_value(expr, magento_root, php_bin)?;
+            Some((expr.clone(), value))
+        })
+        .collect()
+}
+
+fn collect_const_expressions(arguments: &[Argument], out: &mut HashSet<String>) {
+    for arg in arguments {
+        match arg {
+            Argument::Const { value, .. } => {
+                let normalized = value.trim().trim_start_matches('\\');
+                if !normalized.is_empty() {
+                    out.insert(normalized.to_string());
+                }
+            }
+            Argument::Array { items, .. } => collect_const_expressions(items, out),
+            _ => {}
+        }
+    }
+}
+
+fn reflect_constant_value(
+    expr: &str,
+    _magento_root: &Path,
+    _php_bin: &str,
+) -> Option<ResolvedConstValue> {
+    let pool = PHP_WORKER_POOL.get()?;
+    let request = format!("const:{}", expr.trim().trim_start_matches('\\'));
+    let json_raw = pool.request(&request)?;
+    let json_trimmed = json_raw.trim();
+    if json_trimmed == "null" || json_trimmed.is_empty() {
+        return Some(ResolvedConstValue::Null);
+    }
+    let value: serde_json::Value = serde_json::from_str(json_trimmed).ok()?;
+    match value {
+        serde_json::Value::String(s) => Some(ResolvedConstValue::String(s)),
+        serde_json::Value::Number(n) => Some(ResolvedConstValue::Number(n.to_string())),
+        serde_json::Value::Bool(b) => Some(ResolvedConstValue::Bool(b)),
+        serde_json::Value::Null => Some(ResolvedConstValue::Null),
+        _ => None,
+    }
+}
+
+fn apply_resolved_constants_to_di_config(
+    di_config: &mut DiConfig,
+    values: &HashMap<String, ResolvedConstValue>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    for type_config in di_config.type_configs.values_mut() {
+        apply_resolved_constants_to_arguments(&mut type_config.arguments, values);
+    }
+}
+
+fn apply_resolved_constants_to_arguments(
+    arguments: &mut [Argument],
+    values: &HashMap<String, ResolvedConstValue>,
+) {
+    for arg in arguments.iter_mut() {
+        match arg {
+            Argument::Const { name, value } => {
+                let key = value.trim().trim_start_matches('\\').to_string();
+                if let Some(resolved) = values.get(&key) {
+                    *arg = match resolved {
+                        ResolvedConstValue::String(v) => Argument::String {
+                            name: name.clone(),
+                            value: v.clone(),
+                        },
+                        ResolvedConstValue::Number(v) => Argument::Number {
+                            name: name.clone(),
+                            value: v.clone(),
+                        },
+                        ResolvedConstValue::Bool(v) => Argument::Boolean {
+                            name: name.clone(),
+                            value: *v,
+                        },
+                        ResolvedConstValue::Null => Argument::Null { name: name.clone() },
+                    };
+                }
+            }
+            Argument::Array { items, .. } => apply_resolved_constants_to_arguments(items, values),
+            _ => {}
+        }
+    }
+}
+
+fn enrich_constructor_defaults_with_reflection(
+    class_map: &mut HashMap<String, ClassInfo>,
+    magento_root: &Path,
+    php_bin: &str,
+) -> usize {
+    let candidates: Vec<String> = class_map
+        .iter()
+        .filter_map(|(fqcn, info)| {
+            let needs = info
+                .constructor
+                .as_ref()
+                .map(|ctor| constructor_defaults_need_constant_reflection(&ctor.params))
+                .unwrap_or(false);
+            needs.then_some(fqcn.clone())
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let reflected: HashMap<String, Vec<ConstructorParam>> = candidates
+        .par_iter()
+        .filter_map(|fqcn| {
+            let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
+            Some((fqcn.clone(), params))
+        })
+        .collect();
+
+    for (fqcn, params) in &reflected {
+        if let Some(info) = class_map.get_mut(fqcn) {
+            info.constructor = Some(Constructor {
+                params: params.clone(),
+            });
+        }
+    }
+
+    reflected.len()
+}
+
+fn constructor_defaults_need_constant_reflection(params: &[ConstructorParam]) -> bool {
+    params.iter().any(|p| {
+        p.default_value
+            .as_deref()
+            .map(|dv| dv.contains("::"))
+            .unwrap_or(false)
+    })
+}
+
+fn extract_generated_class_map(code_root: &Path) -> HashMap<String, ClassInfo> {
+    if !code_root.is_dir() {
+        return HashMap::new();
+    }
+    let files = walk_php_files(&[code_root.to_path_buf()]);
+    let extracted: Vec<(String, ClassInfo)> = files
+        .par_iter()
+        .filter_map(|path| match extract_file(path) {
+            ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
+            _ => None,
+        })
+        .collect();
+
+    let mut map = HashMap::with_capacity(extracted.len());
+    for (fqcn, info) in extracted {
+        map.insert(fqcn, info);
+    }
+    map
+}
+
+fn merged_class_map(
+    base: &HashMap<String, ClassInfo>,
+    extra: &HashMap<String, ClassInfo>,
+) -> HashMap<String, ClassInfo> {
+    let mut out = base.clone();
+    for (fqcn, info) in extra {
+        out.insert(fqcn.clone(), info.clone());
+    }
+    out
+}
+
+fn build_argument_type_names(
+    base_class_map: &HashMap<String, ClassInfo>,
+    generated_class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    interceptors: &[di_resolver::InterceptorSpec],
+    factories: &[di_resolver::FactorySpec],
+    proxies: &[di_resolver::ProxySpec],
+    search_results: &[SearchResultsSpec],
+    proxy_deferred: &[ProxyDeferredSpec],
+    extension_specs: &[ExtensionSpec],
+) -> Vec<String> {
+    let mut names: HashSet<String> = HashSet::new();
+
+    names.extend(base_class_map.keys().cloned());
+    names.extend(generated_class_map.keys().cloned());
+    names.extend(di_config.virtual_types.keys().cloned());
+    names.extend(di_config.type_configs.keys().cloned());
+
+    for spec in interceptors {
+        let target = spec.fqcn.trim_start_matches('\\').to_string();
+        names.insert(target.clone());
+        names.insert(format!("{target}\\Interceptor"));
+    }
+
+    for spec in factories {
+        names.insert(spec.target_fqcn.clone());
+        names.insert(spec.factory_fqcn.clone());
+    }
+    for spec in proxies {
+        names.insert(spec.target_fqcn.clone());
+        names.insert(spec.proxy_fqcn.clone());
+    }
+    for spec in search_results {
+        names.insert(spec.source_fqcn.clone());
+        names.insert(spec.result_fqcn.clone());
+    }
+    for spec in proxy_deferred {
+        names.insert(spec.target_fqcn.clone());
+        names.insert(spec.proxy_fqcn.clone());
+    }
+    for spec in extension_specs {
+        names.insert(spec.source_interface_fqcn.clone());
+        names.insert(spec.extension_interface_fqcn.clone());
+        names.insert(spec.extension_class_fqcn.clone());
+    }
+
+    let mut sorted: Vec<String> = names.into_iter().collect();
+    sorted.sort();
+    sorted
+}
+
+fn build_interception_type_names(
+    base_class_map: &HashMap<String, ClassInfo>,
+    generated_class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    interceptors: &[di_resolver::InterceptorSpec],
+    factories: &[di_resolver::FactorySpec],
+    proxies: &[di_resolver::ProxySpec],
+    search_results: &[SearchResultsSpec],
+    proxy_deferred: &[ProxyDeferredSpec],
+    extension_specs: &[ExtensionSpec],
+) -> Vec<String> {
+    let mut names: HashSet<String> = build_argument_type_names(
+        base_class_map,
+        generated_class_map,
+        di_config,
+        interceptors,
+        factories,
+        proxies,
+        search_results,
+        proxy_deferred,
+        extension_specs,
+    )
+    .into_iter()
+    .collect();
+
+    names.extend(di_config.plugins.keys().cloned());
+    for (from, to) in &di_config.preferences {
+        names.insert(from.clone());
+        names.insert(to.clone());
+    }
+
+    let mut sorted: Vec<String> = names.into_iter().collect();
+    sorted.sort();
+    sorted
+}
+
+fn build_interception_preferences(
+    interceptors: &[di_resolver::InterceptorSpec],
+) -> HashMap<String, String> {
+    interceptors
+        .iter()
+        .map(|spec| {
+            let target = spec.fqcn.trim_start_matches('\\').to_string();
+            (target.clone(), format!("{target}\\Interceptor"))
+        })
+        .collect()
+}
+
+fn build_interception_registry(
+    type_names: &[String],
+    interceptors: &[di_resolver::InterceptorSpec],
+    di_config: &DiConfig,
+) -> HashMap<String, bool> {
+    let intercepted_targets: HashSet<String> = interceptors
+        .iter()
+        .map(|spec| spec.fqcn.trim_start_matches('\\').to_string())
+        .collect();
+
+    type_names
+        .iter()
+        .map(|name| {
+            let intercepted = intercepted_targets.contains(name)
+                || !di_config.get_active_plugins(name).is_empty();
+            (name.clone(), intercepted)
+        })
+        .collect()
 }
 
 fn print_summary(
@@ -1870,6 +2281,21 @@ fn normalize_reflected_method_signature(
     }
 }
 
+fn normalize_reflected_method_signature_for_proxy(
+    method: &mut MethodSignature,
+    target_fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) {
+    if let Some(rt) = method.return_type.as_mut() {
+        *rt = normalize_reflected_type_hint_for_proxy(rt, target_fqcn, class_map);
+    }
+    for param in method.params.iter_mut() {
+        if let Some(th) = param.type_hint.as_mut() {
+            *th = normalize_reflected_type_hint_for_proxy(th, target_fqcn, class_map);
+        }
+    }
+}
+
 fn normalize_reflected_type_hint(
     raw: &str,
     target_fqcn: &str,
@@ -1905,6 +2331,75 @@ fn normalize_reflected_type_hint(
     let normalize_single = |part: &str| -> String {
         match part {
             "self" | "static" => normalized_target.to_string(),
+            "parent" => current_info
+                .and_then(|info| info.extends.clone())
+                .unwrap_or_else(|| "parent".to_string()),
+            _ => part.trim_start_matches('\\').to_string(),
+        }
+    };
+
+    if core.contains('|') {
+        let mut parts: Vec<String> = core
+            .split('|')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(normalize_single)
+            .collect();
+        let precedence_of = |value: &str| -> u8 {
+            let lower = value.to_ascii_lowercase();
+            BUILTIN_PRECEDENCE
+                .iter()
+                .find_map(|(name, rank)| (*name == lower).then_some(*rank))
+                .unwrap_or(0)
+        };
+        parts.sort_by(|a, b| {
+            precedence_of(a)
+                .cmp(&precedence_of(b))
+                .then_with(|| a.cmp(b))
+        });
+        return format!("{}{}", nullable, parts.join("|"));
+    }
+
+    format!("{}{}", nullable, normalize_single(core))
+}
+
+fn normalize_reflected_type_hint_for_proxy(
+    raw: &str,
+    target_fqcn: &str,
+    class_map: &HashMap<String, ClassInfo>,
+) -> String {
+    const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
+        ("bool", 1),
+        ("int", 2),
+        ("float", 3),
+        ("string", 4),
+        ("array", 5),
+        ("callable", 6),
+        ("iterable", 7),
+        ("object", 8),
+        ("static", 9),
+        ("mixed", 10),
+        ("void", 11),
+        ("false", 12),
+        ("true", 13),
+        ("null", 14),
+        ("never", 15),
+    ];
+
+    let normalized_target = target_fqcn.trim_start_matches('\\');
+    let current_info = class_map.get(normalized_target);
+
+    let (nullable, core) = if let Some(rest) = raw.strip_prefix('?') {
+        ("?", rest)
+    } else {
+        ("", raw)
+    };
+
+    let normalize_single = |part: &str| -> String {
+        match part {
+            // Keep proxy parity with Magento: `self` resolves to concrete target
+            // class name, while `static` remains `static`.
+            "self" => normalized_target.to_string(),
             "parent" => current_info
                 .and_then(|info| info.extends.clone())
                 .unwrap_or_else(|| "parent".to_string()),
@@ -2033,6 +2528,23 @@ fn reflect_interceptable_methods(
         });
     }
     Some(out)
+}
+
+fn reflect_class_kind(fqcn: &str, _magento_root: &Path, _php_bin: &str) -> Option<ClassKind> {
+    let pool = PHP_WORKER_POOL.get()?;
+    let request = format!("kind:{}", fqcn.trim_start_matches('\\'));
+    let json_raw = pool.request(&request)?;
+    let json_trimmed = json_raw.trim();
+    if json_trimmed == "null" || json_trimmed.is_empty() {
+        return None;
+    }
+    let kind: String = serde_json::from_str(json_trimmed).ok()?;
+    match kind.as_str() {
+        "interface" => Some(ClassKind::Interface),
+        "trait" => Some(ClassKind::Trait),
+        "class" => Some(ClassKind::Class),
+        _ => None,
+    }
 }
 
 fn normalize_php_default_value(raw: &str) -> String {
@@ -2176,6 +2688,29 @@ fn synthetic_proxy_deferred_class_info(spec: &ProxyDeferredSpec) -> ClassInfo {
     }
 }
 
+fn synthetic_proxy_target_info(target_fqcn: &str, kind: ClassKind) -> ClassInfo {
+    let normalized = target_fqcn.trim_start_matches('\\');
+    let (namespace, name) = if let Some((ns, class_name)) = normalized.rsplit_once('\\') {
+        (ns.to_string(), class_name.to_string())
+    } else {
+        (String::new(), normalized.to_string())
+    };
+
+    ClassInfo {
+        path: PathBuf::from("__generated__/proxy_target.php"),
+        namespace,
+        name,
+        fqcn: normalized.to_string(),
+        kind,
+        extends: None,
+        implements: vec![],
+        constructor: None,
+        is_abstract: false,
+        is_final: false,
+        public_methods: vec![],
+    }
+}
+
 fn plugin_list_cache_id(scope: &str) -> String {
     if scope == "global" {
         "primary|global|plugin-list".to_string()
@@ -2185,20 +2720,106 @@ fn plugin_list_cache_id(scope: &str) -> String {
 }
 
 fn find_extension_attributes_files(magento_root: &Path, module_paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for module_path in module_paths {
+    // Magento composes XML by module load order (app/etc/config.php), not by
+    // filesystem path order. Preserve that so generated Extension* method order
+    // matches PHP compile output.
+    let module_order = load_module_order_from_config_php(magento_root);
+    let mut ordered_files: Vec<(usize, usize, PathBuf)> = Vec::new();
+    for (discovery_idx, module_path) in module_paths.iter().enumerate() {
         let file = module_path.join("etc/extension_attributes.xml");
         if file.exists() {
+            let order = read_module_name_from_module_xml(module_path)
+                .and_then(|name| module_order.get(&name).copied())
+                .unwrap_or(usize::MAX / 2 + discovery_idx);
+            ordered_files.push((order, discovery_idx, file));
+        }
+    }
+    ordered_files.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, _, file) in ordered_files {
+        if seen.insert(file.clone()) {
             files.push(file);
         }
     }
     let app_etc = magento_root.join("app/etc/extension_attributes.xml");
-    if app_etc.exists() {
+    if app_etc.exists() && seen.insert(app_etc.clone()) {
         files.push(app_etc);
     }
-    files.sort();
-    files.dedup();
     files
+}
+
+fn load_module_order_from_config_php(magento_root: &Path) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let config_php = magento_root.join("app/etc/config.php");
+    let Ok(content) = std::fs::read_to_string(config_php) else {
+        return out;
+    };
+
+    let mut in_modules = false;
+    let mut idx = 0usize;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if !in_modules {
+            if line.starts_with("'modules'") || line.starts_with("\"modules\"") {
+                in_modules = true;
+            }
+            continue;
+        }
+        if line.starts_with("),") || line.starts_with("]") || line == ")" || line == "]" {
+            break;
+        }
+        if !line.contains("=>") {
+            continue;
+        }
+        let Some((quote_pos, quote_ch)) = line
+            .char_indices()
+            .find(|(_, ch)| *ch == '\'' || *ch == '"')
+        else {
+            continue;
+        };
+        let rest = &line[quote_pos + quote_ch.len_utf8()..];
+        let Some(end_rel) = rest.find(quote_ch) else {
+            continue;
+        };
+        let module = &rest[..end_rel];
+        if module.is_empty() || out.contains_key(module) {
+            continue;
+        }
+        out.insert(module.to_string(), idx);
+        idx += 1;
+    }
+
+    out
+}
+
+fn read_module_name_from_module_xml(module_root: &Path) -> Option<String> {
+    let module_xml = module_root.join("etc/module.xml");
+    let content = std::fs::read_to_string(module_xml).ok()?;
+    let mut reader = Reader::from_str(&content);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if local_name(e.name().as_ref()) == "module" =>
+            {
+                if let Some(name) = event_attr(e, b"name") {
+                    let normalized = name.trim().to_string();
+                    if !normalized.is_empty() {
+                        return Some(normalized);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
 }
 
 fn parse_extension_attributes_files(
