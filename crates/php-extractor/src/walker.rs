@@ -41,6 +41,9 @@ pub fn read_module_paths(magento_root: &Path) -> Vec<PathBuf> {
     }
 
     // root setup source (no registration.php)
+    // NOTE: setup/src is included for class map / factory-candidate resolution only.
+    // PHP treats setup as type SETUP (not MODULE) — interceptors for Setup classes
+    // are suppressed post-detection in the CLI, not here.
     let setup = magento_root.join("setup");
     if setup.is_dir() && !paths.contains(&setup) {
         paths.push(setup);

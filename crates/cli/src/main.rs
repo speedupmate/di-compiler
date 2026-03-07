@@ -494,7 +494,9 @@ fn main() {
     // Phase 3a: Parse + merge global di.xml files (for per-area metadata)
     // -----------------------------------------------------------------------
     let phase_3a_started = Instant::now();
-    let di_xml_files = find_di_xml_files(&magento_root);
+    let enabled_modules = load_module_order_from_config_php(&magento_root);
+    let di_xml_files =
+        filter_enabled_di_xml(find_di_xml_files(&magento_root), &enabled_modules);
     log::info!("Found {} di.xml files (global)", di_xml_files.len());
 
     let pb = progress_bar(di_xml_files.len() as u64, "Parsing di.xml (global)");
@@ -530,7 +532,8 @@ fn main() {
     // area-specific di.xml files (e.g. etc/adminhtml/di.xml), not just global.
     // -----------------------------------------------------------------------
     let phase_3b_started = Instant::now();
-    let all_di_xml_files = find_all_di_xml_files(&magento_root);
+    let all_di_xml_files =
+        filter_enabled_di_xml(find_all_di_xml_files(&magento_root), &enabled_modules);
     log::info!("Found {} di.xml files (all areas)", all_di_xml_files.len());
 
     // Only parse files not already in the global set
@@ -601,6 +604,11 @@ fn main() {
 
     let mut factories =
         detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs, &di_config);
+    // Drop factories for classes that Composer already knows about (they exist in
+    // a non-scanned vendor package, e.g. ramsey/uuid). PHP skips these too.
+    if let Some(index) = &composer_autoload {
+        factories.retain(|spec| !index.is_loadable(&spec.factory_fqcn));
+    }
     let proxies = detect_proxies_from_configs_with_existing(
         &class_map,
         &scanner_di_configs,
@@ -675,6 +683,18 @@ fn main() {
     }
 
     let mut interceptors = detect_interceptors(&interception_class_map, &interception_di_config);
+    // PHP registers setup/src as type SETUP (not MODULE). It does not generate
+    // interceptors for Magento\Setup\* classes that only inherit plugins (Phase 2
+    // inheritance from e.g. Symfony\Console\Command\Command). However, if a Setup
+    // class has a *direct* plugin declared in di.xml, PHP does generate its interceptor
+    // (e.g. Magento\Setup\Model\FixtureGenerator\EntityGeneratorFactory). Keep those.
+    interceptors.retain(|spec| {
+        let fqcn = spec.fqcn.trim_start_matches('\\');
+        if !fqcn.starts_with("Magento\\Setup\\") {
+            return true; // non-Setup class — always keep
+        }
+        !spec.plugins.is_empty() // Setup class with direct plugins — keep; inherited-only — drop
+    });
     enrich_interceptor_specs_with_reflection(
         &mut interceptors,
         &interception_class_map,
@@ -1028,7 +1048,10 @@ fn main() {
     let area_di_configs: HashMap<String, DiConfig> = AREAS
         .par_iter()
         .map(|&area| {
-            let area_di_files = find_di_xml_files_for_area(&magento_root, area);
+            let area_di_files = filter_enabled_di_xml(
+                find_di_xml_files_for_area(&magento_root, area),
+                &enabled_modules,
+            );
 
             // Only re-merge if there are area-specific files beyond the global set.
             let area_di_config = if area_di_files.len() > di_xml_files.len() {
@@ -2808,11 +2831,62 @@ fn load_module_order_from_config_php(magento_root: &Path) -> HashMap<String, usi
         if module.is_empty() || out.contains_key(module) {
             continue;
         }
+        // Only include enabled modules (value != 0).
+        // Config line format: 'ModuleName' => 1, or 'ModuleName' => 0,
+        let after_key = &rest[end_rel + quote_ch.len_utf8()..];
+        let enabled = after_key
+            .split("=>")
+            .nth(1)
+            .map(|v| v.trim().trim_end_matches([',', ' ', '\n']).trim() != "0")
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
         out.insert(module.to_string(), idx);
         idx += 1;
     }
 
     out
+}
+
+/// Return the module root directory for a di.xml path by walking up to find the `etc` parent.
+fn module_root_from_di_xml(di_xml: &Path) -> Option<&Path> {
+    // A di.xml path is either:
+    //   <root>/etc/di.xml
+    //   <root>/etc/<area>/di.xml
+    // Walk up until we find a component named "etc" and return its parent.
+    let mut p = di_xml.parent()?;
+    loop {
+        if p.file_name()?.to_str()? == "etc" {
+            return p.parent();
+        }
+        p = p.parent()?;
+    }
+}
+
+/// Filter a list of di.xml paths, dropping files from disabled modules.
+///
+/// A di.xml is dropped when its module can be identified via `etc/module.xml`
+/// AND that module name is absent from `enabled_modules` (which only contains
+/// enabled modules from `app/etc/config.php`).
+///
+/// Files whose module cannot be determined (e.g. `app/etc/di.xml`) are kept.
+fn filter_enabled_di_xml(
+    files: Vec<PathBuf>,
+    enabled_modules: &HashMap<String, usize>,
+) -> Vec<PathBuf> {
+    files
+        .into_iter()
+        .filter(|path| {
+            let Some(module_root) = module_root_from_di_xml(path) else {
+                return true; // can't determine module → keep
+            };
+            let Some(name) = read_module_name_from_module_xml(module_root) else {
+                return true; // no module.xml → keep (e.g. framework library)
+            };
+            enabled_modules.contains_key(&name)
+        })
+        .collect()
 }
 
 fn read_module_name_from_module_xml(module_root: &Path) -> Option<String> {

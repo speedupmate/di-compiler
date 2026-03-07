@@ -54,11 +54,17 @@ pub fn detect_interceptors(
 
         // Skip non-concrete: abstract classes, interfaces, traits don't get spec files.
         // Also skip classes that don't exist in class_map (not in scanned PHP files).
+        // Also skip NoninterceptableInterface implementors (e.g. generated Proxy classes).
         let is_concrete = match info {
             None => false, // class not found on disk → skip
             Some(info) => {
                 use php_extractor::types::ClassKind;
-                !info.is_abstract && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
+                !info.is_abstract
+                    && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
+                    && !info.implements.iter().any(|iface| {
+                        iface.trim_start_matches('\\')
+                            == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
+                    })
             }
         };
         if !is_concrete {
@@ -126,6 +132,14 @@ pub fn detect_interceptors(
             if matches!(info.kind, ClassKind::Interface | ClassKind::Trait) {
                 continue;
             }
+        }
+        // Skip classes that implement NoninterceptableInterface — Magento's Proxy
+        // classes and other non-interceptable objects use this marker to opt out.
+        if info.implements.iter().any(|iface| {
+            iface.trim_start_matches('\\')
+                == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
+        }) {
+            continue;
         }
         // Check inheritance chain.
         if has_intercepted_ancestor(fqcn, class_map, &intercepted_set, &mut ancestor_cache) {
