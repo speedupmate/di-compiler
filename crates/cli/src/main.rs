@@ -41,7 +41,7 @@ use di_xml_reader::{
     merge_into, parse_di_xml, Argument, DiConfig, Plugin,
 };
 use php_extractor::{
-    extract_file,
+    extract_file, extract_string_constants,
     types::{
         ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
         MethodSignature,
@@ -728,7 +728,42 @@ fn main() {
     // Phase 5: Resolve arguments (global config for per-area override later)
     // -----------------------------------------------------------------------
     let phase_5_started = Instant::now();
-    let args_map = resolve_all_arguments(&class_map, &di_config); // global only; per-area overrides applied later
+
+    // Build PHP class-constant resolution map.
+    // di.xml xsi:type="init_parameter" values contain PHP constant expressions like
+    // `Magento\Framework\App\State::PARAM_MODE`. We resolve these by reading the
+    // class source file and extracting the actual string constant value.
+    let const_map: HashMap<String, String> = {
+        // Collect unique ClassName::CONST_NAME expressions from all di_config arguments
+        let mut init_exprs: HashSet<String> = HashSet::new();
+        let mut collect_from_arg = |arg: &Argument| {
+            if let Argument::Init { value, .. } = arg {
+                let normalized = value.trim().trim_start_matches('\\');
+                if normalized.contains("::") {
+                    init_exprs.insert(normalized.to_string());
+                }
+            }
+        };
+        for tc in di_config.type_configs.values() {
+            for arg in &tc.arguments {
+                collect_from_arg(arg);
+            }
+        }
+
+        let mut map = HashMap::new();
+        for expr in &init_exprs {
+            let Some((class_name, const_name)) = expr.split_once("::") else { continue };
+            let Some(info) = class_map.get(class_name) else { continue };
+            let constants = extract_string_constants(&info.path);
+            if let Some(value) = constants.get(const_name) {
+                map.insert(expr.clone(), value.clone());
+            }
+        }
+        map
+    };
+    log::info!("Resolved {} PHP constant expressions for init_parameter", const_map.len());
+
+    let args_map = resolve_all_arguments(&class_map, &di_config, &const_map); // global only; per-area overrides applied later
     log::info!("Resolved arguments for {} classes", args_map.len());
 
     // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
@@ -1086,6 +1121,7 @@ fn main() {
                 &argument_type_names,
                 &metadata_class_map,
                 &area_di_config_for_args,
+                &const_map,
             );
             let area_args: HashMap<String, Vec<di_resolver::ResolvedArg>> = area_args
                 .into_iter()

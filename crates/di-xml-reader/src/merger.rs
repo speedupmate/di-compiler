@@ -20,9 +20,17 @@ pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
         dst.preferences.insert(k, v);
     }
 
-    // Virtual types: last wins (later config overrides type_name)
+    // Virtual types: merge by name.
+    // If a later declaration omits `type`, keep the previously resolved base
+    // type and only let accompanying <arguments> overrides merge via TypeConfig.
     for (k, v) in src.virtual_types {
-        dst.virtual_types.insert(k, v);
+        if let Some(existing) = dst.virtual_types.get_mut(&k) {
+            if !v.type_name.trim().is_empty() {
+                existing.type_name = v.type_name;
+            }
+        } else {
+            dst.virtual_types.insert(k, v);
+        }
     }
 
     // Plugins: merge by owner type, then by plugin name (last wins per name)
@@ -49,14 +57,33 @@ fn merge_type_config(dst: &mut TypeConfig, src: TypeConfig) {
     if src.shared.is_some() {
         dst.shared = src.shared;
     }
-    // arguments: merge by name (last wins)
+    // arguments: merge by name; Array arguments recursively merge items by key
     for src_arg in src.arguments {
-        let name = arg_name(&src_arg);
+        let name = arg_name(&src_arg).to_string();
         if let Some(existing) = dst.arguments.iter_mut().find(|a| arg_name(a) == name) {
-            *existing = src_arg;
+            merge_argument(existing, src_arg);
         } else {
             dst.arguments.push(src_arg);
         }
+    }
+}
+
+/// Merge `src_arg` into `dst_arg`.
+/// For Array arguments both sides are merged recursively by item name.
+/// All other types: last-wins (src replaces dst).
+fn merge_argument(dst: &mut Argument, src: Argument) {
+    match (dst, src) {
+        (Argument::Array { items: dst_items, .. }, Argument::Array { items: src_items, .. }) => {
+            for src_item in src_items {
+                let name = arg_name(&src_item).to_string();
+                if let Some(existing) = dst_items.iter_mut().find(|a| arg_name(a) == name) {
+                    merge_argument(existing, src_item);
+                } else {
+                    dst_items.push(src_item);
+                }
+            }
+        }
+        (dst, src) => *dst = src,
     }
 }
 
@@ -76,7 +103,7 @@ fn arg_name(arg: &Argument) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DiConfig, Plugin};
+    use crate::model::{Argument, DiConfig, Plugin, TypeConfig, VirtualType};
 
     #[test]
     fn test_preference_last_wins() {
@@ -139,5 +166,60 @@ mod tests {
         let p1 = plugins.iter().find(|p| p.name == "p1").unwrap();
         assert_eq!(p1.type_name, "T1Updated"); // overridden
         assert_eq!(p1.sort_order, 5);
+    }
+
+    #[test]
+    fn test_virtual_type_override_without_type_keeps_previous_base_type() {
+        let mut c1 = DiConfig::default();
+        c1.virtual_types.insert(
+            "AssetPreProcessorPool".into(),
+            VirtualType {
+                name: "AssetPreProcessorPool".into(),
+                type_name: "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool".into(),
+            },
+        );
+        c1.type_configs.insert(
+            "AssetPreProcessorPool".into(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "preprocessors".into(),
+                    items: vec![Argument::Array {
+                        name: "js".into(),
+                        items: vec![],
+                    }],
+                }],
+            },
+        );
+
+        // Later config overrides only arguments and omits `type` attribute.
+        let mut c2 = DiConfig::default();
+        c2.virtual_types.insert(
+            "AssetPreProcessorPool".into(),
+            VirtualType {
+                name: "AssetPreProcessorPool".into(),
+                type_name: String::new(),
+            },
+        );
+        c2.type_configs.insert(
+            "AssetPreProcessorPool".into(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "preprocessors".into(),
+                    items: vec![Argument::Array {
+                        name: "json".into(),
+                        items: vec![],
+                    }],
+                }],
+            },
+        );
+
+        let merged = merge_configs(vec![c1, c2]);
+        let vt = merged.virtual_types.get("AssetPreProcessorPool").unwrap();
+        assert_eq!(
+            vt.type_name,
+            "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool"
+        );
     }
 }

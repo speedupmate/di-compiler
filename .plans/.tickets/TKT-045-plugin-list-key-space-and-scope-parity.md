@@ -4,7 +4,7 @@ title: Plugin-list key-space and scope parity
 phase: 08-parity-closure
 feature: runtime-map-generator-coverage
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-043, TKT-044]
 touches:
@@ -39,3 +39,19 @@ Close plugin-list metadata drift that remains after universe/coverage fixes:
 
 - Tightening key generation can accidentally drop valid plugin chains for edge modules.
 - Scope leakage (global entries appearing in non-global scope files) can persist if input filtering is incomplete.
+
+## Resolution (2026-03-07)
+
+Code parity gap closed. Remaining delta vs PHP archive:
+
+| Category | Count | Root cause |
+|---|---|---|
+| code missing | 1 | `StructureLazy/Interceptor.php` — stale baseline (NoninterceptableInterface, PHP also skips) |
+| code extra | 2 | `StockItemImporter/Interceptor.php` (archive incomplete, correct); `ReadFactory.php` cap-S (setup typo) |
+| metadata changed | 16 | Pure key-ordering noise — BTreeMap vs PHP insertion order. No content bugs. |
+
+Fixes committed:
+- Disabled-module di.xml filtering (config.php `=> 0` entries)
+- NoninterceptableInterface check in interceptor detection (Phase 1 + Phase 2)
+- Setup interceptor filter refined: suppress inherited-only, keep directly-plugged
+- Root-namespace factory guard (lexer use-import resolution bug)

@@ -109,7 +109,7 @@ fn serialize_arg_indent(out: &mut String, name: &str, value: &ResolvedArgValue, 
         Array(items) => {
             out.push_str(&format!("{}  '_vac_' => \n{}  array (\n", pad, pad));
             for item in items {
-                serialize_arg_indent(out, &item.name, &item.resolved, indent + 4);
+                serialize_vac_entry(out, &item.name, &item.resolved, indent + 4);
             }
             out.push_str(&format!("{}  ),\n", pad));
         }
@@ -120,16 +120,81 @@ fn serialize_arg_indent(out: &mut String, name: &str, value: &ResolvedArgValue, 
         }
         GlobalArgRef { arg_name, default } => {
             out.push_str(&format!("{}  '_a_' => '{}',\n", pad, escape_php(arg_name)));
-            if let Some(d) = default {
-                out.push_str(&format!(
-                    "{}  '_d_' => {},\n",
-                    pad,
-                    render_untyped_default(d)
-                ));
-            }
+            let default_str = match default {
+                Some(d) => render_untyped_default(d),
+                None => "NULL".to_string(),
+            };
+            out.push_str(&format!("{}  '_d_' => {},\n", pad, default_str));
         }
     }
     out.push_str(&format!("{}),\n", pad));
+}
+
+fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, indent: usize) {
+    use ResolvedArgValue::*;
+    let pad = " ".repeat(indent);
+    match value {
+        SharedInstance(fqcn) => {
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n{}  '_i_' => '{}',\n{}),\n",
+                pad,
+                escape_php(name),
+                pad,
+                pad,
+                escape_php(fqcn),
+                pad
+            ));
+        }
+        NonSharedInstance(fqcn) => {
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n{}  '_ins_' => '{}',\n{}),\n",
+                pad,
+                escape_php(name),
+                pad,
+                pad,
+                escape_php(fqcn),
+                pad
+            ));
+        }
+        GlobalArgRef { arg_name, default } => {
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n{}  '_a_' => '{}',\n",
+                pad,
+                escape_php(name),
+                pad,
+                pad,
+                escape_php(arg_name)
+            ));
+            let default_str = match default {
+                Some(d) => render_untyped_default(d),
+                None => "NULL".to_string(),
+            };
+            out.push_str(&format!("{}  '_d_' => {},\n{}),\n", pad, default_str, pad));
+        }
+        Scalar(val) => {
+            out.push_str(&format!(
+                "{}'{}' => {},\n",
+                pad,
+                escape_php(name),
+                render_scalar(val)
+            ));
+        }
+        Null => {
+            out.push_str(&format!("{}'{}' => NULL,\n", pad, escape_php(name)));
+        }
+        Array(items) => {
+            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            for item in items {
+                serialize_vac_entry(out, &item.name, &item.resolved, indent + 2);
+            }
+            out.push_str(&format!("{}),\n", pad));
+        }
+        PlainArray(items) => {
+            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            serialize_plain_array_items(out, items, indent + 2);
+            out.push_str(&format!("{}),\n", pad));
+        }
+    }
 }
 
 fn serialize_plain_array_items(out: &mut String, items: &[ResolvedArrayItem], indent: usize) {
@@ -169,6 +234,7 @@ pub const AREAS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use di_resolver::{ResolvedArg, ResolvedArgValue, ResolvedScalar};
     use di_xml_reader::DiConfig;
     use std::collections::HashMap;
 
@@ -190,5 +256,63 @@ mod tests {
             .insert("Foo\\Interface".to_string(), "Foo\\Impl".to_string());
         let out = generate_area_config(&HashMap::new(), &di_config);
         assert!(out.contains("'Foo\\\\Interface' => 'Foo\\\\Impl'"));
+    }
+
+    #[test]
+    fn test_nested_configured_arrays_are_flat_in_vac() {
+        let mut args = HashMap::new();
+        args.insert(
+            "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
+            vec![ResolvedArg {
+                name: "sources".to_string(),
+                resolved: ResolvedArgValue::Array(vec![ResolvedArg {
+                    name: "modular".to_string(),
+                    resolved: ResolvedArgValue::Array(vec![
+                        ResolvedArg {
+                            name: "source".to_string(),
+                            resolved: ResolvedArgValue::SharedInstance(
+                                "Magento\\Config\\App\\Config\\Source\\ModularConfigSource"
+                                    .to_string(),
+                            ),
+                        },
+                        ResolvedArg {
+                            name: "sortOrder".to_string(),
+                            resolved: ResolvedArgValue::Scalar(ResolvedScalar::String(
+                                "10".to_string(),
+                            )),
+                        },
+                    ]),
+                }]),
+            }],
+        );
+
+        let out = generate_area_config(&args, &DiConfig::default());
+        assert!(out.contains("'sortOrder' => '10',"));
+        assert!(
+            !out.contains("'modular' => \n        array (\n          '_vac_' =>"),
+            "nested configured arrays must not re-wrap with _vac_"
+        );
+        assert!(
+            !out.contains("'sortOrder' => \n            array (\n              '_v_' => '10',"),
+            "nested configured scalars must not re-wrap with _v_"
+        );
+    }
+
+    #[test]
+    fn test_global_arg_ref_always_emits_default_key() {
+        let mut args = HashMap::new();
+        args.insert(
+            "App\\Service".to_string(),
+            vec![ResolvedArg {
+                name: "mode".to_string(),
+                resolved: ResolvedArgValue::GlobalArgRef {
+                    arg_name: "MAGE_MODE".to_string(),
+                    default: None,
+                },
+            }],
+        );
+        let out = generate_area_config(&args, &DiConfig::default());
+        assert!(out.contains("'_a_' => 'MAGE_MODE'"));
+        assert!(out.contains("'_d_' => NULL,"));
     }
 }

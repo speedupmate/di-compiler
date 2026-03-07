@@ -90,7 +90,7 @@ fn serialize_resolved_arg(out: &mut String, name: &str, value: &ResolvedArgValue
         ResolvedArgValue::Array(items) => {
             out.push_str(&format!("{}  '_vac_' => \n{}  array (\n", pad, pad));
             for item in items {
-                serialize_resolved_arg(out, &item.name, &item.resolved, indent + 4);
+                serialize_vac_entry(out, &item.name, &item.resolved, indent + 4);
             }
             out.push_str(&format!("{}  ),\n", pad));
         }
@@ -101,16 +101,75 @@ fn serialize_resolved_arg(out: &mut String, name: &str, value: &ResolvedArgValue
         }
         ResolvedArgValue::GlobalArgRef { arg_name, default } => {
             out.push_str(&format!("{}  '_a_' => '{}',\n", pad, escape_php(arg_name)));
-            if let Some(default) = default {
-                out.push_str(&format!(
-                    "{}  '_d_' => {},\n",
-                    pad,
-                    render_untyped_default(default)
-                ));
-            }
+            let default_str = match default {
+                Some(d) => render_untyped_default(d),
+                None => "NULL".to_string(),
+            };
+            out.push_str(&format!("{}  '_d_' => {},\n", pad, default_str));
         }
     }
     out.push_str(&format!("{}),\n", pad));
+}
+
+/// Serialize one key/value entry inside a `_vac_` (configured array) block.
+///
+/// Inside `_vac_`, Magento's ArgumentsResolver stores values differently from
+/// top-level constructor args:
+///   - Instance refs:  `array('_i_' => 'FQN')`  (same notation as top-level)
+///   - Global arg refs: `array('_a_' => ..., '_d_' => ...)`  (same)
+///   - Scalars:  **plain PHP value** — NOT wrapped in `array('_v_' => ...)`
+///   - Nulls:    **plain `NULL`**   — NOT wrapped in `array('_vn_' => true)`
+///   - Nested arrays: **flat `array(...)`** — NOT wrapped in `array('_vac_' => ...)`
+///
+/// This matches PHP `ArgumentsResolver::getConfiguredArrayAttribute()`.
+fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, indent: usize) {
+    let pad = " ".repeat(indent);
+    match value {
+        ResolvedArgValue::SharedInstance(fqcn) => {
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n{}  '_i_' => '{}',\n{}),\n",
+                pad, escape_php(name), pad, pad, escape_php(fqcn), pad
+            ));
+        }
+        ResolvedArgValue::NonSharedInstance(fqcn) => {
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n{}  '_ins_' => '{}',\n{}),\n",
+                pad, escape_php(name), pad, pad, escape_php(fqcn), pad
+            ));
+        }
+        ResolvedArgValue::GlobalArgRef { arg_name, default } => {
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n{}  '_a_' => '{}',\n",
+                pad, escape_php(name), pad, pad, escape_php(arg_name)
+            ));
+            let default_str = match default {
+                Some(d) => render_untyped_default(d),
+                None => "NULL".to_string(),
+            };
+            out.push_str(&format!("{}  '_d_' => {},\n{}),\n", pad, default_str, pad));
+        }
+        ResolvedArgValue::Scalar(val) => {
+            // Plain scalar — no _v_ wrapper inside _vac_
+            out.push_str(&format!("{}'{}' => {},\n", pad, escape_php(name), render_scalar(val)));
+        }
+        ResolvedArgValue::Null => {
+            // Plain NULL — no _vn_ wrapper inside _vac_
+            out.push_str(&format!("{}'{}' => NULL,\n", pad, escape_php(name)));
+        }
+        ResolvedArgValue::Array(items) => {
+            // Nested configured array — flat, no _vac_ re-wrap
+            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            for item in items {
+                serialize_vac_entry(out, &item.name, &item.resolved, indent + 2);
+            }
+            out.push_str(&format!("{}),\n", pad));
+        }
+        ResolvedArgValue::PlainArray(items) => {
+            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            serialize_plain_array_items(out, items, indent + 2);
+            out.push_str(&format!("{}),\n", pad));
+        }
+    }
 }
 
 fn serialize_plain_array_items(out: &mut String, items: &[ResolvedArrayItem], indent: usize) {
@@ -166,6 +225,8 @@ pub(crate) fn render_untyped_default(default: &str) -> String {
         "true" => "true".to_string(),
         "false" => "false".to_string(),
         "NULL" | "null" => "NULL".to_string(),
+        // Empty PHP array default: PHP reflection returns [], var_export gives array ()
+        "[]" => "array ()".to_string(),
         _ if is_safe_php_numeric_literal(default) => default.to_string(),
         _ => format!("'{}'", escape_php(default)),
     }
@@ -325,5 +386,71 @@ mod tests {
         );
         let out = serialize_arguments_php(&map);
         assert!(out.contains("'_v_' => true,"));
+    }
+
+    #[test]
+    fn test_configured_array_nested_entries_are_flat_inside_vac() {
+        let mut map = HashMap::new();
+        map.insert(
+            "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
+            vec![ResolvedArg {
+                name: "sources".to_string(),
+                resolved: ResolvedArgValue::Array(vec![ResolvedArg {
+                    name: "modular".to_string(),
+                    resolved: ResolvedArgValue::Array(vec![
+                        ResolvedArg {
+                            name: "source".to_string(),
+                            resolved: ResolvedArgValue::SharedInstance(
+                                "Magento\\Config\\App\\Config\\Source\\ModularConfigSource"
+                                    .to_string(),
+                            ),
+                        },
+                        ResolvedArg {
+                            name: "sortOrder".to_string(),
+                            resolved: ResolvedArgValue::Scalar(ResolvedScalar::String(
+                                "10".to_string(),
+                            )),
+                        },
+                    ]),
+                }]),
+            }],
+        );
+
+        let out = serialize_arguments_php(&map);
+
+        assert!(
+            out.contains("'modular' =>"),
+            "configured array entries must stay flat inside _vac_"
+        );
+        assert!(
+            out.contains("'sortOrder' => '10',"),
+            "scalar values inside _vac_ must not use _v_ wrapper"
+        );
+        assert!(
+            !out.contains("'modular' => \n      array (\n        '_vac_' =>"),
+            "nested configured arrays must not re-wrap with _vac_"
+        );
+        assert!(
+            !out.contains("'sortOrder' => \n          array (\n            '_v_' => '10',"),
+            "nested scalar values must not re-wrap with _v_"
+        );
+    }
+
+    #[test]
+    fn test_global_arg_ref_always_emits_default_key() {
+        let mut map = HashMap::new();
+        map.insert(
+            "App\\Service".to_string(),
+            vec![ResolvedArg {
+                name: "mode".to_string(),
+                resolved: ResolvedArgValue::GlobalArgRef {
+                    arg_name: "MAGE_MODE".to_string(),
+                    default: None,
+                },
+            }],
+        );
+        let out = serialize_arguments_php(&map);
+        assert!(out.contains("'_a_' => 'MAGE_MODE'"));
+        assert!(out.contains("'_d_' => NULL,"));
     }
 }

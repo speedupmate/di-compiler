@@ -27,11 +27,12 @@ use di_xml_reader::{Argument, DiConfig};
 pub fn resolve_all_arguments(
     class_map: &HashMap<String, ClassInfo>,
     di_config: &DiConfig,
+    const_map: &HashMap<String, String>,
 ) -> HashMap<String, Vec<ResolvedArg>> {
     let mut result = HashMap::new();
 
     for (fqcn, info) in class_map {
-        let resolved = resolve_for_class(fqcn, info, di_config);
+        let resolved = resolve_for_class(fqcn, info, class_map, di_config, const_map);
         if !resolved.is_empty() {
             result.insert(fqcn.clone(), resolved);
         }
@@ -49,10 +50,11 @@ pub fn resolve_all_arguments_for_named_types(
     type_names: &[String],
     class_map: &HashMap<String, ClassInfo>,
     di_config: &DiConfig,
+    const_map: &HashMap<String, String>,
 ) -> HashMap<String, Vec<ResolvedArg>> {
     let mut result = HashMap::new();
     for type_name in type_names {
-        let resolved = resolve_for_type_name(type_name, class_map, di_config);
+        let resolved = resolve_for_type_name(type_name, class_map, di_config, const_map);
         if !resolved.is_empty() {
             result.insert(type_name.clone(), resolved);
         }
@@ -61,8 +63,14 @@ pub fn resolve_all_arguments_for_named_types(
 }
 
 /// Resolve constructor args for a single class.
-pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> Vec<ResolvedArg> {
-    let di_args = merged_di_arguments_for_type_name(fqcn, di_config);
+pub fn resolve_for_class(
+    fqcn: &str,
+    info: &ClassInfo,
+    class_map: &HashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    const_map: &HashMap<String, String>,
+) -> Vec<ResolvedArg> {
+    let di_args = merged_di_arguments_for_type_name(fqcn, class_map, di_config);
     let di_arg_map: HashMap<&str, &Argument> =
         di_args.iter().map(|a| (argument_name(a), *a)).collect();
     let Some(ctor) = &info.constructor else {
@@ -81,9 +89,9 @@ pub fn resolve_for_class(fqcn: &str, info: &ClassInfo, di_config: &DiConfig) -> 
             resolved.push(ResolvedArg {
                 name: param.name.clone(),
                 resolved: if type_hint.is_some() {
-                    resolve_configured_instance_argument(di_arg, di_config)
+                    resolve_configured_instance_argument(di_arg, di_config, const_map)
                 } else {
-                    resolve_configured_non_object_argument(di_arg, param.default_value.as_deref(), di_config)
+                    resolve_configured_non_object_argument(di_arg, param.default_value.as_deref(), di_config, const_map)
                 },
             });
             continue;
@@ -125,23 +133,24 @@ fn resolve_for_type_name(
     type_name: &str,
     class_map: &HashMap<String, ClassInfo>,
     di_config: &DiConfig,
+    const_map: &HashMap<String, String>,
 ) -> Vec<ResolvedArg> {
     let normalized = normalize(type_name);
     let is_virtual = di_config.virtual_types.contains_key(&normalized);
     if let Some(info) = class_info_with_inherited_constructor(&normalized, class_map) {
         if info.constructor.is_none() && is_virtual {
-            let di_args = merged_di_arguments_for_type_name(&normalized, di_config);
+            let di_args = merged_di_arguments_for_type_name(&normalized, class_map, di_config);
             if !di_args.is_empty() {
                 return di_args
                     .iter()
                     .map(|arg| ResolvedArg {
                         name: argument_name(arg).to_string(),
-                        resolved: resolve_di_argument(arg, di_config),
+                        resolved: resolve_di_argument(arg, di_config, const_map),
                     })
                     .collect();
             }
         }
-        return resolve_for_class(&normalized, &info, di_config);
+        return resolve_for_class(&normalized, &info, class_map, di_config, const_map);
     }
 
     let instance_type = normalize(&di_config.get_instance_type(&normalized));
@@ -151,18 +160,18 @@ fn resolve_for_type_name(
             // DI overrides against the requested logical type name.
             info.fqcn = normalized.clone();
             if info.constructor.is_none() && is_virtual {
-                let di_args = merged_di_arguments_for_type_name(&normalized, di_config);
+                let di_args = merged_di_arguments_for_type_name(&normalized, class_map, di_config);
                 if !di_args.is_empty() {
                     return di_args
                         .iter()
                         .map(|arg| ResolvedArg {
                             name: argument_name(arg).to_string(),
-                            resolved: resolve_di_argument(arg, di_config),
+                            resolved: resolve_di_argument(arg, di_config, const_map),
                         })
                         .collect();
                 }
             }
-            return resolve_for_class(&normalized, &info, di_config);
+            return resolve_for_class(&normalized, &info, class_map, di_config, const_map);
         }
     }
 
@@ -170,7 +179,7 @@ fn resolve_for_type_name(
         return Vec::new();
     }
 
-    let di_args = merged_di_arguments_for_type_name(&normalized, di_config);
+    let di_args = merged_di_arguments_for_type_name(&normalized, class_map, di_config);
     if di_args.is_empty() {
         return Vec::new();
     }
@@ -178,7 +187,7 @@ fn resolve_for_type_name(
         .iter()
         .map(|arg| ResolvedArg {
             name: argument_name(arg).to_string(),
-            resolved: resolve_di_argument(arg, di_config),
+            resolved: resolve_di_argument(arg, di_config, const_map),
         })
         .collect()
 }
@@ -211,22 +220,60 @@ fn class_info_with_inherited_constructor(
 
 fn merged_di_arguments_for_type_name<'a>(
     type_name: &str,
+    class_map: &HashMap<String, ClassInfo>,
     di_config: &'a DiConfig,
 ) -> Vec<&'a Argument> {
-    let chain = virtual_type_chain(type_name, di_config);
+    // Build the full type chain: PHP class hierarchy (root→leaf) followed by
+    // the virtual-type chain for each entry.  More-specific types override
+    // less-specific ones, so we process from least specific to most specific.
+    //
+    // PHP's ArgumentsResolver walks the class hierarchy the same way: a
+    // <type name="Parent"> di.xml override is inherited by all subclasses
+    // unless the subclass declares its own override for that argument name.
 
-    // Merge from concrete/base → most specific logical type.
-    let mut merged: Vec<&Argument> = Vec::new();
+    // 1. Collect the PHP extends chain for the concrete class that `type_name`
+    //    resolves to.  The chain is ordered root-ancestor-first.
+    let concrete = {
+        let vchain = virtual_type_chain(type_name, di_config);
+        normalize(vchain.last().unwrap_or(&type_name.to_string()))
+    };
+
+    let mut class_hierarchy: Vec<String> = Vec::new();
+    {
+        let mut cursor = concrete.clone();
+        let mut seen: HashSet<String> = HashSet::new();
+        while !cursor.is_empty() && seen.insert(cursor.clone()) {
+            class_hierarchy.push(cursor.clone());
+            match class_map.get(&cursor).and_then(|i| i.extends.as_ref()) {
+                Some(parent) => cursor = normalize(parent),
+                None => break,
+            }
+        }
+        class_hierarchy.reverse(); // root-ancestor first (lowest priority)
+    }
+
+    // 2. If `type_name` is a virtual type or differs from `concrete`, append it
+    //    at the end so its own virtual-type chain has the highest priority.
+    if normalize(type_name) != concrete {
+        class_hierarchy.push(normalize(type_name));
+    }
+
+    // 3. For each entry in the hierarchy, walk its virtual-type chain and merge
+    //    arguments (later entries / more-specific names override earlier ones).
+    let mut merged: Vec<&'a Argument> = Vec::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
-    for current in chain.iter().rev() {
-        let args = di_config.get_arguments(current);
-        for arg in args {
-            let name = argument_name(arg).to_string();
-            if let Some(idx) = by_name.get(&name).copied() {
-                merged[idx] = arg;
-            } else {
-                by_name.insert(name, merged.len());
-                merged.push(arg);
+
+    for ancestor in &class_hierarchy {
+        let chain = virtual_type_chain(ancestor, di_config);
+        for current in chain.iter().rev() {
+            for arg in di_config.get_arguments(current) {
+                let name = argument_name(arg).to_string();
+                if let Some(idx) = by_name.get(&name).copied() {
+                    merged[idx] = arg;
+                } else {
+                    by_name.insert(name, merged.len());
+                    merged.push(arg);
+                }
             }
         }
     }
@@ -273,7 +320,7 @@ fn first_non_null_class_type_hint_arm(type_hint: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue {
+fn resolve_di_argument(arg: &Argument, di_config: &DiConfig, const_map: &HashMap<String, String>) -> ResolvedArgValue {
     match arg {
         Argument::Object { value, shared, .. } => {
             let concrete = di_config.get_preference(value);
@@ -298,7 +345,7 @@ fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue
                     .iter()
                     .map(|item| ResolvedArg {
                         name: argument_name(item).to_string(),
-                        resolved: resolve_di_argument(item, di_config),
+                        resolved: resolve_di_argument(item, di_config, const_map),
                     })
                     .collect();
                 ResolvedArgValue::Array(resolved_items)
@@ -314,7 +361,7 @@ fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue
             }
         }
         Argument::Init { value, .. } => ResolvedArgValue::GlobalArgRef {
-            arg_name: value.clone(),
+            arg_name: resolve_php_constant_expr(value, const_map),
             default: None,
         },
         Argument::Const { value, .. } => {
@@ -323,7 +370,7 @@ fn resolve_di_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue
     }
 }
 
-fn resolve_configured_instance_argument(arg: &Argument, di_config: &DiConfig) -> ResolvedArgValue {
+fn resolve_configured_instance_argument(arg: &Argument, di_config: &DiConfig, const_map: &HashMap<String, String>) -> ResolvedArgValue {
     match arg {
         Argument::Object { value, shared, .. } => {
             let concrete = di_config.get_preference(value);
@@ -334,7 +381,7 @@ fn resolve_configured_instance_argument(arg: &Argument, di_config: &DiConfig) ->
                 ResolvedArgValue::NonSharedInstance(concrete)
             }
         }
-        _ => resolve_di_argument(arg, di_config),
+        _ => resolve_di_argument(arg, di_config, const_map),
     }
 }
 
@@ -342,14 +389,37 @@ fn resolve_configured_non_object_argument(
     arg: &Argument,
     constructor_default: Option<&str>,
     di_config: &DiConfig,
+    const_map: &HashMap<String, String>,
 ) -> ResolvedArgValue {
     match arg {
         Argument::Init { value, .. } => ResolvedArgValue::GlobalArgRef {
-            arg_name: value.clone(),
-            default: constructor_default.map(|d| d.to_string()),
+            // _a_: resolve PHP class constant expressions (e.g. ClassName::CONST_NAME → "MAGE_MODE")
+            arg_name: resolve_php_constant_expr(value, const_map),
+            // _d_: constructor default is raw PHP source (e.g. `'default'`) — unquote it
+            default: constructor_default.and_then(|d| {
+                let trimmed = d.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                    None
+                } else if let Some(s) = parse_quoted_php_string(trimmed) {
+                    Some(s)
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }),
         },
-        _ => resolve_di_argument(arg, di_config),
+        _ => resolve_di_argument(arg, di_config, const_map),
     }
+}
+
+/// Resolve a PHP constant expression of the form `ClassName::CONST_NAME` to its actual
+/// value using the pre-built const_map.  If the expression is not in `ClassName::CONST_NAME`
+/// form (or has no match), the raw string is returned unchanged.
+fn resolve_php_constant_expr(expr: &str, const_map: &HashMap<String, String>) -> String {
+    let normalized = expr.trim().trim_start_matches('\\');
+    if let Some(resolved) = const_map.get(normalized) {
+        return resolved.clone();
+    }
+    normalized.to_string()
 }
 
 fn resolve_non_object_default(default_value: Option<&str>) -> ResolvedArgValue {
@@ -503,7 +573,7 @@ mod tests {
             make_class("App\\Service", vec![("logger", Some("App\\Logger"))]),
         );
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config);
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
         let args = &map["App\\Service"];
         assert_eq!(args.len(), 1);
         assert!(
@@ -529,7 +599,7 @@ mod tests {
                 }],
             },
         );
-        let map = resolve_all_arguments(&class_map, &di_config);
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
         let args = &map["App\\Service"];
         assert!(matches!(
             &args[0].resolved,
@@ -545,7 +615,7 @@ mod tests {
             make_class("App\\Service", vec![("options", None)]),
         );
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config);
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
         let args = &map["App\\Service"];
         assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
     }
@@ -559,7 +629,7 @@ mod tests {
         );
 
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config);
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
         let args = &map["App\\Service"];
         assert!(matches!(
             &args[0].resolved,
@@ -576,7 +646,7 @@ mod tests {
         );
 
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config);
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
         let args = &map["App\\Service"];
         assert!(matches!(
             &args[0].resolved,
@@ -593,7 +663,7 @@ mod tests {
         );
 
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config);
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
         let args = &map["App\\Service"];
         assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
     }
