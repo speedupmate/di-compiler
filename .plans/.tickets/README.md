@@ -50,3 +50,4 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [044](TKT-044-area-config-and-interception-virtual-generated-coverage.md) | Area-config and interception metadata coverage for virtual/generated types | 08 | Ready | 043 |
 | [045](TKT-045-plugin-list-key-space-and-scope-parity.md) | Plugin-list key-space and scope parity | 08 | Ready | 043, 044 |
 | [046](TKT-046-proxy-method-surface-order-and-shape-parity.md) | Proxy method surface, order, and class-shape parity | 08 | Ready | 039, 042 |
+| [047](TKT-047-debugging-knowledge-base-and-skill-packaging.md) | Debugging knowledge base relocation and skill packaging | 09 | Done | 037 |

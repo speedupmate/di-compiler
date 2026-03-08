@@ -12,6 +12,8 @@ Canonical compare baseline for this repo is:
 - [phases/](phases/) — phase PRDs (execution order)
 - [.features/](.features/) — one spec per feature
 - [.tickets/](.tickets/) — execution-sized ticket packs
+- [.skills/](.skills/) — reusable project-specific agent skills
+- [.debugging/](.debugging/) — deep-dive debugging notes and parity investigations
 
 ## Phase Order
 

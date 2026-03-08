@@ -59,3 +59,8 @@ Define and implement a full project README and formal MIT licensing so new contr
 
 - Landed via commit `1880873`.
 - Root README and MIT licensing are in place and aligned with current CLI usage.
+
+## Follow-up Update (2026-03-08)
+
+- Root `README.md` was reintroduced at `rust/di-compiler/README.md` after a missing-file regression.
+- Added explicit baseline bootstrap instructions for environments without `generated/_code` and `generated/_metadata`.
