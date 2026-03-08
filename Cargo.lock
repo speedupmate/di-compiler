@@ -182,6 +182,7 @@ dependencies = [
  "php-extractor",
  "rayon",
  "rustc-hash",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -253,6 +254,7 @@ dependencies = [
  "insta",
  "log",
  "php-extractor",
+ "serde_json",
  "thiserror",
 ]
 

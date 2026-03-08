@@ -8,6 +8,7 @@ thiserror.workspace = true
 log.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
+serde_json.workspace = true
 di-resolver = { path = "../di-resolver" }
 di-xml-reader = { path = "../di-xml-reader" }
 php-extractor = { path = "../php-extractor" }

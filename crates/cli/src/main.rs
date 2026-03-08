@@ -199,7 +199,7 @@ function reflect_methods(string $class): ?array {
         $params = [];
         foreach ($m->getParameters() as $p) {
             $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
-            if ($hd) $dv = var_export($p->getDefaultValue(), true);
+            if ($hd) { $raw = $p->getDefaultValue(); $dv = is_array($raw) ? '__json__:'.json_encode($raw) : var_export($raw, true); }
             $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
                 'has_default'=>$hd,'default_value'=>$dv,
                 'is_variadic'=>$p->isVariadic(),'is_by_ref'=>$p->isPassedByReference()];
@@ -229,7 +229,7 @@ function reflect_ctor(string $class): ?array {
     $params = [];
     foreach ($ctor->getParameters() as $p) {
         $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
-        if ($hd) $dv = var_export($p->getDefaultValue(), true);
+        if ($hd) { $raw = $p->getDefaultValue(); $dv = is_array($raw) ? '__json__:'.json_encode($raw) : var_export($raw, true); }
         $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
             'has_default'=>$hd,'default_value'=>$dv,'is_variadic'=>$p->isVariadic()];
     }

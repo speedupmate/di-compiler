@@ -198,7 +198,7 @@ fn render_params(params: &[MethodParam]) -> String {
             if !p.is_variadic {
                 if let Some(default_value) = &p.default_value {
                     s.push_str(" = ");
-                    s.push_str(default_value);
+                    s.push_str(&crate::render_php_default(default_value));
                 }
             }
             s

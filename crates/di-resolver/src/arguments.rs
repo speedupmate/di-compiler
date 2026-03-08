@@ -495,6 +495,16 @@ fn resolve_non_object_default(default_value: Option<&str>) -> ResolvedArgValue {
     if trimmed == "[]" {
         return ResolvedArgValue::PlainArray(Vec::new());
     }
+    // PHP reflection worker emits `__json__:<json>` for array defaults so we
+    // get the resolved values rather than constant expressions.
+    if let Some(json_str) = trimmed.strip_prefix("__json__:") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            return ResolvedArgValue::PlainArray(json_to_plain_array_items(&v));
+        }
+    }
+    if let Some(items) = parse_php_array_default(trimmed) {
+        return ResolvedArgValue::PlainArray(items);
+    }
     if let Some(s) = parse_quoted_php_string(trimmed) {
         return ResolvedArgValue::Scalar(ResolvedScalar::String(s));
     }
@@ -502,6 +512,319 @@ fn resolve_non_object_default(default_value: Option<&str>) -> ResolvedArgValue {
         return ResolvedArgValue::Scalar(ResolvedScalar::Number(trimmed.to_string()));
     }
     ResolvedArgValue::Scalar(ResolvedScalar::String(trimmed.to_string()))
+}
+
+fn json_to_plain_array_items(v: &serde_json::Value) -> Vec<ResolvedArrayItem> {
+    match v {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| ResolvedArrayItem {
+                name: k.clone(),
+                value: json_to_plain_array_value(v),
+            })
+            .collect(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| ResolvedArrayItem {
+                name: i.to_string(),
+                value: json_to_plain_array_value(v),
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn json_to_plain_array_value(v: &serde_json::Value) -> ResolvedArrayValue {
+    match v {
+        serde_json::Value::String(s) => ResolvedArrayValue::Scalar(ResolvedScalar::String(s.clone())),
+        serde_json::Value::Number(n) => ResolvedArrayValue::Scalar(ResolvedScalar::Number(n.to_string())),
+        serde_json::Value::Bool(b) => ResolvedArrayValue::Scalar(ResolvedScalar::Bool(*b)),
+        serde_json::Value::Null => ResolvedArrayValue::Null,
+        other => ResolvedArrayValue::Array(json_to_plain_array_items(other)),
+    }
+}
+
+fn parse_php_array_default(input: &str) -> Option<Vec<ResolvedArrayItem>> {
+    let mut p = PhpArrayDefaultParser::new(input);
+    let items = p.parse_array()?;
+    p.skip_ws();
+    if !p.is_eof() {
+        return None;
+    }
+    Some(items)
+}
+
+struct PhpArrayDefaultParser<'a> {
+    src: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PhpArrayDefaultParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            src: input.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        self.pos >= self.src.len()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_ascii_whitespace() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn consume_char(&mut self, ch: u8) -> bool {
+        if self.peek() == Some(ch) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_bytes(&mut self, bytes: &[u8]) -> bool {
+        let end = self.pos + bytes.len();
+        if end > self.src.len() {
+            return false;
+        }
+        if &self.src[self.pos..end] == bytes {
+            self.pos = end;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_keyword_ci(&mut self, kw: &str) -> bool {
+        let bytes = kw.as_bytes();
+        let end = self.pos + bytes.len();
+        if end > self.src.len() {
+            return false;
+        }
+        let segment = &self.src[self.pos..end];
+        if !segment.eq_ignore_ascii_case(bytes) {
+            return false;
+        }
+        if let Some(next) = self.src.get(end).copied() {
+            if next.is_ascii_alphanumeric() || next == b'_' {
+                return false;
+            }
+        }
+        self.pos = end;
+        true
+    }
+
+    fn parse_array(&mut self) -> Option<Vec<ResolvedArrayItem>> {
+        self.skip_ws();
+        let close = if self.consume_keyword_ci("array") {
+            self.skip_ws();
+            if !self.consume_char(b'(') {
+                return None;
+            }
+            b')'
+        } else if self.consume_char(b'[') {
+            b']'
+        } else {
+            return None;
+        };
+
+        let mut items = Vec::new();
+        let mut auto_index: usize = 0;
+        loop {
+            self.skip_ws();
+            if self.consume_char(close) {
+                break;
+            }
+
+            let first = self.parse_value()?;
+            self.skip_ws();
+
+            if self.consume_bytes(b"=>") {
+                let key = value_to_php_array_key(&first)?;
+                let value = self.parse_value()?;
+                items.push(ResolvedArrayItem { name: key, value });
+            } else {
+                items.push(ResolvedArrayItem {
+                    name: auto_index.to_string(),
+                    value: first,
+                });
+                auto_index += 1;
+            }
+
+            self.skip_ws();
+            if self.consume_char(b',') {
+                self.skip_ws();
+                if self.consume_char(close) {
+                    break;
+                }
+                continue;
+            }
+            if self.consume_char(close) {
+                break;
+            }
+            return None;
+        }
+        Some(items)
+    }
+
+    fn parse_value(&mut self) -> Option<ResolvedArrayValue> {
+        self.skip_ws();
+
+        if self.peek() == Some(b'[') {
+            let nested = self.parse_array()?;
+            return Some(ResolvedArrayValue::Array(nested));
+        }
+
+        if self.starts_with_keyword_ci("array") {
+            let nested = self.parse_array()?;
+            return Some(ResolvedArrayValue::Array(nested));
+        }
+
+        if let Some(s) = self.parse_string_literal() {
+            return Some(ResolvedArrayValue::Scalar(ResolvedScalar::String(s)));
+        }
+
+        if let Some(n) = self.parse_numeric_literal() {
+            return Some(ResolvedArrayValue::Scalar(ResolvedScalar::Number(n)));
+        }
+
+        if self.consume_keyword_ci("true") {
+            return Some(ResolvedArrayValue::Scalar(ResolvedScalar::Bool(true)));
+        }
+        if self.consume_keyword_ci("false") {
+            return Some(ResolvedArrayValue::Scalar(ResolvedScalar::Bool(false)));
+        }
+        if self.consume_keyword_ci("null") {
+            return Some(ResolvedArrayValue::Null);
+        }
+
+        self.parse_bareword_string()
+            .map(|s| ResolvedArrayValue::Scalar(ResolvedScalar::String(s)))
+    }
+
+    fn starts_with_keyword_ci(&self, kw: &str) -> bool {
+        let bytes = kw.as_bytes();
+        let end = self.pos + bytes.len();
+        if end > self.src.len() {
+            return false;
+        }
+        let segment = &self.src[self.pos..end];
+        if !segment.eq_ignore_ascii_case(bytes) {
+            return false;
+        }
+        if let Some(next) = self.src.get(end).copied() {
+            if next.is_ascii_alphanumeric() || next == b'_' {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn parse_string_literal(&mut self) -> Option<String> {
+        let quote = match self.peek() {
+            Some(b'\'') => b'\'',
+            Some(b'"') => b'"',
+            _ => return None,
+        };
+        self.pos += 1; // opening quote
+
+        let mut out = String::new();
+        let mut escaped = false;
+        while let Some(c) = self.peek() {
+            self.pos += 1;
+            if escaped {
+                out.push(c as char);
+                escaped = false;
+                continue;
+            }
+            if c == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if c == quote {
+                return Some(out);
+            }
+            out.push(c as char);
+        }
+        None
+    }
+
+    fn parse_numeric_literal(&mut self) -> Option<String> {
+        let start = self.pos;
+        let Some(first) = self.peek() else {
+            return None;
+        };
+        if !(first.is_ascii_digit() || first == b'+' || first == b'-') {
+            return None;
+        }
+
+        while let Some(c) = self.peek() {
+            if c.is_ascii_whitespace()
+                || c == b','
+                || c == b')'
+                || c == b']'
+                || (c == b'=' && self.src.get(self.pos + 1) == Some(&b'>'))
+            {
+                break;
+            }
+            self.pos += 1;
+        }
+        let token = std::str::from_utf8(&self.src[start..self.pos]).ok()?.trim();
+        if token.parse::<f64>().is_ok() {
+            Some(token.to_string())
+        } else {
+            self.pos = start;
+            None
+        }
+    }
+
+    fn parse_bareword_string(&mut self) -> Option<String> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_whitespace()
+                || c == b','
+                || c == b')'
+                || c == b']'
+                || (c == b'=' && self.src.get(self.pos + 1) == Some(&b'>'))
+            {
+                break;
+            }
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        let token = std::str::from_utf8(&self.src[start..self.pos]).ok()?.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token.to_string())
+        }
+    }
+}
+
+fn value_to_php_array_key(value: &ResolvedArrayValue) -> Option<String> {
+    match value {
+        ResolvedArrayValue::Scalar(ResolvedScalar::String(s))
+        | ResolvedArrayValue::Scalar(ResolvedScalar::Number(s)) => Some(s.clone()),
+        ResolvedArrayValue::Scalar(ResolvedScalar::Bool(true)) => Some("1".to_string()),
+        ResolvedArrayValue::Scalar(ResolvedScalar::Bool(false)) => Some("0".to_string()),
+        ResolvedArrayValue::Null => Some(String::new()),
+        ResolvedArrayValue::Array(_) => None,
+    }
 }
 
 fn parse_quoted_php_string(input: &str) -> Option<String> {
@@ -1116,5 +1439,114 @@ mod tests {
             assert!(inner.contains_key("source"));
             assert!(inner.contains_key("sortOrder"));
         }
+    }
+
+    #[test]
+    fn test_optional_constructor_var_export_array_default_is_parsed_as_plain_array() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Magento\\Store\\Model\\StoreResolver\\ReaderList".to_string(),
+            make_class_with_constructor(
+                "Magento\\Store\\Model\\StoreResolver\\ReaderList",
+                vec![ConstructorParam {
+                    name: "resolverMap".to_string(),
+                    type_hint: None,
+                    is_optional: true,
+                    default_value: Some(
+                        "array (\n  'website' => 'Magento\\\\Store\\\\Model\\\\StoreResolver\\\\Website',\n  'group' => 'Magento\\\\Store\\\\Model\\\\StoreResolver\\\\Group',\n  'store' => 'Magento\\\\Store\\\\Model\\\\StoreResolver\\\\Store',\n)"
+                            .to_string(),
+                    ),
+                    is_primitive: false,
+                    is_variadic: false,
+                    is_promoted: false,
+                }],
+            ),
+        );
+
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &HashMap::new());
+        let args = &map["Magento\\Store\\Model\\StoreResolver\\ReaderList"];
+        let resolver_map = args
+            .iter()
+            .find(|a| a.name == "resolverMap")
+            .expect("resolverMap arg");
+
+        let by_key: HashMap<_, _> = match &resolver_map.resolved {
+            ResolvedArgValue::PlainArray(items) => {
+                items.iter().map(|i| (i.name.as_str(), &i.value)).collect()
+            }
+            other => panic!("expected plain array default, got {other:?}"),
+        };
+
+        assert_eq!(by_key.len(), 3);
+        assert!(matches!(
+            by_key.get("website").copied(),
+            Some(ResolvedArrayValue::Scalar(ResolvedScalar::String(v)))
+            if v == "Magento\\Store\\Model\\StoreResolver\\Website"
+        ));
+        assert!(matches!(
+            by_key.get("group").copied(),
+            Some(ResolvedArrayValue::Scalar(ResolvedScalar::String(v)))
+            if v == "Magento\\Store\\Model\\StoreResolver\\Group"
+        ));
+        assert!(matches!(
+            by_key.get("store").copied(),
+            Some(ResolvedArrayValue::Scalar(ResolvedScalar::String(v)))
+            if v == "Magento\\Store\\Model\\StoreResolver\\Store"
+        ));
+    }
+
+    #[test]
+    fn test_optional_constructor_short_array_default_is_parsed_as_plain_array() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\ArrayDefaults".to_string(),
+            make_class_with_constructor(
+                "App\\ArrayDefaults",
+                vec![ConstructorParam {
+                    name: "payload".to_string(),
+                    type_hint: None,
+                    is_optional: true,
+                    default_value: Some(
+                        "['a' => 'alpha', 'b' => 2, 'c' => ['d' => false], 'e' => null]".to_string(),
+                    ),
+                    is_primitive: false,
+                    is_variadic: false,
+                    is_promoted: false,
+                }],
+            ),
+        );
+
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &HashMap::new());
+        let args = &map["App\\ArrayDefaults"];
+        let payload = args.iter().find(|a| a.name == "payload").expect("payload arg");
+
+        let by_key: HashMap<_, _> = match &payload.resolved {
+            ResolvedArgValue::PlainArray(items) => {
+                items.iter().map(|i| (i.name.as_str(), &i.value)).collect()
+            }
+            other => panic!("expected plain array default, got {other:?}"),
+        };
+
+        assert!(matches!(
+            by_key.get("a").copied(),
+            Some(ResolvedArrayValue::Scalar(ResolvedScalar::String(v))) if v == "alpha"
+        ));
+        assert!(matches!(
+            by_key.get("b").copied(),
+            Some(ResolvedArrayValue::Scalar(ResolvedScalar::Number(v))) if v == "2"
+        ));
+        assert!(matches!(by_key.get("e").copied(), Some(ResolvedArrayValue::Null)));
+
+        let nested = by_key.get("c").copied().expect("nested c");
+        let nested_map: HashMap<_, _> = match nested {
+            ResolvedArrayValue::Array(items) => {
+                items.iter().map(|i| (i.name.as_str(), &i.value)).collect()
+            }
+            other => panic!("expected nested array, got {other:?}"),
+        };
+        assert!(matches!(
+            nested_map.get("d").copied(),
+            Some(ResolvedArrayValue::Scalar(ResolvedScalar::Bool(false)))
+        ));
     }
 }

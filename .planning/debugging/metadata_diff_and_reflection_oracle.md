@@ -217,3 +217,93 @@ Regression   → test for that exact pattern
 ```
 
 The counts are your scoreboard. Every fix should move at least one number to zero.
+
+---
+
+## Step 5: Type-Shape Content Diff (Critical Runtime Guard)
+
+### Why this matters
+
+A metadata entry can be "present" and still be wrong at runtime if the value type
+is wrong.
+
+Example incident:
+
+- `Magento\Store\Model\StoreResolver\ReaderList::resolverMap` was emitted as:
+  - `'_v_' => 'array (...)'` (string)
+- Magento expects:
+  - `'_v_' => [ ... ]` (actual PHP array)
+
+This produced frontend runtime failure:
+
+`TypeError: Cannot access offset of type string on string`  
+at `vendor/magento/module-store/Model/StoreResolver/ReaderList.php:50`
+
+So key existence parity is not enough. We need **shape parity** (type + structure).
+
+### Fast detection rules
+
+1. Hard-fail any stringified array in scalar slot:
+   - `'_v_' => 'array ('...`
+2. Hard-fail scalar/array type mismatch at the same key path between truth and rust.
+3. Keep ignoring map key order, but never ignore value type differences.
+
+### Minimal check script pattern (shape-focused)
+
+```php
+<?php
+$truth = include '/var/www/application/generated/_metadata/global.php';
+$ours  = include '/var/www/application/generated/metadata/global.php';
+
+$issues = [];
+
+$walk = function ($t, $o, $path = '') use (&$walk, &$issues) {
+    if (gettype($t) !== gettype($o)) {
+        $issues[] = "TYPE_MISMATCH $path truth=" . gettype($t) . " ours=" . gettype($o);
+        return;
+    }
+    if (!is_array($t)) return;
+
+    foreach ($t as $k => $tv) {
+        if (!array_key_exists($k, $o)) continue;
+        $ov = $o[$k];
+        $kp = $path === '' ? (string)$k : "$path.$k";
+        $walk($tv, $ov, $kp);
+    }
+};
+
+$walk($truth, $ours);
+foreach ($issues as $i) echo $i, "\n";
+```
+
+### Known high-risk symptom classes
+
+When this check fails, first validate these runtime-sensitive paths:
+
+- `StoreResolver` / scope resolution (`ReaderList::resolverMap`)
+- `ConfigSourceAggregated` source maps (`sortOrder` + `source` tuples)
+- command/config lists where many modules merge array values
+
+### Required smoke checks after metadata changes
+
+After each rebuild, run:
+
+1. `bin/magento list` (CLI bootstrap + command registry)
+2. one frontend bootstrap hit (store/scope resolver + config resolver path)
+
+These catch shape regressions that pure key-count diffs miss.
+
+### Round Results (2026-03-08)
+
+Type-aware comparison across all metadata files (`generated/_metadata` vs `generated/metadata`):
+
+- `string|integer`: 476
+- `integer|string`: 6
+- `NULL|array`: 51
+- `array|string` or `string|array`: 0
+
+Interpretation:
+
+- The **ReaderList-style fatal class** (array accidentally serialized as string) is currently **not present**.
+- Remaining high-risk shape differences are concentrated in `*plugin-list.php` section `1` entries where truth has `NULL` and rust has `array`.
+- Numeric scalar typing (`'10'` vs `10`) is still a content mismatch source; usually less fatal than structure mismatches but should stay tracked for parity.
