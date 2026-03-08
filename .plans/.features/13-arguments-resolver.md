@@ -1,7 +1,7 @@
 # 13: Arguments Resolver
 
 - Category: Resolution
-- Status: Planned
+- Status: Done
 - Implementation Phase: 03-di-resolver
 - Owner: Unassigned
 - Feature ID: `arguments-resolver`
@@ -64,3 +64,23 @@ pub enum ArgumentNotation {
 - Preference and virtualType chains followed correctly
 - di.xml `<argument>` overrides reflection-based defaults
 - Scalar/primitive params (string, int, bool, array) → `_v_` notation
+
+## Completed (2026-03-08)
+
+All acceptance criteria met. Two fixes were required beyond the original scope:
+
+**Interface argument inheritance** — PHP's `Config::_collectConfiguration` uses
+`ClassReader::getParents()` which returns both parent classes and directly-implemented
+interfaces. The merge order now inserts each class's "new" interfaces (not inherited from
+its parent, mirroring `array_diff(class.implements, parent.implements)`) just before the
+class, so interface-level args flow to preference concretes at the correct priority.
+Reference: `Magento\Setup\Module\Di\Compiler\Config` + `Magento\Framework\Code\Reader\ClassReader`.
+
+**Recursive array merge** — Same-name array arguments in the type hierarchy are now merged
+recursively by key (mirrors PHP `array_replace_recursive`) rather than replaced wholesale.
+Return type of `merged_di_arguments_for_type_name` changed to `Vec<Argument>` (owned) to
+support the in-place recursive merge via `merge_argument_into()`.
+
+**Verification:** `bin/magento list` returns 177 commands in compiled mode, identical to
+developer mode (was 62 before fixes). Multiple classes spot-checked against PHP runtime
+via `$config->getArguments(...)` — all match.

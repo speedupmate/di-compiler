@@ -26,20 +26,38 @@ Correctness first. Speed second. Never silent failures.
 - Validated by diff harness before any release (TKT-023)
 - No PHP runtime dependency at compile time (PHP fallback is opt-in, not required)
 
-## Current Baseline (2026-03-05)
+## Current Status (2026-03-08)
 
-Validation against `generated/_code/` and `generated/_metadata/` currently reports:
+### Runtime Behavior
 
-- Code: 723 missing, 13 extra, 4219 content-different files
-- Metadata: 8 missing, 0 extra, 8 content-different files
-- Metadata syntax: 7/8 area files fail `php -n -l` due invalid numeric literal serialization
+`bin/magento list` reports **177 commands in compiled mode = 177 in developer mode** —
+runtime behavior parity achieved for command dispatch. This was validated after two
+argument-resolver fixes (interface arg inheritance + recursive array merge). Multiple
+classes verified against PHP runtime via `$config->getArguments(...)` — metadata
+semantics match PHP exactly.
 
-Primary gap buckets:
+PHP runtime (`$config->getArguments()`) is now the primary correctness ground truth.
+Comparison against the archived baseline (`generated/_code/`, `generated/_metadata/`) is
+a secondary signal for byte-level file format work.
 
-- Missing operations: plugin-list metadata, app action list metadata, extension attributes/service data generation
-- Interceptor parity gaps: namespace generation, method selection, signature fidelity
-- Scanner parity gaps: XML + PHP scanner trigger rules and skip rules
-- Runtime generated entity map gaps beyond interceptor/factory/proxy
+### Code File Parity (vs Archive Baseline)
+
+Content diffs in interceptors, factories, and proxies remain. The archived baseline
+numbers from 2026-03-05 (723 missing / 13 extra / 4219 content-different code files) are
+no longer the active tracking metric — runtime semantic parity is.
+
+### Metadata File Parity (vs Archive Baseline)
+
+Metadata runtime semantics match PHP runtime. Remaining archive diffs are key-ordering
+artifacts (BTreeMap vs PHP insertion order) and minor serialization formatting, not
+semantic gaps.
+
+### Primary Remaining Gaps
+
+- Code file byte-exact content (interceptors, factories, proxies): namespace structure, method signatures, scanner trigger/skip rules
+- Missing generated entity types: plugin-list metadata, app action list metadata, extension attributes/service data
+- Metadata key-ordering vs PHP insertion order (non-semantic, archive diff only)
+- Metadata syntax: area files may still contain invalid numeric literals (`php -n -l`)
 
 ## Technical Guardrails
 

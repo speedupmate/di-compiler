@@ -72,7 +72,7 @@ pub fn resolve_for_class(
 ) -> Vec<ResolvedArg> {
     let di_args = merged_di_arguments_for_type_name(fqcn, class_map, di_config);
     let di_arg_map: HashMap<&str, &Argument> =
-        di_args.iter().map(|a| (argument_name(a), *a)).collect();
+        di_args.iter().map(|a| (argument_name(a), a)).collect();
     let Some(ctor) = &info.constructor else {
         return vec![];
     };
@@ -218,11 +218,11 @@ fn class_info_with_inherited_constructor(
     Some(info)
 }
 
-fn merged_di_arguments_for_type_name<'a>(
+fn merged_di_arguments_for_type_name(
     type_name: &str,
     class_map: &HashMap<String, ClassInfo>,
-    di_config: &'a DiConfig,
-) -> Vec<&'a Argument> {
+    di_config: &DiConfig,
+) -> Vec<Argument> {
     // Build the full type chain: PHP class hierarchy (root→leaf) followed by
     // the virtual-type chain for each entry.  More-specific types override
     // less-specific ones, so we process from least specific to most specific.
@@ -230,6 +230,15 @@ fn merged_di_arguments_for_type_name<'a>(
     // PHP's ArgumentsResolver walks the class hierarchy the same way: a
     // <type name="Parent"> di.xml override is inherited by all subclasses
     // unless the subclass declares its own override for that argument name.
+    //
+    // Additionally, PHP's Config::_collectConfiguration also recurses into
+    // implemented interfaces (via ClassReader::getParents which returns
+    // [parentClass, ...new_interfaces] or [null, ...interfaces]).  This means
+    // arguments registered on an interface (e.g. CommandListInterface) flow
+    // into the concrete preference class (e.g. CommandList).  We mirror this
+    // by inserting each class's "new" interfaces (not already in parent) just
+    // before the class in the hierarchy, giving interfaces lower priority than
+    // the class's own arguments.
 
     // 1. Collect the PHP extends chain for the concrete class that `type_name`
     //    resolves to.  The chain is ordered root-ancestor-first.
@@ -238,18 +247,40 @@ fn merged_di_arguments_for_type_name<'a>(
         normalize(vchain.last().unwrap_or(&type_name.to_string()))
     };
 
-    let mut class_hierarchy: Vec<String> = Vec::new();
+    let mut extends_chain: Vec<String> = Vec::new();
     {
         let mut cursor = concrete.clone();
         let mut seen: HashSet<String> = HashSet::new();
         while !cursor.is_empty() && seen.insert(cursor.clone()) {
-            class_hierarchy.push(cursor.clone());
+            extends_chain.push(cursor.clone());
             match class_map.get(&cursor).and_then(|i| i.extends.as_ref()) {
                 Some(parent) => cursor = normalize(parent),
                 None => break,
             }
         }
-        class_hierarchy.reverse(); // root-ancestor first (lowest priority)
+        extends_chain.reverse(); // root-ancestor first (lowest priority)
+    }
+
+    // 1b. Expand extends_chain to include interfaces "new" to each class level.
+    //     Mirrors PHP ClassReader::getParents: array_diff(class.implements, parent.implements).
+    //     Interfaces are inserted before the class so the class's own args win.
+    let mut class_hierarchy: Vec<String> = Vec::new();
+    {
+        let mut parent_implements: HashSet<String> = HashSet::new();
+        for class_name in &extends_chain {
+            if let Some(info) = class_map.get(class_name) {
+                let class_implements: HashSet<String> =
+                    info.implements.iter().map(|i| normalize(i)).collect();
+                let mut new_interfaces: Vec<String> = class_implements
+                    .difference(&parent_implements)
+                    .cloned()
+                    .collect();
+                new_interfaces.sort(); // stable ordering
+                class_hierarchy.extend(new_interfaces);
+                parent_implements = class_implements;
+            }
+            class_hierarchy.push(class_name.clone());
+        }
     }
 
     // 2. If `type_name` is a virtual type or differs from `concrete`, append it
@@ -260,7 +291,10 @@ fn merged_di_arguments_for_type_name<'a>(
 
     // 3. For each entry in the hierarchy, walk its virtual-type chain and merge
     //    arguments (later entries / more-specific names override earlier ones).
-    let mut merged: Vec<&'a Argument> = Vec::new();
+    //    For Array arguments, recursively merge items (matching PHP's array_replace_recursive
+    //    semantics) rather than replacing — this is critical for arguments like `commands`
+    //    that are contributed by many di.xml files across many modules.
+    let mut merged: Vec<Argument> = Vec::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
 
     for ancestor in &class_hierarchy {
@@ -269,16 +303,38 @@ fn merged_di_arguments_for_type_name<'a>(
             for arg in di_config.get_arguments(current) {
                 let name = argument_name(arg).to_string();
                 if let Some(idx) = by_name.get(&name).copied() {
-                    merged[idx] = arg;
+                    merge_argument_into(&mut merged[idx], arg);
                 } else {
                     by_name.insert(name, merged.len());
-                    merged.push(arg);
+                    merged.push(arg.clone());
                 }
             }
         }
     }
 
     merged
+}
+
+/// Merge `src` into `dst`.
+/// For Array arguments both sides are merged recursively by item name (same-name item wins src).
+/// All other types: src replaces dst.
+fn merge_argument_into(dst: &mut Argument, src: &Argument) {
+    match (dst, src) {
+        (
+            Argument::Array { items: dst_items, .. },
+            Argument::Array { items: src_items, .. },
+        ) => {
+            for src_item in src_items {
+                let name = argument_name(src_item).to_string();
+                if let Some(existing) = dst_items.iter_mut().find(|a| argument_name(a) == name) {
+                    merge_argument_into(existing, src_item);
+                } else {
+                    dst_items.push(src_item.clone());
+                }
+            }
+        }
+        (dst, src) => *dst = src.clone(),
+    }
 }
 
 fn virtual_type_chain(type_name: &str, di_config: &DiConfig) -> Vec<String> {
@@ -857,5 +913,208 @@ mod tests {
             ResolvedArgValue::GlobalArgRef { arg_name, default }
             if arg_name == "MAGE_MODE" && default.is_none()
         ));
+    }
+
+    #[test]
+    fn test_interface_arguments_merge_into_concrete_with_recursive_array_merge() {
+        let mut class_map = HashMap::new();
+        let mut command_list = make_class(
+            "Magento\\Framework\\Console\\CommandList",
+            vec![("commands", Some("array"))],
+        );
+        command_list.implements = vec!["Magento\\Framework\\Console\\CommandListInterface".to_string()];
+        class_map.insert(command_list.fqcn.clone(), command_list);
+
+        let mut di_config = DiConfig::default();
+        di_config.type_configs.insert(
+            "Magento\\Framework\\Console\\CommandListInterface".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "commands".to_string(),
+                    items: vec![
+                        Argument::Object {
+                            name: "core".to_string(),
+                            value: "Vendor\\Core\\Command".to_string(),
+                            shared: None,
+                        },
+                        Argument::Object {
+                            name: "override_me".to_string(),
+                            value: "Vendor\\Legacy\\Command".to_string(),
+                            shared: None,
+                        },
+                    ],
+                }],
+            },
+        );
+        di_config.type_configs.insert(
+            "Magento\\Framework\\Console\\CommandList".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "commands".to_string(),
+                    items: vec![
+                        Argument::Object {
+                            name: "local".to_string(),
+                            value: "Vendor\\Local\\Command".to_string(),
+                            shared: None,
+                        },
+                        Argument::Object {
+                            name: "override_me".to_string(),
+                            value: "Vendor\\New\\Command".to_string(),
+                            shared: None,
+                        },
+                    ],
+                }],
+            },
+        );
+
+        let resolved = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let args = resolved
+            .get("Magento\\Framework\\Console\\CommandList")
+            .expect("resolved arguments");
+        let commands = args
+            .iter()
+            .find(|a| a.name == "commands")
+            .expect("commands argument must exist");
+        let by_name: HashMap<_, _> = match &commands.resolved {
+            ResolvedArgValue::Array(items) => {
+                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
+            }
+            other => panic!("expected configured array for commands, got {other:?}"),
+        };
+
+        assert_eq!(by_name.len(), 3);
+        assert!(matches!(
+            by_name.get("core").copied(),
+            Some(ResolvedArgValue::SharedInstance(v)) if v == "Vendor\\Core\\Command"
+        ));
+        assert!(matches!(
+            by_name.get("local").copied(),
+            Some(ResolvedArgValue::SharedInstance(v)) if v == "Vendor\\Local\\Command"
+        ));
+        assert!(matches!(
+            by_name.get("override_me").copied(),
+            Some(ResolvedArgValue::SharedInstance(v)) if v == "Vendor\\New\\Command"
+        ));
+    }
+
+    #[test]
+    fn test_virtual_type_array_argument_merges_parent_sources_without_dropping_entries() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
+            make_class(
+                "Magento\\Framework\\App\\Config\\ConfigSourceAggregated",
+                vec![("sources", Some("array"))],
+            ),
+        );
+
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "systemConfigSnapshotSourceAggregated".to_string(),
+            di_xml_reader::VirtualType {
+                name: "systemConfigSnapshotSourceAggregated".to_string(),
+                type_name: "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
+            },
+        );
+        di_config.type_configs.insert(
+            "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "sources".to_string(),
+                    items: vec![
+                        Argument::Array {
+                            name: "modular".to_string(),
+                            items: vec![
+                                Argument::Object {
+                                    name: "source".to_string(),
+                                    value: "Magento\\Config\\App\\Config\\Source\\ModularConfigSource"
+                                        .to_string(),
+                                    shared: None,
+                                },
+                                Argument::String {
+                                    name: "sortOrder".to_string(),
+                                    value: "10".to_string(),
+                                },
+                            ],
+                        },
+                        Argument::Array {
+                            name: "dynamic".to_string(),
+                            items: vec![
+                                Argument::Object {
+                                    name: "source".to_string(),
+                                    value: "Magento\\Config\\App\\Config\\Source\\RuntimeConfigSource"
+                                        .to_string(),
+                                    shared: None,
+                                },
+                                Argument::String {
+                                    name: "sortOrder".to_string(),
+                                    value: "100".to_string(),
+                                },
+                            ],
+                        },
+                    ],
+                }],
+            },
+        );
+        di_config.type_configs.insert(
+            "systemConfigSnapshotSourceAggregated".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "sources".to_string(),
+                    items: vec![Argument::Array {
+                        name: "initial".to_string(),
+                        items: vec![
+                            Argument::Object {
+                                name: "source".to_string(),
+                                value: "Magento\\Config\\App\\Config\\Source\\InitialSnapshotConfigSource"
+                                    .to_string(),
+                                shared: None,
+                            },
+                            Argument::String {
+                                name: "sortOrder".to_string(),
+                                value: "1000".to_string(),
+                            },
+                        ],
+                    }],
+                }],
+            },
+        );
+
+        let resolved = resolve_all_arguments_for_named_types(
+            &["systemConfigSnapshotSourceAggregated".to_string()],
+            &class_map,
+            &di_config,
+            &HashMap::new(),
+        );
+        let args = resolved
+            .get("systemConfigSnapshotSourceAggregated")
+            .expect("resolved virtual type arguments");
+        let sources = args
+            .iter()
+            .find(|a| a.name == "sources")
+            .expect("sources argument must exist");
+        let by_name: HashMap<_, _> = match &sources.resolved {
+            ResolvedArgValue::Array(items) => {
+                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
+            }
+            other => panic!("expected configured array for sources, got {other:?}"),
+        };
+
+        assert_eq!(by_name.len(), 3);
+        for key in ["modular", "dynamic", "initial"] {
+            let entry = by_name.get(key).copied().expect("source entry");
+            let inner: HashMap<_, _> = match entry {
+                ResolvedArgValue::Array(items) => {
+                    items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
+                }
+                other => panic!("expected nested configured array for {key}, got {other:?}"),
+            };
+            assert!(inner.contains_key("source"));
+            assert!(inner.contains_key("sortOrder"));
+        }
     }
 }
