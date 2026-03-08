@@ -50,10 +50,22 @@ pub fn generate_area_config_with_extra_preferences(
     out.push_str("  ),\n");
 
     // Section: preferences
+    // Merge di.xml preferences with interception preferences (extra_preferences maps
+    // Concrete → Concrete\Interceptor). Also add VTs whose DIRECT type is an intercepted
+    // concrete — they get a preference entry pointing to the Interceptor.
     out.push_str("  'preferences' => \n  array (\n");
     let mut merged_preferences = di_config.preferences.clone();
     for (from, to) in extra_preferences {
         merged_preferences.insert(from.clone(), to.clone());
+    }
+    // VTs whose direct type_name is an intercepted concrete get a preference entry.
+    for (vt_name, vt) in &di_config.virtual_types {
+        let direct = vt.type_name.trim_start_matches('\\');
+        if let Some(interceptor) = extra_preferences.get(direct) {
+            merged_preferences
+                .entry(vt_name.clone())
+                .or_insert_with(|| interceptor.clone());
+        }
     }
     let mut sorted_prefs: Vec<(&String, &String)> = merged_preferences.iter().collect();
     sorted_prefs.sort_by_key(|(k, _)| k.as_str());
@@ -67,15 +79,24 @@ pub fn generate_area_config_with_extra_preferences(
     out.push_str("  ),\n");
 
     // Section: instanceTypes (virtualTypes)
+    // Config\Compiled::getInstanceType only follows ONE hop, so we must fully resolve
+    // VT chains here (VT → VT → Concrete becomes VT → Concrete).
     out.push_str("  'instanceTypes' => \n  array (\n");
-    let mut sorted_vt: Vec<(&String, &di_xml_reader::VirtualType)> =
-        di_config.virtual_types.iter().collect();
-    sorted_vt.sort_by_key(|(k, _)| k.as_str());
-    for (name, vt) in sorted_vt {
+    let mut sorted_vt: Vec<&String> = di_config.virtual_types.keys().collect();
+    sorted_vt.sort();
+    for name in sorted_vt {
+        // Follow VT chain to the final concrete type
+        let mut concrete = di_config.virtual_types[name].type_name.as_str();
+        let mut steps = 0;
+        while let Some(vt) = di_config.virtual_types.get(concrete) {
+            concrete = vt.type_name.as_str();
+            steps += 1;
+            if steps > 64 { break; } // guard against cycles
+        }
         out.push_str(&format!(
             "    '{}' => '{}',\n",
             escape_php(name),
-            escape_php(&vt.type_name)
+            escape_php(concrete)
         ));
     }
     out.push_str("  ),\n");

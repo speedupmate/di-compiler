@@ -1057,13 +1057,25 @@ fn main() {
         &args.magento_root,
         &args.fallback_php,
     );
+    // Second pass: reflect constructors for classes that appear in the argument
+    // type universe but whose constructor could not be found by our lexer because
+    // they inherit from a class outside our scan scope (e.g. PHP built-in \Exception,
+    // or a third-party library). We restrict this to argument_type_names to avoid
+    // reflecting every abstract base class in the codebase.
+    let reflected_inherited_ctors = enrich_inherited_constructors_with_reflection(
+        &mut metadata_class_map,
+        &argument_type_names,
+        &args.magento_root,
+        &args.fallback_php,
+    );
     log::info!(
-        "Metadata universe: args {} / interception {} type names (base {}, generated {}, ctor reflections {})",
+        "Metadata universe: args {} / interception {} type names (base {}, generated {}, ctor reflections {}, inherited reflections {})",
         argument_type_names.len(),
         interception_type_names.len(),
         interception_class_map.len(),
         generated_class_map.len(),
-        reflected_metadata_ctors
+        reflected_metadata_ctors,
+        reflected_inherited_ctors
     );
     let interception_preferences = build_interception_preferences(&interceptors, &metadata_base_di_config);
     let all_fqcns = build_interception_registry(
@@ -1437,6 +1449,56 @@ fn enrich_constructor_defaults_with_reflection(
     reflected.len()
 }
 
+/// Reflect constructors for concrete classes that are in `type_names` but whose
+/// constructor was not found by our lexer (likely inherited from a class outside
+/// our scan scope such as a PHP built-in or third-party library).
+///
+/// Only considers non-abstract classes that explicitly extend something —
+/// classes with no `extends` clause and no constructor genuinely have no params.
+fn enrich_inherited_constructors_with_reflection(
+    class_map: &mut HashMap<String, ClassInfo>,
+    type_names: &[String],
+    magento_root: &Path,
+    php_bin: &str,
+) -> usize {
+    let candidates: Vec<String> = type_names
+        .iter()
+        .filter_map(|fqcn| {
+            let info = class_map.get(fqcn)?;
+            // Only concrete classes with no ctor found that extend something.
+            if info.constructor.is_some() || info.is_abstract || info.extends.is_none() {
+                return None;
+            }
+            Some(fqcn.clone())
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let reflected: HashMap<String, Vec<ConstructorParam>> = candidates
+        .par_iter()
+        .filter_map(|fqcn| {
+            let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
+            if params.is_empty() {
+                return None; // no-arg constructor — not useful to store
+            }
+            Some((fqcn.clone(), params))
+        })
+        .collect();
+
+    for (fqcn, params) in &reflected {
+        if let Some(info) = class_map.get_mut(fqcn) {
+            info.constructor = Some(Constructor {
+                params: params.clone(),
+            });
+        }
+    }
+
+    reflected.len()
+}
+
 fn constructor_defaults_need_constant_reflection(params: &[ConstructorParam]) -> bool {
     params.iter().any(|p| {
         p.default_value
@@ -1488,16 +1550,53 @@ fn build_argument_type_names(
     proxy_deferred: &[ProxyDeferredSpec],
     extension_specs: &[ExtensionSpec],
 ) -> Vec<String> {
+    // Intercepted concrete classes must NOT appear in arguments under their own name —
+    // their args are compiled under ClassName\Interceptor instead.
+    let intercepted_fqcns: HashSet<String> = interceptors
+        .iter()
+        .map(|spec| spec.fqcn.trim_start_matches('\\').to_string())
+        .collect();
+
     let mut names: HashSet<String> = HashSet::new();
 
-    names.extend(base_class_map.keys().cloned());
+    // Include all scanned classes (abstract and concrete) except intercepted concretes.
+    // PHP's DI compiler includes abstract classes in the arguments universe.
+    // Generated classes (interceptors, factories, proxies) are never abstract.
+    names.extend(
+        base_class_map
+            .iter()
+            .filter(|(fqcn, _)| !intercepted_fqcns.contains(*fqcn))
+            .map(|(fqcn, _)| fqcn.clone()),
+    );
     names.extend(generated_class_map.keys().cloned());
-    names.extend(di_config.virtual_types.keys().cloned());
-    names.extend(di_config.type_configs.keys().cloned());
+    // Virtual types: include only if their DIRECT type is NOT an intercepted concrete.
+    // (VTs whose direct type is a VT pointing to an intercepted concrete ARE included.)
+    for (vt_name, vt) in &di_config.virtual_types {
+        let direct_type = vt.type_name.trim_start_matches('\\');
+        if !intercepted_fqcns.contains(direct_type) {
+            names.insert(vt_name.clone());
+        }
+    }
+    // type_configs: include all except intercepted or VTs-with-intercepted-direct-type.
+    names.extend(
+        di_config.type_configs.keys().filter(|fqcn| {
+            if intercepted_fqcns.contains(*fqcn) {
+                return false;
+            }
+            // If this is a VT whose direct type is an intercepted concrete, exclude it.
+            if let Some(vt) = di_config.virtual_types.get(*fqcn) {
+                let direct_type = vt.type_name.trim_start_matches('\\');
+                if intercepted_fqcns.contains(direct_type) {
+                    return false;
+                }
+            }
+            true
+        }).cloned(),
+    );
 
     for spec in interceptors {
         let target = spec.fqcn.trim_start_matches('\\').to_string();
-        names.insert(target.clone());
+        // Only the Interceptor variant appears in arguments, not the concrete class itself.
         names.insert(format!("{target}\\Interceptor"));
     }
 
@@ -1577,20 +1676,13 @@ fn build_interception_preferences(
         })
         .collect();
 
-    let intercepted: HashSet<String> = map.keys().cloned().collect();
-
-    // Virtual types whose concrete is intercepted go in the preferences section
-    // (not instanceTypes) and are filtered from the arguments section.
-    // e.g. AdyenPaymentAchFacade (VT → Adapter) where Adapter is intercepted
-    //   => add AdyenPaymentAchFacade → Adapter\Interceptor to preferences
+    // Virtual types whose DIRECT type is an intercepted concrete also get a mapping.
+    // This ensures that when argument resolution calls get_preference(vt_name), it
+    // correctly resolves to the Interceptor (not the bare VT name).
     for (vt_name, vt) in &di_config.virtual_types {
-        let vt_name = vt_name.trim_start_matches('\\');
-        if map.contains_key(vt_name) {
-            continue;
-        }
-        let concrete = vt.type_name.trim_start_matches('\\');
-        if intercepted.contains(concrete) {
-            map.insert(vt_name.to_string(), format!("{concrete}\\Interceptor"));
+        let direct = vt.type_name.trim_start_matches('\\');
+        if let Some(interceptor) = map.get(direct).cloned() {
+            map.entry(vt_name.clone()).or_insert(interceptor);
         }
     }
 
