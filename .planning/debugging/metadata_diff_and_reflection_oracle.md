@@ -293,7 +293,7 @@ After each rebuild, run:
 
 These catch shape regressions that pure key-count diffs miss.
 
-### Round Results (2026-03-08)
+### Round 1 Results (2026-03-08, before numeric fixes)
 
 Type-aware comparison across all metadata files (`generated/_metadata` vs `generated/metadata`):
 
@@ -302,8 +302,48 @@ Type-aware comparison across all metadata files (`generated/_metadata` vs `gener
 - `NULL|array`: 51
 - `array|string` or `string|array`: 0
 
-Interpretation:
+### Round 2 Results (2026-03-08, after numeric type + comment-strip fixes)
 
-- The **ReaderList-style fatal class** (array accidentally serialized as string) is currently **not present**.
-- Remaining high-risk shape differences are concentrated in `*plugin-list.php` section `1` entries where truth has `NULL` and rust has `array`.
-- Numeric scalar typing (`'10'` vs `10`) is still a content mismatch source; usually less fatal than structure mismatches but should stay tracked for parity.
+- `string|integer`: **0** ✓
+- `integer|string`: **0** ✓
+- `NULL|array`: **51** (unchanged, functionally harmless — see below)
+- `array|string` or `string|array`: **0** ✓
+
+### Fixes applied
+
+**string|integer (476 → 0)**: `xsi:type="number"` in di.xml stored as string.
+PHP's `Number::evaluate()` returns raw XML text string (not cast to int/float).
+`var_export()` then quotes it. Fix: di-xml-reader parser now emits `xsi:type="number"`
+as `Argument::String` (not `Argument::Number`). PHP constants that resolve to integers
+still use `Argument::Number` via constant-resolution path, remaining unquoted.
+
+**integer|string (6 → 0)**: Constructor default `3145728 // 3mb` — tier-1 lexer
+captured PHP line comment as part of default value string. Fix: `read_default_value`
+breaks at `//` or `#`, leaving pos at comment start for outer loop's `skip_noise`.
+
+### Remaining: NULL|array (51, plugin-list section 1)
+
+Pattern: truth has `null`, ours has array of plugins for interface/disabled-plugin types.
+
+Affected types fall into two categories:
+1. **Marker interfaces** (`HttpPostActionInterface`, `HttpGetActionInterface`,
+   `HttpHeadActionInterface`, `CsrfAwareActionInterface`, `OrderInterface`,
+   `WishlistController\IndexInterface`) — extend `ActionInterface` which has plugins.
+   PHP stores null because compiled Relations has no entry for interfaces; our code
+   walks the class map and inherits plugins from `ActionInterface`.
+2. **Abstract collection** types (`Eav/Catalog/Sales AbstractCollection`) in scopes
+   where `currentPageDetection` plugin is disabled — PHP strips disabled plugins from
+   return value of `inheritPlugins`, making children resolve to null; our code includes
+   disabled plugins in the inherited return value.
+
+**Runtime impact**: None expected. Plugin lookup at runtime uses concrete class names
+(never interface names). Concrete classes that implement these interfaces have their own
+correct entries in section 1. The interface entries are never looked up by `getNext()`.
+
+**Root cause** (for reference, not yet fixed):
+- PHP `PluginListGenerator::inheritPlugins()` returns `$plugins` AFTER `unset`ing
+  disabled entries (line 342), so caller sees empty array → children inherit nothing.
+- Compiled Relations doesn't include interfaces → `relations->has(interface)` = false
+  → interface resolves via `pluginData[$type]` only (no parent traversal).
+  PHP DOES visit interfaces (they appear as parents of concrete types in `getParents()`),
+  but since `relations->has(interface)` = false in some contexts, they get `null`.

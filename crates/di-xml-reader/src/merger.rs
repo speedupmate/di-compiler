@@ -73,7 +73,14 @@ fn merge_type_config(dst: &mut TypeConfig, src: TypeConfig) {
 /// All other types: last-wins (src replaces dst).
 fn merge_argument(dst: &mut Argument, src: Argument) {
     match (dst, src) {
-        (Argument::Array { items: dst_items, .. }, Argument::Array { items: src_items, .. }) => {
+        (
+            Argument::Array {
+                items: dst_items, ..
+            },
+            Argument::Array {
+                items: src_items, ..
+            },
+        ) => {
             for src_item in src_items {
                 let name = arg_name(&src_item).to_string();
                 if let Some(existing) = dst_items.iter_mut().find(|a| arg_name(a) == name) {

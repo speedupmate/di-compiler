@@ -91,7 +91,9 @@ pub fn generate_area_config_with_extra_preferences(
         while let Some(vt) = di_config.virtual_types.get(concrete) {
             concrete = vt.type_name.as_str();
             steps += 1;
-            if steps > 64 { break; } // guard against cycles
+            if steps > 64 {
+                break;
+            } // guard against cycles
         }
         out.push_str(&format!(
             "    '{}' => '{}',\n",
@@ -204,14 +206,24 @@ fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, i
             out.push_str(&format!("{}'{}' => NULL,\n", pad, escape_php(name)));
         }
         Array(items) => {
-            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n",
+                pad,
+                escape_php(name),
+                pad
+            ));
             for item in items {
                 serialize_vac_entry(out, &item.name, &item.resolved, indent + 2);
             }
             out.push_str(&format!("{}),\n", pad));
         }
         PlainArray(items) => {
-            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n",
+                pad,
+                escape_php(name),
+                pad
+            ));
             serialize_plain_array_items(out, items, indent + 2);
             out.push_str(&format!("{}),\n", pad));
         }

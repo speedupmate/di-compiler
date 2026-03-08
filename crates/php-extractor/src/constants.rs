@@ -78,7 +78,10 @@ impl<'a> ConstScanner<'a> {
         while !self.is_eof() {
             match self.peek() {
                 b'\\' => self.advance(2),
-                b'\'' => { self.advance(1); return; }
+                b'\'' => {
+                    self.advance(1);
+                    return;
+                }
                 _ => self.advance(1),
             }
         }
@@ -88,7 +91,10 @@ impl<'a> ConstScanner<'a> {
         while !self.is_eof() {
             match self.peek() {
                 b'\\' => self.advance(2),
-                b'"' => { self.advance(1); return; }
+                b'"' => {
+                    self.advance(1);
+                    return;
+                }
                 _ => self.advance(1),
             }
         }
@@ -112,18 +118,36 @@ impl<'a> ConstScanner<'a> {
         // pos is already past the opening '
         let mut out = Vec::new();
         loop {
-            if self.is_eof() { return None; }
+            if self.is_eof() {
+                return None;
+            }
             match self.peek() {
                 b'\\' => {
                     self.advance(1);
                     match self.peek() {
-                        b'\'' => { out.push(b'\''); self.advance(1); }
-                        b'\\' => { out.push(b'\\'); self.advance(1); }
-                        other => { out.push(b'\\'); out.push(other); self.advance(1); }
+                        b'\'' => {
+                            out.push(b'\'');
+                            self.advance(1);
+                        }
+                        b'\\' => {
+                            out.push(b'\\');
+                            self.advance(1);
+                        }
+                        other => {
+                            out.push(b'\\');
+                            out.push(other);
+                            self.advance(1);
+                        }
                     }
                 }
-                b'\'' => { self.advance(1); break; }
-                b => { out.push(b); self.advance(1); }
+                b'\'' => {
+                    self.advance(1);
+                    break;
+                }
+                b => {
+                    out.push(b);
+                    self.advance(1);
+                }
             }
         }
         String::from_utf8(out).ok()
@@ -134,17 +158,38 @@ impl<'a> ConstScanner<'a> {
     fn read_dq_string(&mut self) -> Option<String> {
         let mut out = Vec::new();
         loop {
-            if self.is_eof() { return None; }
+            if self.is_eof() {
+                return None;
+            }
             match self.peek() {
                 b'\\' => {
                     self.advance(1);
                     match self.peek() {
-                        b'"'  => { out.push(b'"');  self.advance(1); }
-                        b'\\' => { out.push(b'\\'); self.advance(1); }
-                        b'n'  => { out.push(b'\n'); self.advance(1); }
-                        b't'  => { out.push(b'\t'); self.advance(1); }
-                        b'r'  => { out.push(b'\r'); self.advance(1); }
-                        other => { out.push(b'\\'); out.push(other); self.advance(1); }
+                        b'"' => {
+                            out.push(b'"');
+                            self.advance(1);
+                        }
+                        b'\\' => {
+                            out.push(b'\\');
+                            self.advance(1);
+                        }
+                        b'n' => {
+                            out.push(b'\n');
+                            self.advance(1);
+                        }
+                        b't' => {
+                            out.push(b'\t');
+                            self.advance(1);
+                        }
+                        b'r' => {
+                            out.push(b'\r');
+                            self.advance(1);
+                        }
+                        other => {
+                            out.push(b'\\');
+                            out.push(other);
+                            self.advance(1);
+                        }
                     }
                 }
                 b'$' | b'{' => {
@@ -162,8 +207,14 @@ impl<'a> ConstScanner<'a> {
                     }
                     return None;
                 }
-                b'"' => { self.advance(1); break; }
-                b => { out.push(b); self.advance(1); }
+                b'"' => {
+                    self.advance(1);
+                    break;
+                }
+                b => {
+                    out.push(b);
+                    self.advance(1);
+                }
             }
         }
         String::from_utf8(out).ok()
@@ -172,18 +223,29 @@ impl<'a> ConstScanner<'a> {
     fn scan(&mut self, result: &mut HashMap<String, String>) {
         while !self.is_eof() {
             match self.peek() {
-                b'\'' => { self.advance(1); self.skip_sq_string(); }
-                b'"'  => { self.advance(1); self.skip_dq_string(); }
-                b'/'  => {
+                b'\'' => {
+                    self.advance(1);
+                    self.skip_sq_string();
+                }
+                b'"' => {
+                    self.advance(1);
+                    self.skip_dq_string();
+                }
+                b'/' => {
                     if self.at(1) == b'/' {
-                        self.advance(2); self.skip_line_comment();
+                        self.advance(2);
+                        self.skip_line_comment();
                     } else if self.at(1) == b'*' {
-                        self.advance(2); self.skip_block_comment();
+                        self.advance(2);
+                        self.skip_block_comment();
                     } else {
                         self.advance(1);
                     }
                 }
-                b'#'  => { self.advance(1); self.skip_line_comment(); }
+                b'#' => {
+                    self.advance(1);
+                    self.skip_line_comment();
+                }
                 b if b.is_ascii_alphabetic() || b == b'_' => {
                     let start = self.pos;
                     let ident = self.read_ident();
@@ -196,7 +258,7 @@ impl<'a> ConstScanner<'a> {
         }
     }
 
-fn try_read_const(&mut self, _start: usize, result: &mut HashMap<String, String>) {
+    fn try_read_const(&mut self, _start: usize, result: &mut HashMap<String, String>) {
         // Skip whitespace after `const`
         self.skip_ws();
         // Read constant name

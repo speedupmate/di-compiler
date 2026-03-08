@@ -78,8 +78,7 @@ pub fn detect_factories_from_configs(
         // almost certainly a use-import resolution bug in our lexer. Suppress it
         // only when a class with the same simple name already exists somewhere in
         // the class map (meaning the type hint resolved to the wrong namespace).
-        if !factory_fqcn.contains('\\')
-            && class_map.values().any(|info| info.name == factory_fqcn)
+        if !factory_fqcn.contains('\\') && class_map.values().any(|info| info.name == factory_fqcn)
         {
             return;
         }

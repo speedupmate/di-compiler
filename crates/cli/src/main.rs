@@ -10,7 +10,7 @@
 //!   7. Generate metadata files (area configs, interception.php)
 //!   8. Incremental writes (skip unchanged — TKT-022/026)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -495,8 +495,7 @@ fn main() {
     // -----------------------------------------------------------------------
     let phase_3a_started = Instant::now();
     let enabled_modules = load_module_order_from_config_php(&magento_root);
-    let di_xml_files =
-        filter_enabled_di_xml(find_di_xml_files(&magento_root), &enabled_modules);
+    let di_xml_files = filter_enabled_di_xml(find_di_xml_files(&magento_root), &enabled_modules);
     log::info!("Found {} di.xml files (global)", di_xml_files.len());
 
     let pb = progress_bar(di_xml_files.len() as u64, "Parsing di.xml (global)");
@@ -752,8 +751,12 @@ fn main() {
 
         let mut map = HashMap::new();
         for expr in &init_exprs {
-            let Some((class_name, const_name)) = expr.split_once("::") else { continue };
-            let Some(info) = class_map.get(class_name) else { continue };
+            let Some((class_name, const_name)) = expr.split_once("::") else {
+                continue;
+            };
+            let Some(info) = class_map.get(class_name) else {
+                continue;
+            };
             let constants = extract_string_constants(&info.path);
             if let Some(value) = constants.get(const_name) {
                 map.insert(expr.clone(), value.clone());
@@ -761,7 +764,10 @@ fn main() {
         }
         map
     };
-    log::info!("Resolved {} PHP constant expressions for init_parameter", const_map.len());
+    log::info!(
+        "Resolved {} PHP constant expressions for init_parameter",
+        const_map.len()
+    );
 
     let args_map = resolve_all_arguments(&class_map, &di_config, &const_map); // global only; per-area overrides applied later
     log::info!("Resolved arguments for {} classes", args_map.len());
@@ -924,7 +930,11 @@ fn main() {
                 // Reflection order/surface is Magento's source of truth for
                 // proxy methods (declaration order including inherited publics).
                 let mut methods = reflected_methods.clone();
-                if let Some(pos) = info.public_methods.iter().position(|m| m.name == "_resetState") {
+                if let Some(pos) = info
+                    .public_methods
+                    .iter()
+                    .position(|m| m.name == "_resetState")
+                {
                     if !methods.iter().any(|m| m.name == "_resetState") {
                         methods.insert(
                             pos.min(methods.len()),
@@ -1077,7 +1087,8 @@ fn main() {
         reflected_metadata_ctors,
         reflected_inherited_ctors
     );
-    let interception_preferences = build_interception_preferences(&interceptors, &metadata_base_di_config);
+    let interception_preferences =
+        build_interception_preferences(&interceptors, &metadata_base_di_config);
     let all_fqcns = build_interception_registry(
         &interception_type_names,
         &interceptors,
@@ -1225,7 +1236,12 @@ fn main() {
             .compare_report_dir
             .clone()
             .unwrap_or_else(|| generated_root.join("diff"));
-        match compare_against_archive(&generated_root, &archive_root, &report_dir) {
+        match compare_against_archive(
+            &generated_root,
+            &archive_root,
+            &report_dir,
+            &args.fallback_php,
+        ) {
             Ok(summary) => {
                 log::info!(
                     "Archive diff: code missing {}, code extra {}, code changed {}, metadata missing {}, metadata extra {}, metadata changed {} (reports: {})",
@@ -1579,19 +1595,23 @@ fn build_argument_type_names(
     }
     // type_configs: include all except intercepted or VTs-with-intercepted-direct-type.
     names.extend(
-        di_config.type_configs.keys().filter(|fqcn| {
-            if intercepted_fqcns.contains(*fqcn) {
-                return false;
-            }
-            // If this is a VT whose direct type is an intercepted concrete, exclude it.
-            if let Some(vt) = di_config.virtual_types.get(*fqcn) {
-                let direct_type = vt.type_name.trim_start_matches('\\');
-                if intercepted_fqcns.contains(direct_type) {
+        di_config
+            .type_configs
+            .keys()
+            .filter(|fqcn| {
+                if intercepted_fqcns.contains(*fqcn) {
                     return false;
                 }
-            }
-            true
-        }).cloned(),
+                // If this is a VT whose direct type is an intercepted concrete, exclude it.
+                if let Some(vt) = di_config.virtual_types.get(*fqcn) {
+                    let direct_type = vt.type_name.trim_start_matches('\\');
+                    if intercepted_fqcns.contains(direct_type) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned(),
     );
 
     for spec in interceptors {
@@ -1756,6 +1776,7 @@ fn compare_against_archive(
     output_root: &Path,
     archive_root: &Path,
     report_dir: &Path,
+    php_bin: &str,
 ) -> std::io::Result<ArchiveCompareSummary> {
     let archive_code = archive_root.join("_code");
     let archive_metadata = archive_root.join("_metadata");
@@ -1794,6 +1815,7 @@ fn compare_against_archive(
         &report_dir.join("metadata.changed.txt"),
         &metadata_diff.changed,
     )?;
+    write_comparable_metadata_reports(&archive_metadata, &output_metadata, report_dir, php_bin)?;
 
     let summary = ArchiveCompareSummary {
         code_missing: code_diff.missing.len(),
@@ -1807,6 +1829,554 @@ fn compare_against_archive(
     std::fs::write(report_dir.join("summary.json"), summary_json)?;
 
     Ok(summary)
+}
+
+fn write_comparable_metadata_reports(
+    archive_metadata_dir: &Path,
+    output_metadata_dir: &Path,
+    report_dir: &Path,
+    php_bin: &str,
+) -> std::io::Result<()> {
+    let archive_files = collect_relative_files(archive_metadata_dir)?;
+    let output_files = collect_relative_files(output_metadata_dir)?;
+    let mut common: Vec<String> = archive_files.intersection(&output_files).cloned().collect();
+    common.sort();
+
+    let comparable_dir = report_dir.join("comparable_metadata");
+    std::fs::create_dir_all(&comparable_dir)?;
+
+    let mut manifest = String::new();
+    for rel in common {
+        let archive_src = archive_metadata_dir.join(&rel);
+        let output_src = output_metadata_dir.join(&rel);
+        let stem = comparable_metadata_stem(&rel);
+        let archive_dst = comparable_dir.join(format!("{stem}.archive.json"));
+        let output_dst = comparable_dir.join(format!("{stem}.output.json"));
+        let archive_json = normalize_metadata_to_json_bytes(&archive_src, php_bin)?;
+        let output_json = normalize_metadata_to_json_bytes(&output_src, php_bin)?;
+        std::fs::write(&archive_dst, &archive_json)?;
+        std::fs::write(&output_dst, &output_json)?;
+
+        let report = build_comparable_metadata_report(&rel, &archive_json, &output_json)?;
+        let report_json = serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|_| "{\"error\":\"serialize\"}".to_string());
+        let report_dst = comparable_dir.join(format!("{stem}_report.json"));
+        std::fs::write(&report_dst, report_json)?;
+        let text_report = render_comparable_metadata_report_text(&report);
+        let text_report_dst = comparable_dir.join(format!("{stem}_report.txt"));
+        std::fs::write(&text_report_dst, text_report)?;
+
+        manifest.push_str(&format!(
+            "{rel}\t{stem}\t{}.archive.json\t{}.output.json\t{}_report.json\t{}_report.txt\n",
+            stem, stem, stem, stem
+        ));
+    }
+    std::fs::write(comparable_dir.join("manifest.txt"), manifest)?;
+
+    Ok(())
+}
+
+fn comparable_metadata_stem(rel: &str) -> String {
+    let safe = rel.replace(['/', '\\'], "__");
+    format!("comparable_{safe}")
+}
+
+fn normalize_metadata_to_json_bytes(src: &Path, php_bin: &str) -> std::io::Result<Vec<u8>> {
+    let script = r#"
+$file = $argv[1] ?? '';
+if ($file === '' || !is_file($file)) {
+    fwrite(STDERR, "missing metadata file\n");
+    exit(2);
+}
+$data = include $file;
+$normalize = function ($value) use (&$normalize) {
+    if (!is_array($value)) {
+        return $value;
+    }
+    if (array_is_list($value)) {
+        $out = [];
+        foreach ($value as $item) {
+            $out[] = $normalize($item);
+        }
+        return $out;
+    }
+    $keys = array_keys($value);
+    usort($keys, function ($a, $b) {
+        return strcmp((string)$a, (string)$b);
+    });
+    $out = [];
+    foreach ($keys as $key) {
+        $out[$key] = $normalize($value[$key]);
+    }
+    return $out;
+};
+$normalized = $normalize($data);
+$json = json_encode(
+    $normalized,
+    JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+);
+if ($json === false) {
+    fwrite(STDERR, "json_encode failed\n");
+    exit(3);
+}
+echo $json, "\n";
+"#;
+
+    let output = Command::new(php_bin)
+        .arg("-r")
+        .arg(script)
+        .arg(src.as_os_str())
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "failed to normalize metadata {}: {}",
+                src.display(),
+                stderr.trim()
+            ),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ComparableMetadataReport {
+    file: String,
+    summary: ComparableReportSummary,
+    sections: BTreeMap<String, ComparableReportSummary>,
+    type_mismatches_by_pair: BTreeMap<String, usize>,
+    high_risk_mismatches_sample: Vec<ComparableTypeMismatchSample>,
+    missing_paths_sample: Vec<String>,
+    extra_paths_sample: Vec<String>,
+    value_mismatches_sample: Vec<ComparableValueMismatchSample>,
+    severity_score: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct ComparableReportSummary {
+    missing_paths: usize,
+    extra_paths: usize,
+    type_mismatches: usize,
+    value_mismatches: usize,
+    high_risk_mismatches: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ComparableTypeMismatchSample {
+    path: String,
+    truth_type: String,
+    output_type: String,
+    pair: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ComparableValueMismatchSample {
+    path: String,
+    truth: String,
+    output: String,
+}
+
+#[derive(Default)]
+struct ComparableReportAccumulator {
+    summary: ComparableReportSummary,
+    sections: HashMap<String, ComparableReportSummary>,
+    type_mismatches_by_pair: HashMap<String, usize>,
+    high_risk_mismatches_sample: Vec<ComparableTypeMismatchSample>,
+    missing_paths_sample: Vec<String>,
+    extra_paths_sample: Vec<String>,
+    value_mismatches_sample: Vec<ComparableValueMismatchSample>,
+}
+
+fn build_comparable_metadata_report(
+    file: &str,
+    archive_json: &[u8],
+    output_json: &[u8],
+) -> std::io::Result<ComparableMetadataReport> {
+    let truth: serde_json::Value = serde_json::from_slice(archive_json).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to parse archive comparable json for {}: {e}", file),
+        )
+    })?;
+    let ours: serde_json::Value = serde_json::from_slice(output_json).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to parse output comparable json for {}: {e}", file),
+        )
+    })?;
+
+    let mut acc = ComparableReportAccumulator::default();
+    compare_json_values(&truth, &ours, "", &mut acc);
+    let severity_score = (acc.summary.high_risk_mismatches as u64) * 100
+        + (acc.summary.type_mismatches as u64) * 10
+        + (acc.summary.value_mismatches as u64)
+        + (acc.summary.missing_paths as u64)
+        + (acc.summary.extra_paths as u64);
+
+    let mut sections = BTreeMap::new();
+    for (k, v) in acc.sections {
+        sections.insert(k, v);
+    }
+    let mut type_mismatches_by_pair = BTreeMap::new();
+    for (k, v) in acc.type_mismatches_by_pair {
+        type_mismatches_by_pair.insert(k, v);
+    }
+
+    Ok(ComparableMetadataReport {
+        file: file.to_string(),
+        summary: acc.summary,
+        sections,
+        type_mismatches_by_pair,
+        high_risk_mismatches_sample: acc.high_risk_mismatches_sample,
+        missing_paths_sample: acc.missing_paths_sample,
+        extra_paths_sample: acc.extra_paths_sample,
+        value_mismatches_sample: acc.value_mismatches_sample,
+        severity_score,
+    })
+}
+
+fn compare_json_values(
+    truth: &serde_json::Value,
+    ours: &serde_json::Value,
+    path: &str,
+    acc: &mut ComparableReportAccumulator,
+) {
+    const SAMPLE_LIMIT: usize = 200;
+
+    let truth_ty = json_type_name(truth);
+    let ours_ty = json_type_name(ours);
+    if truth_ty != ours_ty {
+        let pair = format!("{truth_ty}|{ours_ty}");
+        acc.summary.type_mismatches += 1;
+        increment_section(acc, path, |s| s.type_mismatches += 1);
+        *acc.type_mismatches_by_pair.entry(pair.clone()).or_insert(0) += 1;
+        let high_risk = is_high_risk_pair(truth_ty, ours_ty);
+        if high_risk {
+            acc.summary.high_risk_mismatches += 1;
+            increment_section(acc, path, |s| s.high_risk_mismatches += 1);
+            if acc.high_risk_mismatches_sample.len() < SAMPLE_LIMIT {
+                acc.high_risk_mismatches_sample
+                    .push(ComparableTypeMismatchSample {
+                        path: path.to_string(),
+                        truth_type: truth_ty.to_string(),
+                        output_type: ours_ty.to_string(),
+                        pair,
+                    });
+            }
+        }
+        return;
+    }
+
+    match (truth, ours) {
+        (serde_json::Value::Object(t), serde_json::Value::Object(o)) => {
+            for (k, tv) in t {
+                let child_path = join_object_path(path, k);
+                if let Some(ov) = o.get(k) {
+                    compare_json_values(tv, ov, &child_path, acc);
+                } else {
+                    acc.summary.missing_paths += 1;
+                    increment_section(acc, &child_path, |s| s.missing_paths += 1);
+                    if acc.missing_paths_sample.len() < SAMPLE_LIMIT {
+                        acc.missing_paths_sample.push(child_path);
+                    }
+                }
+            }
+            for k in o.keys() {
+                if !t.contains_key(k) {
+                    let child_path = join_object_path(path, k);
+                    acc.summary.extra_paths += 1;
+                    increment_section(acc, &child_path, |s| s.extra_paths += 1);
+                    if acc.extra_paths_sample.len() < SAMPLE_LIMIT {
+                        acc.extra_paths_sample.push(child_path);
+                    }
+                }
+            }
+        }
+        (serde_json::Value::Array(t), serde_json::Value::Array(o)) => {
+            let shared = std::cmp::min(t.len(), o.len());
+            for idx in 0..shared {
+                let child_path = join_array_path(path, idx);
+                compare_json_values(&t[idx], &o[idx], &child_path, acc);
+            }
+            for idx in shared..t.len() {
+                let child_path = join_array_path(path, idx);
+                acc.summary.missing_paths += 1;
+                increment_section(acc, &child_path, |s| s.missing_paths += 1);
+                if acc.missing_paths_sample.len() < SAMPLE_LIMIT {
+                    acc.missing_paths_sample.push(child_path);
+                }
+            }
+            for idx in shared..o.len() {
+                let child_path = join_array_path(path, idx);
+                acc.summary.extra_paths += 1;
+                increment_section(acc, &child_path, |s| s.extra_paths += 1);
+                if acc.extra_paths_sample.len() < SAMPLE_LIMIT {
+                    acc.extra_paths_sample.push(child_path);
+                }
+            }
+        }
+        _ => {
+            if truth != ours {
+                acc.summary.value_mismatches += 1;
+                increment_section(acc, path, |s| s.value_mismatches += 1);
+                if acc.value_mismatches_sample.len() < SAMPLE_LIMIT {
+                    acc.value_mismatches_sample
+                        .push(ComparableValueMismatchSample {
+                            path: path.to_string(),
+                            truth: compact_json_value(truth),
+                            output: compact_json_value(ours),
+                        });
+                }
+            }
+        }
+    }
+}
+
+fn increment_section<F>(acc: &mut ComparableReportAccumulator, path: &str, f: F)
+where
+    F: FnOnce(&mut ComparableReportSummary),
+{
+    let key = section_from_path(path);
+    let entry = acc.sections.entry(key).or_default();
+    f(entry);
+}
+
+fn section_from_path(path: &str) -> String {
+    if path.is_empty() {
+        return "root".to_string();
+    }
+    if let Some(rest) = path.strip_prefix('[') {
+        return if rest.is_empty() {
+            "list".to_string()
+        } else {
+            "list".to_string()
+        };
+    }
+    let first = path.split('.').next().unwrap_or("root");
+    let first = first.split('[').next().unwrap_or(first);
+    if first.is_empty() {
+        "root".to_string()
+    } else {
+        first.to_string()
+    }
+}
+
+fn join_object_path(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_string()
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+fn join_array_path(parent: &str, index: usize) -> String {
+    if parent.is_empty() {
+        format!("[{index}]")
+    } else {
+        format!("{parent}[{index}]")
+    }
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "NULL",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn is_high_risk_pair(truth_ty: &str, ours_ty: &str) -> bool {
+    let truth_container = truth_ty == "array" || truth_ty == "object";
+    let ours_container = ours_ty == "array" || ours_ty == "object";
+    if truth_container != ours_container {
+        return true;
+    }
+    matches!(
+        (truth_ty, ours_ty),
+        ("NULL", "array") | ("array", "NULL") | ("NULL", "object") | ("object", "NULL")
+    )
+}
+
+fn compact_json_value(v: &serde_json::Value) -> String {
+    const LIMIT: usize = 220;
+    let raw = serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".to_string());
+    if raw.len() <= LIMIT {
+        raw
+    } else {
+        format!("{}...", &raw[..LIMIT])
+    }
+}
+
+fn render_comparable_metadata_report_text(report: &ComparableMetadataReport) -> String {
+    const TOP_N: usize = 10;
+    const SAMPLE_N: usize = 20;
+
+    let mut out = String::new();
+    out.push_str(&format!("file: {}\n", report.file));
+    out.push_str(&format!("severity_score: {}\n", report.severity_score));
+    out.push_str("summary:\n");
+    out.push_str(&format!(
+        "  missing_paths: {}\n",
+        report.summary.missing_paths
+    ));
+    out.push_str(&format!("  extra_paths: {}\n", report.summary.extra_paths));
+    out.push_str(&format!(
+        "  type_mismatches: {}\n",
+        report.summary.type_mismatches
+    ));
+    out.push_str(&format!(
+        "  value_mismatches: {}\n",
+        report.summary.value_mismatches
+    ));
+    out.push_str(&format!(
+        "  high_risk_mismatches: {}\n",
+        report.summary.high_risk_mismatches
+    ));
+
+    let mut section_rows: Vec<(&String, &ComparableReportSummary)> =
+        report.sections.iter().collect();
+    section_rows.sort_by(|(ka, va), (kb, vb)| {
+        let sa = section_weight(va);
+        let sb = section_weight(vb);
+        sb.cmp(&sa).then_with(|| ka.cmp(kb))
+    });
+    out.push_str("top_sections:\n");
+    for (section, stats) in section_rows.into_iter().take(TOP_N) {
+        out.push_str(&format!(
+            "  - {}: missing={}, extra={}, type={}, value={}, high_risk={}\n",
+            section,
+            stats.missing_paths,
+            stats.extra_paths,
+            stats.type_mismatches,
+            stats.value_mismatches,
+            stats.high_risk_mismatches
+        ));
+    }
+
+    let mut pair_rows: Vec<(&String, &usize)> = report.type_mismatches_by_pair.iter().collect();
+    pair_rows.sort_by(|(ka, va), (kb, vb)| vb.cmp(va).then_with(|| ka.cmp(kb)));
+    out.push_str("top_type_pairs:\n");
+    for (pair, count) in pair_rows.into_iter().take(TOP_N) {
+        out.push_str(&format!("  - {}: {}\n", pair, count));
+    }
+
+    let suggestions = infer_comparable_fix_categories(report);
+    out.push_str("suggested_fix_categories:\n");
+    if suggestions.is_empty() {
+        out.push_str("  - none\n");
+    } else {
+        for suggestion in suggestions {
+            out.push_str(&format!("  - {}\n", suggestion));
+        }
+    }
+
+    out.push_str("high_risk_samples:\n");
+    for sample in report.high_risk_mismatches_sample.iter().take(SAMPLE_N) {
+        out.push_str(&format!(
+            "  - {} [{} -> {}]\n",
+            sample.path, sample.truth_type, sample.output_type
+        ));
+    }
+    out.push_str("missing_paths_sample:\n");
+    for path in report.missing_paths_sample.iter().take(SAMPLE_N) {
+        out.push_str(&format!("  - {}\n", path));
+    }
+    out.push_str("extra_paths_sample:\n");
+    for path in report.extra_paths_sample.iter().take(SAMPLE_N) {
+        out.push_str(&format!("  - {}\n", path));
+    }
+    out.push_str("value_mismatches_sample:\n");
+    for sample in report.value_mismatches_sample.iter().take(SAMPLE_N) {
+        out.push_str(&format!(
+            "  - {} [truth={}, output={}]\n",
+            sample.path, sample.truth, sample.output
+        ));
+    }
+
+    out
+}
+
+fn section_weight(summary: &ComparableReportSummary) -> u64 {
+    (summary.high_risk_mismatches as u64) * 100
+        + (summary.type_mismatches as u64) * 10
+        + (summary.value_mismatches as u64)
+        + (summary.missing_paths as u64)
+        + (summary.extra_paths as u64)
+}
+
+fn infer_comparable_fix_categories(report: &ComparableMetadataReport) -> Vec<String> {
+    let mut categories: BTreeSet<String> = BTreeSet::new();
+    if report
+        .missing_paths_sample
+        .iter()
+        .chain(report.extra_paths_sample.iter())
+        .any(|path| path.starts_with("arguments."))
+    {
+        categories.insert("argument merge/resolution parity (arguments.* drift)".to_string());
+    }
+    if report
+        .missing_paths_sample
+        .iter()
+        .chain(report.extra_paths_sample.iter())
+        .any(|path| path.starts_with("instanceTypes."))
+    {
+        categories.insert(
+            "instanceTypes mapping parity (virtual/interceptor target resolution)".to_string(),
+        );
+    }
+    if report
+        .missing_paths_sample
+        .iter()
+        .chain(report.extra_paths_sample.iter())
+        .any(|path| path.starts_with("preferences."))
+    {
+        categories.insert("preferences parity (owner -> resolved type alignment)".to_string());
+    }
+    let has_string_number = report
+        .type_mismatches_by_pair
+        .keys()
+        .any(|pair| pair == "string|number" || pair == "number|string");
+    if has_string_number {
+        categories
+            .insert("scalar normalization parity (numeric string vs numeric value)".to_string());
+    }
+    let has_container_shape = report
+        .type_mismatches_by_pair
+        .keys()
+        .any(|pair| pair == "object|array" || pair == "array|object");
+    if has_container_shape {
+        categories.insert(
+            "array/object shape parity (list vs associative map normalization)".to_string(),
+        );
+    }
+    let has_null_container = report.type_mismatches_by_pair.keys().any(|pair| {
+        pair == "NULL|object"
+            || pair == "object|NULL"
+            || pair == "NULL|array"
+            || pair == "array|NULL"
+    });
+    if has_null_container {
+        categories.insert(
+            "null-container mismatch parity (missing node vs explicit null/collection)".to_string(),
+        );
+    }
+    if report.file.contains("plugin-list.php") {
+        categories.insert(
+            "plugin list key/surface parity (method key expansion and owner coverage)".to_string(),
+        );
+    }
+    if report.file == "interception.php" {
+        categories.insert(
+            "interception registry parity (interceptor set and plugin owner aggregation)"
+                .to_string(),
+        );
+    }
+    categories.into_iter().collect()
 }
 
 fn diff_relative_files(archive_dir: &Path, output_dir: &Path) -> std::io::Result<RelativeDiff> {
@@ -3452,5 +4022,108 @@ fn maybe_push_proxy_target(candidate: &str, out: &mut HashSet<String>) {
         if !target.is_empty() {
             out.insert(target.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        infer_comparable_fix_categories, render_comparable_metadata_report_text,
+        ComparableMetadataReport, ComparableReportSummary, ComparableTypeMismatchSample,
+        ComparableValueMismatchSample,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn infer_categories_identifies_common_parity_buckets() {
+        let report = ComparableMetadataReport {
+            file: "primary|global|plugin-list.php".to_string(),
+            summary: ComparableReportSummary::default(),
+            sections: BTreeMap::new(),
+            type_mismatches_by_pair: BTreeMap::from([
+                ("string|number".to_string(), 12usize),
+                ("NULL|object".to_string(), 2usize),
+                ("object|array".to_string(), 1usize),
+            ]),
+            high_risk_mismatches_sample: Vec::new(),
+            missing_paths_sample: vec![
+                "arguments.AssetPreProcessor.candidates".to_string(),
+                "preferences.SomeType".to_string(),
+            ],
+            extra_paths_sample: vec!["instanceTypes.SomeType".to_string()],
+            value_mismatches_sample: Vec::new(),
+            severity_score: 0,
+        };
+
+        let categories = infer_comparable_fix_categories(&report);
+        assert!(categories
+            .iter()
+            .any(|c| c.contains("argument merge/resolution parity")));
+        assert!(categories
+            .iter()
+            .any(|c| c.contains("instanceTypes mapping parity")));
+        assert!(categories.iter().any(|c| c.contains("preferences parity")));
+        assert!(categories
+            .iter()
+            .any(|c| c.contains("scalar normalization parity")));
+        assert!(categories
+            .iter()
+            .any(|c| c.contains("array/object shape parity")));
+        assert!(categories
+            .iter()
+            .any(|c| c.contains("null-container mismatch parity")));
+        assert!(categories
+            .iter()
+            .any(|c| c.contains("plugin list key/surface parity")));
+    }
+
+    #[test]
+    fn text_report_renders_expected_sections() {
+        let report = ComparableMetadataReport {
+            file: "adminhtml.php".to_string(),
+            summary: ComparableReportSummary {
+                missing_paths: 5,
+                extra_paths: 3,
+                type_mismatches: 2,
+                value_mismatches: 1,
+                high_risk_mismatches: 1,
+            },
+            sections: BTreeMap::from([(
+                "arguments".to_string(),
+                ComparableReportSummary {
+                    missing_paths: 5,
+                    extra_paths: 1,
+                    type_mismatches: 2,
+                    value_mismatches: 0,
+                    high_risk_mismatches: 1,
+                },
+            )]),
+            type_mismatches_by_pair: BTreeMap::from([("string|number".to_string(), 2usize)]),
+            high_risk_mismatches_sample: vec![ComparableTypeMismatchSample {
+                path: "arguments.foo".to_string(),
+                truth_type: "NULL".to_string(),
+                output_type: "object".to_string(),
+                pair: "NULL|object".to_string(),
+            }],
+            missing_paths_sample: vec!["arguments.foo".to_string()],
+            extra_paths_sample: vec!["instanceTypes.Bar".to_string()],
+            value_mismatches_sample: vec![ComparableValueMismatchSample {
+                path: "preferences.Foo".to_string(),
+                truth: "\"A\"".to_string(),
+                output: "\"B\"".to_string(),
+            }],
+            severity_score: 123,
+        };
+
+        let text = render_comparable_metadata_report_text(&report);
+        assert!(text.contains("file: adminhtml.php"));
+        assert!(text.contains("severity_score: 123"));
+        assert!(text.contains("top_sections:"));
+        assert!(text.contains("top_type_pairs:"));
+        assert!(text.contains("suggested_fix_categories:"));
+        assert!(text.contains("high_risk_samples:"));
+        assert!(text.contains("missing_paths_sample:"));
+        assert!(text.contains("extra_paths_sample:"));
+        assert!(text.contains("value_mismatches_sample:"));
     }
 }

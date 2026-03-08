@@ -32,7 +32,7 @@ pub use writer::write_if_changed;
 /// The PHP reflection worker emits `__json__:<json>` for array defaults.
 /// This function converts those back to PHP array literal syntax.
 /// All other values are returned as-is (they are already valid PHP literals).
-pub fn render_php_default(default_value: &str) -> std::borrow::Cow<str> {
+pub fn render_php_default(default_value: &str) -> std::borrow::Cow<'_, str> {
     if let Some(json_str) = default_value.strip_prefix("__json__:") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
             return std::borrow::Cow::Owned(json_value_to_php_literal(&v));
@@ -46,7 +46,9 @@ fn json_value_to_php_literal(v: &serde_json::Value) -> String {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
+        serde_json::Value::String(s) => {
+            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+        }
         serde_json::Value::Array(arr) => {
             let items: Vec<String> = arr.iter().map(json_value_to_php_literal).collect();
             format!("[{}]", items.join(", "))
@@ -55,7 +57,11 @@ fn json_value_to_php_literal(v: &serde_json::Value) -> String {
             let items: Vec<String> = map
                 .iter()
                 .map(|(k, v)| {
-                    format!("'{}' => {}", k.replace('\\', "\\\\").replace('\'', "\\'"), json_value_to_php_literal(v))
+                    format!(
+                        "'{}' => {}",
+                        k.replace('\\', "\\\\").replace('\'', "\\'"),
+                        json_value_to_php_literal(v)
+                    )
                 })
                 .collect();
             format!("[{}]", items.join(", "))

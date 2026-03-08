@@ -337,7 +337,10 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
             name,
             value: ctx.text == "true" || ctx.text == "1",
         },
-        "number" => Argument::Number {
+        // PHP's Number::evaluate() returns the raw XML string (not cast to int/float).
+        // var_export() then quotes it as a string in metadata. Use Argument::String so
+        // render_scalar outputs it quoted, matching PHP truth.
+        "number" => Argument::String {
             name,
             value: ctx.text,
         },

@@ -1151,16 +1151,17 @@ impl<'a> Scanner<'a> {
                     self.skip_dq_string();
                 }
                 b'/' if self.at(1) == b'/' => {
-                    self.advance(2);
-                    self.skip_line_comment();
+                    // Line comment ends the meaningful part of the default value.
+                    // Break here leaving pos at `//`; the outer loop's skip_noise handles it.
+                    break;
                 }
                 b'/' if self.at(1) == b'*' => {
                     self.advance(2);
                     self.skip_block_comment();
                 }
                 b'#' if self.at(1) != b'[' => {
-                    self.advance(1);
-                    self.skip_line_comment();
+                    // Line comment — same treatment as `//`.
+                    break;
                 }
                 b'(' => {
                     paren += 1;

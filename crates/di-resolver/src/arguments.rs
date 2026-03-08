@@ -91,7 +91,12 @@ pub fn resolve_for_class(
                 resolved: if type_hint.is_some() {
                     resolve_configured_instance_argument(di_arg, di_config, const_map)
                 } else {
-                    resolve_configured_non_object_argument(di_arg, param.default_value.as_deref(), di_config, const_map)
+                    resolve_configured_non_object_argument(
+                        di_arg,
+                        param.default_value.as_deref(),
+                        di_config,
+                        const_map,
+                    )
                 },
             });
             continue;
@@ -106,16 +111,16 @@ pub fn resolve_for_class(
         } else if param.is_optional {
             resolve_non_object_default(param.default_value.as_deref())
         } else if let Some(type_hint) = param
-                .type_hint
-                .as_deref()
-                .and_then(first_non_null_class_type_hint_arm)
-            {
-                let concrete = di_config.get_preference(&type_hint);
-                if di_config.is_shared(&concrete) {
-                    ResolvedArgValue::SharedInstance(concrete)
-                } else {
-                    ResolvedArgValue::NonSharedInstance(concrete)
-                }
+            .type_hint
+            .as_deref()
+            .and_then(first_non_null_class_type_hint_arm)
+        {
+            let concrete = di_config.get_preference(&type_hint);
+            if di_config.is_shared(&concrete) {
+                ResolvedArgValue::SharedInstance(concrete)
+            } else {
+                ResolvedArgValue::NonSharedInstance(concrete)
+            }
         } else {
             ResolvedArgValue::Null
         };
@@ -321,8 +326,12 @@ fn merged_di_arguments_for_type_name(
 fn merge_argument_into(dst: &mut Argument, src: &Argument) {
     match (dst, src) {
         (
-            Argument::Array { items: dst_items, .. },
-            Argument::Array { items: src_items, .. },
+            Argument::Array {
+                items: dst_items, ..
+            },
+            Argument::Array {
+                items: src_items, ..
+            },
         ) => {
             for src_item in src_items {
                 let name = argument_name(src_item).to_string();
@@ -376,7 +385,11 @@ fn first_non_null_class_type_hint_arm(type_hint: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn resolve_di_argument(arg: &Argument, di_config: &DiConfig, const_map: &HashMap<String, String>) -> ResolvedArgValue {
+fn resolve_di_argument(
+    arg: &Argument,
+    di_config: &DiConfig,
+    const_map: &HashMap<String, String>,
+) -> ResolvedArgValue {
     match arg {
         Argument::Object { value, shared, .. } => {
             let concrete = di_config.get_preference(value);
@@ -426,7 +439,11 @@ fn resolve_di_argument(arg: &Argument, di_config: &DiConfig, const_map: &HashMap
     }
 }
 
-fn resolve_configured_instance_argument(arg: &Argument, di_config: &DiConfig, const_map: &HashMap<String, String>) -> ResolvedArgValue {
+fn resolve_configured_instance_argument(
+    arg: &Argument,
+    di_config: &DiConfig,
+    const_map: &HashMap<String, String>,
+) -> ResolvedArgValue {
     match arg {
         Argument::Object { value, shared, .. } => {
             let concrete = di_config.get_preference(value);
@@ -537,8 +554,12 @@ fn json_to_plain_array_items(v: &serde_json::Value) -> Vec<ResolvedArrayItem> {
 
 fn json_to_plain_array_value(v: &serde_json::Value) -> ResolvedArrayValue {
     match v {
-        serde_json::Value::String(s) => ResolvedArrayValue::Scalar(ResolvedScalar::String(s.clone())),
-        serde_json::Value::Number(n) => ResolvedArrayValue::Scalar(ResolvedScalar::Number(n.to_string())),
+        serde_json::Value::String(s) => {
+            ResolvedArrayValue::Scalar(ResolvedScalar::String(s.clone()))
+        }
+        serde_json::Value::Number(n) => {
+            ResolvedArrayValue::Scalar(ResolvedScalar::Number(n.to_string()))
+        }
         serde_json::Value::Bool(b) => ResolvedArrayValue::Scalar(ResolvedScalar::Bool(*b)),
         serde_json::Value::Null => ResolvedArrayValue::Null,
         other => ResolvedArrayValue::Array(json_to_plain_array_items(other)),
@@ -866,11 +887,17 @@ fn is_configured_argument_array(items: &[Argument]) -> bool {
 
 fn resolve_plain_array_value(arg: &Argument) -> ResolvedArrayValue {
     match arg {
-        Argument::String { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
+        Argument::String { value, .. } => {
+            ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone()))
+        }
         Argument::Boolean { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::Bool(*value)),
-        Argument::Number { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::Number(value.clone())),
+        Argument::Number { value, .. } => {
+            ResolvedArrayValue::Scalar(ResolvedScalar::Number(value.clone()))
+        }
         Argument::Null { .. } => ResolvedArrayValue::Null,
-        Argument::Const { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
+        Argument::Const { value, .. } => {
+            ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone()))
+        }
         Argument::Array { items, .. } => ResolvedArrayValue::Array(
             items
                 .iter()
@@ -882,8 +909,12 @@ fn resolve_plain_array_value(arg: &Argument) -> ResolvedArrayValue {
         ),
         // Fallbacks: treat configured-only forms as scalar strings when they
         // unexpectedly appear in a non-configured array branch.
-        Argument::Object { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
-        Argument::Init { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone())),
+        Argument::Object { value, .. } => {
+            ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone()))
+        }
+        Argument::Init { value, .. } => {
+            ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone()))
+        }
     }
 }
 
@@ -1030,8 +1061,7 @@ mod tests {
                 shared: None,
                 arguments: vec![Argument::String {
                     name: "defaultPreprocessor".to_string(),
-                    value: "Magento\\Framework\\View\\Asset\\PreProcessor\\Passthrough"
-                        .to_string(),
+                    value: "Magento\\Framework\\View\\Asset\\PreProcessor\\Passthrough".to_string(),
                 }],
             },
         );
@@ -1166,7 +1196,10 @@ mod tests {
         );
         let args = &map["AssetPreProcessorPool"];
 
-        let by_name: HashMap<_, _> = args.iter().map(|a| (a.name.as_str(), &a.resolved)).collect();
+        let by_name: HashMap<_, _> = args
+            .iter()
+            .map(|a| (a.name.as_str(), &a.resolved))
+            .collect();
 
         assert!(matches!(
             by_name.get("objectManager").copied(),
@@ -1245,7 +1278,8 @@ mod tests {
             "Magento\\Framework\\Console\\CommandList",
             vec![("commands", Some("array"))],
         );
-        command_list.implements = vec!["Magento\\Framework\\Console\\CommandListInterface".to_string()];
+        command_list.implements =
+            vec!["Magento\\Framework\\Console\\CommandListInterface".to_string()];
         class_map.insert(command_list.fqcn.clone(), command_list);
 
         let mut di_config = DiConfig::default();
@@ -1301,9 +1335,10 @@ mod tests {
             .find(|a| a.name == "commands")
             .expect("commands argument must exist");
         let by_name: HashMap<_, _> = match &commands.resolved {
-            ResolvedArgValue::Array(items) => {
-                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
-            }
+            ResolvedArgValue::Array(items) => items
+                .iter()
+                .map(|i| (i.name.as_str(), &i.resolved))
+                .collect(),
             other => panic!("expected configured array for commands, got {other:?}"),
         };
 
@@ -1353,8 +1388,9 @@ mod tests {
                             items: vec![
                                 Argument::Object {
                                     name: "source".to_string(),
-                                    value: "Magento\\Config\\App\\Config\\Source\\ModularConfigSource"
-                                        .to_string(),
+                                    value:
+                                        "Magento\\Config\\App\\Config\\Source\\ModularConfigSource"
+                                            .to_string(),
                                     shared: None,
                                 },
                                 Argument::String {
@@ -1368,8 +1404,9 @@ mod tests {
                             items: vec![
                                 Argument::Object {
                                     name: "source".to_string(),
-                                    value: "Magento\\Config\\App\\Config\\Source\\RuntimeConfigSource"
-                                        .to_string(),
+                                    value:
+                                        "Magento\\Config\\App\\Config\\Source\\RuntimeConfigSource"
+                                            .to_string(),
                                     shared: None,
                                 },
                                 Argument::String {
@@ -1421,9 +1458,10 @@ mod tests {
             .find(|a| a.name == "sources")
             .expect("sources argument must exist");
         let by_name: HashMap<_, _> = match &sources.resolved {
-            ResolvedArgValue::Array(items) => {
-                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
-            }
+            ResolvedArgValue::Array(items) => items
+                .iter()
+                .map(|i| (i.name.as_str(), &i.resolved))
+                .collect(),
             other => panic!("expected configured array for sources, got {other:?}"),
         };
 
@@ -1431,9 +1469,10 @@ mod tests {
         for key in ["modular", "dynamic", "initial"] {
             let entry = by_name.get(key).copied().expect("source entry");
             let inner: HashMap<_, _> = match entry {
-                ResolvedArgValue::Array(items) => {
-                    items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
-                }
+                ResolvedArgValue::Array(items) => items
+                    .iter()
+                    .map(|i| (i.name.as_str(), &i.resolved))
+                    .collect(),
                 other => panic!("expected nested configured array for {key}, got {other:?}"),
             };
             assert!(inner.contains_key("source"));
@@ -1507,7 +1546,8 @@ mod tests {
                     type_hint: None,
                     is_optional: true,
                     default_value: Some(
-                        "['a' => 'alpha', 'b' => 2, 'c' => ['d' => false], 'e' => null]".to_string(),
+                        "['a' => 'alpha', 'b' => 2, 'c' => ['d' => false], 'e' => null]"
+                            .to_string(),
                     ),
                     is_primitive: false,
                     is_variadic: false,
@@ -1518,7 +1558,10 @@ mod tests {
 
         let map = resolve_all_arguments(&class_map, &DiConfig::default(), &HashMap::new());
         let args = &map["App\\ArrayDefaults"];
-        let payload = args.iter().find(|a| a.name == "payload").expect("payload arg");
+        let payload = args
+            .iter()
+            .find(|a| a.name == "payload")
+            .expect("payload arg");
 
         let by_key: HashMap<_, _> = match &payload.resolved {
             ResolvedArgValue::PlainArray(items) => {
@@ -1535,7 +1578,10 @@ mod tests {
             by_key.get("b").copied(),
             Some(ResolvedArrayValue::Scalar(ResolvedScalar::Number(v))) if v == "2"
         ));
-        assert!(matches!(by_key.get("e").copied(), Some(ResolvedArrayValue::Null)));
+        assert!(matches!(
+            by_key.get("e").copied(),
+            Some(ResolvedArrayValue::Null)
+        ));
 
         let nested = by_key.get("c").copied().expect("nested c");
         let nested_map: HashMap<_, _> = match nested {

@@ -128,19 +128,33 @@ fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, i
         ResolvedArgValue::SharedInstance(fqcn) => {
             out.push_str(&format!(
                 "{}'{}' => \n{}array (\n{}  '_i_' => '{}',\n{}),\n",
-                pad, escape_php(name), pad, pad, escape_php(fqcn), pad
+                pad,
+                escape_php(name),
+                pad,
+                pad,
+                escape_php(fqcn),
+                pad
             ));
         }
         ResolvedArgValue::NonSharedInstance(fqcn) => {
             out.push_str(&format!(
                 "{}'{}' => \n{}array (\n{}  '_ins_' => '{}',\n{}),\n",
-                pad, escape_php(name), pad, pad, escape_php(fqcn), pad
+                pad,
+                escape_php(name),
+                pad,
+                pad,
+                escape_php(fqcn),
+                pad
             ));
         }
         ResolvedArgValue::GlobalArgRef { arg_name, default } => {
             out.push_str(&format!(
                 "{}'{}' => \n{}array (\n{}  '_a_' => '{}',\n",
-                pad, escape_php(name), pad, pad, escape_php(arg_name)
+                pad,
+                escape_php(name),
+                pad,
+                pad,
+                escape_php(arg_name)
             ));
             let default_str = match default {
                 Some(d) => render_untyped_default(d),
@@ -150,7 +164,12 @@ fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, i
         }
         ResolvedArgValue::Scalar(val) => {
             // Plain scalar — no _v_ wrapper inside _vac_
-            out.push_str(&format!("{}'{}' => {},\n", pad, escape_php(name), render_scalar(val)));
+            out.push_str(&format!(
+                "{}'{}' => {},\n",
+                pad,
+                escape_php(name),
+                render_scalar(val)
+            ));
         }
         ResolvedArgValue::Null => {
             // Plain NULL — no _vn_ wrapper inside _vac_
@@ -158,14 +177,24 @@ fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, i
         }
         ResolvedArgValue::Array(items) => {
             // Nested configured array — flat, no _vac_ re-wrap
-            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n",
+                pad,
+                escape_php(name),
+                pad
+            ));
             for item in items {
                 serialize_vac_entry(out, &item.name, &item.resolved, indent + 2);
             }
             out.push_str(&format!("{}),\n", pad));
         }
         ResolvedArgValue::PlainArray(items) => {
-            out.push_str(&format!("{}'{}' => \n{}array (\n", pad, escape_php(name), pad));
+            out.push_str(&format!(
+                "{}'{}' => \n{}array (\n",
+                pad,
+                escape_php(name),
+                pad
+            ));
             serialize_plain_array_items(out, items, indent + 2);
             out.push_str(&format!("{}),\n", pad));
         }
