@@ -68,29 +68,36 @@ pub struct PluginListMetadata {
 
 /// Build the in-memory plugin list structures:
 /// section 0 => pluginData, section 1 => inherited, section 2 => processed.
+///
+/// `include_virtual_types`: when `false`, skips the virtual-type inherit pass
+/// (correct for non-global scopes where virtual types are not applicable).
+/// Avoids cloning + clearing the full DiConfig in the caller.
 pub fn compile_plugin_list(
     di_config: &DiConfig,
     class_map: &FxHashMap<String, ClassInfo>,
     class_definitions: &[String],
+    include_virtual_types: bool,
 ) -> PluginListMetadata {
     let plugin_data = collect_plugin_data(di_config);
     let mut inherited: FxHashMap<String, Option<Vec<PluginConfig>>> = FxHashMap::default();
     let mut processed: FxHashMap<String, ProcessedMethod> = FxHashMap::default();
     let mut plugin_methods_cache: FxHashMap<String, FxHashMap<String, u8>> = FxHashMap::default();
 
-    // 1) Virtual types from merged scope config.
-    let mut virtual_types: Vec<&String> = di_config.virtual_types.keys().collect();
-    virtual_types.sort();
-    for vt in virtual_types {
-        inherit_plugins(
-            vt,
-            &plugin_data,
-            di_config,
-            class_map,
-            &mut inherited,
-            &mut processed,
-            &mut plugin_methods_cache,
-        );
+    // 1) Virtual types from merged scope config (global scope only).
+    if include_virtual_types {
+        let mut virtual_types: Vec<&String> = di_config.virtual_types.keys().collect();
+        virtual_types.sort();
+        for vt in virtual_types {
+            inherit_plugins(
+                vt,
+                &plugin_data,
+                di_config,
+                class_map,
+                &mut inherited,
+                &mut processed,
+                &mut plugin_methods_cache,
+            );
+        }
     }
 
     // 2) Explicit plugin owners.
@@ -154,7 +161,7 @@ pub fn generate_plugin_list_php(
     class_map: &FxHashMap<String, ClassInfo>,
     class_definitions: &[String],
 ) -> String {
-    let metadata = compile_plugin_list(di_config, class_map, class_definitions);
+    let metadata = compile_plugin_list(di_config, class_map, class_definitions, true);
     serialize_plugin_list_php(&metadata)
 }
 
@@ -590,7 +597,7 @@ mod tests {
         );
 
         let class_defs: Vec<String> = class_map.keys().cloned().collect();
-        let compiled = compile_plugin_list(&di, &class_map, &class_defs);
+        let compiled = compile_plugin_list(&di, &class_map, &class_defs, true);
         let inherited = compiled
             .inherited
             .get("Foo\\Target")
@@ -627,7 +634,7 @@ mod tests {
         );
 
         let class_defs: Vec<String> = class_map.keys().cloned().collect();
-        let compiled = compile_plugin_list(&di, &class_map, &class_defs);
+        let compiled = compile_plugin_list(&di, &class_map, &class_defs, true);
 
         let self_key = compiled
             .processed
@@ -665,7 +672,7 @@ mod tests {
         );
 
         let class_defs: Vec<String> = class_map.keys().cloned().collect();
-        let compiled = compile_plugin_list(&di, &class_map, &class_defs);
+        let compiled = compile_plugin_list(&di, &class_map, &class_defs, true);
         let child_plugins = compiled
             .inherited
             .get("Foo\\Child")

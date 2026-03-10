@@ -28,9 +28,10 @@ use serde::{Deserialize, Serialize};
 use code_generator::{
     extension_path, factory_path, generate_app_action_list_php,
     generate_area_config_with_overrides, generate_extension, generate_extension_interface,
-    generate_factory, generate_interceptor, generate_plugin_list_php, generate_proxy,
-    generate_proxy_deferred, generate_search_results, interceptor_path, proxy_deferred_path,
-    proxy_path, search_results_path, serialize_interception_php, write_if_changed,
+    compile_plugin_list, generate_factory, generate_interceptor, generate_proxy,
+    generate_proxy_deferred, generate_search_results, interceptor_path,
+    proxy_deferred_path, proxy_path, search_results_path, serialize_interception_php,
+    serialize_plugin_list_php, write_if_changed,
     ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
@@ -558,9 +559,20 @@ fn main() {
         .filter(|p| !di_xml_files_set.contains(p))
         .collect();
 
-    let extra_configs: Vec<_> = extra_di_files
+    // Parse area-specific di.xml files into a path-keyed cache so the Phase 7
+    // area loop can look up already-parsed configs instead of re-parsing.
+    let area_di_xml_cache: FxHashMap<std::path::PathBuf, DiConfig> = extra_di_files
         .par_iter()
-        .filter_map(|path| parse_di_xml(path).ok())
+        .filter_map(|path| {
+            parse_di_xml(path)
+                .ok()
+                .map(|cfg| ((*path).clone(), cfg))
+        })
+        .collect();
+    // Preserve original file order for deterministic scanner_di_configs merge.
+    let extra_configs: Vec<DiConfig> = extra_di_files
+        .iter()
+        .filter_map(|path| area_di_xml_cache.get(*path).cloned())
         .collect();
 
     let mut scanner_di_configs = global_di_configs.clone();
@@ -1143,8 +1155,14 @@ fn main() {
     let interception_path = metadata_root.join("interception.php");
     let _ = write_if_changed(&interception_path, &interception_content);
 
+    // Build the case-normalisation index once from the interception class map.
+    // All 7 area iterations reuse the same index; previously it was rebuilt
+    // from scratch inside canonicalize_instance_reference_case on every call.
+    let case_index = build_case_index(&interception_class_map);
+
     // Per-area config files — each area merges global + area-specific di.xml overlays.
     // Run in parallel: each area is independent (different files, different output path).
+    let t_area_config = Instant::now();
     let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
     let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = AREAS
         .par_iter()
@@ -1166,9 +1184,16 @@ fn main() {
                     if area_only.is_empty() {
                         std::sync::Arc::clone(&metadata_base_di_config)
                     } else {
-                        let extra_configs: Vec<_> = area_only
+                        // Look up from Phase 3b cache; fall back to re-parsing only for
+                        // files not in the cache (should not happen in practice).
+                        let extra_configs: Vec<DiConfig> = area_only
                             .iter()
-                            .filter_map(|p| parse_di_xml(p).ok())
+                            .filter_map(|p| {
+                                area_di_xml_cache
+                                    .get(*p)
+                                    .cloned()
+                                    .or_else(|| parse_di_xml(p).ok())
+                            })
                             .collect();
                         // Area-specific module configs applied via the same two-phase merge as
                         // global: deep-merge area module configs together, then apply on the
@@ -1187,10 +1212,10 @@ fn main() {
                     std::sync::Arc::clone(&metadata_base_di_config)
                 };
 
-            // Build area-specific preference overrides and direct interceptor map.
+            // Build area-specific preference overrides.
+            // global_interceptor_map is shared read-only; no per-area clone needed.
             let area_preference_overrides =
                 build_interception_preference_overrides(&area_di_config, &global_interceptor_map);
-            let area_instance_type_overrides = global_interceptor_map.clone();
 
             let mut area_di_config_for_args = (*area_di_config).clone();
             for (from, to) in &area_preference_overrides {
@@ -1236,7 +1261,8 @@ fn main() {
                 &area_di_config_for_args,
                 &const_map,
             );
-            canonicalize_instance_reference_case(&mut area_args, &interception_class_map);
+            // Reuse pre-built case index: avoids rebuilding from class_map on every area.
+            apply_case_index(&mut area_args, &case_index);
             let area_args: FxHashMap<String, Vec<di_resolver::ResolvedArg>> = area_args
                 .into_iter()
                 .filter(|(fqcn, args)| {
@@ -1246,7 +1272,7 @@ fn main() {
                     // both the VT name and the Interceptor. Exception: when intercepted
                     // source classes resolve to no constructor args, PHP keeps a class-level
                     // NULL entry for the original class name.
-                    if !area_instance_type_overrides.contains_key(fqcn) {
+                    if !global_interceptor_map.contains_key(fqcn) {
                         return true;
                     }
                     if metadata_base_di_config
@@ -1272,7 +1298,7 @@ fn main() {
                 &area_args,
                 &area_di_config,
                 &area_preference_overrides,
-                &area_instance_type_overrides,
+                &global_interceptor_map,
             );
             let area_path = metadata_root.join(format!("{}.php", area));
             let _ = write_if_changed(&area_path, &area_content);
@@ -1281,6 +1307,7 @@ fn main() {
         })
         .collect();
     pb_area.finish_with_message("done");
+    log::debug!("Phase 7 area-config loop: {:?}", t_area_config.elapsed());
 
     // Scope-specific plugin-list metadata files.
     let plugin_list_class_definitions: Vec<String> = Vec::new();
@@ -1293,21 +1320,23 @@ fn main() {
         "webapi_rest",
         "webapi_soap",
     ];
+    let t_plugin_list = Instant::now();
     let pb_plugins = progress_bar(
         plugin_scopes.len() as u64,
         "Generating plugin-list metadata",
     );
     for scope in plugin_scopes {
         if let Some(scope_di_config) = area_di_configs.get(scope) {
-            let mut plugin_di_config = (**scope_di_config).clone();
-            if scope != "global" {
-                plugin_di_config.virtual_types.clear();
-            }
-            let content = generate_plugin_list_php(
-                &plugin_di_config,
+            // For non-global scopes virtual types are not emitted; pass the flag
+            // directly instead of cloning + clearing the full DiConfig.
+            let include_vt = scope == "global";
+            let metadata = compile_plugin_list(
+                &**scope_di_config,
                 &class_map,
                 &plugin_list_class_definitions,
+                include_vt,
             );
+            let content = serialize_plugin_list_php(&metadata);
             let cache_id = plugin_list_cache_id(scope);
             let path = metadata_root.join(format!("{}.php", cache_id));
             let _ = write_if_changed(&path, &content);
@@ -1315,6 +1344,7 @@ fn main() {
         pb_plugins.inc(1);
     }
     pb_plugins.finish_with_message("done");
+    log::debug!("Phase 7 plugin-list loop: {:?}", t_plugin_list.elapsed());
 
     // App action list metadata.
     let app_action_list = generate_app_action_list_php(&class_map);
@@ -3883,10 +3913,10 @@ fn normalize_reflected_type_hint_for_proxy(
     format!("{}{}", nullable, normalize_single(core))
 }
 
-fn canonicalize_instance_reference_case(
-    args_map: &mut FxHashMap<String, Vec<di_resolver::ResolvedArg>>,
-    class_map: &FxHashMap<String, ClassInfo>,
-) {
+/// Build a lowercase-key → canonical-case-FQCN index from the class map.
+/// Real source classes (path.exists()) win over synthetic entries; ties
+/// break lexicographically.  Build once and reuse across all areas.
+fn build_case_index(class_map: &FxHashMap<String, ClassInfo>) -> FxHashMap<String, String> {
     let mut case_index: FxHashMap<String, (String, u8)> = FxHashMap::default();
     case_index.reserve(class_map.len());
     for (fqcn, info) in class_map {
@@ -3906,15 +3936,21 @@ fn canonicalize_instance_reference_case(
             }
         }
     }
-    let case_index: FxHashMap<String, String> =
-        case_index.into_iter().map(|(k, (v, _))| (k, v)).collect();
+    case_index.into_iter().map(|(k, (v, _))| (k, v)).collect()
+}
 
+/// Apply a pre-built case index to an args map (shared across all areas).
+fn apply_case_index(
+    args_map: &mut FxHashMap<String, Vec<di_resolver::ResolvedArg>>,
+    case_index: &FxHashMap<String, String>,
+) {
     for args in args_map.values_mut() {
         for arg in args.iter_mut() {
-            canonicalize_resolved_arg_value_case(&mut arg.resolved, &case_index);
+            canonicalize_resolved_arg_value_case(&mut arg.resolved, case_index);
         }
     }
 }
+
 
 fn canonicalize_resolved_arg_value_case(
     value: &mut di_resolver::ResolvedArgValue,
@@ -4921,10 +4957,9 @@ mod tests {
     use super::{
         apply_setup_di_compile_runtime_overrides, build_argument_type_names,
         build_interception_registry, build_interception_type_names,
-        canonicalize_instance_reference_case, enrich_all_constructors_with_reflection,
-        infer_comparable_fix_categories, render_comparable_metadata_report_text,
-        ComparableMetadataReport, ComparableReportSummary, ComparableTypeMismatchSample,
-        ComparableValueMismatchSample, IncrementalCache,
+        apply_case_index, build_case_index, infer_comparable_fix_categories,
+        render_comparable_metadata_report_text, ComparableMetadataReport, ComparableReportSummary,
+        ComparableTypeMismatchSample, ComparableValueMismatchSample,
     };
     use di_resolver::{
         ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
@@ -4932,7 +4967,7 @@ mod tests {
     use di_xml_reader::{Argument, DiConfig, VirtualType};
     use php_extractor::types::{ClassInfo, ClassKind};
     use rustc_hash::FxHashMap;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5384,7 +5419,8 @@ mod tests {
             ],
         );
 
-        canonicalize_instance_reference_case(&mut args_map, &class_map);
+        let case_index = build_case_index(&class_map);
+        apply_case_index(&mut args_map, &case_index);
 
         let args = args_map.get("Foo\\Type").expect("canonicalized args");
         assert!(matches!(

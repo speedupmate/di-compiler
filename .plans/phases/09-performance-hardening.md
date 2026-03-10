@@ -41,7 +41,7 @@ Drive hot-path optimizations that materially reduce wall-clock compile time with
 
 ## Tickets In This Phase
 
-TKT-035 through TKT-037, TKT-042, TKT-056 through TKT-060
+TKT-035 through TKT-037, TKT-042, TKT-056 through TKT-061
 
 ## Round 2 Status (2026-03-10)
 
@@ -56,3 +56,13 @@ TKT-056 through TKT-060 landed in one batch:
 | TKT-060 | Archive compare parallelization | Done |
 
 Test count: 197 (up from 176). Build clean, zero warnings.
+
+## Round 3 Status (2026-03-10)
+
+| Ticket | Change | Status |
+|--------|--------|--------|
+| TKT-061 | Phase 7 micro-optimizations (case index, di.xml cache, plugin-list clone, sub-timers) | Done |
+
+Measured Phase 7 sub-timers: area-config loop ~450ms, plugin-list ~44ms.
+Bottleneck identified as `resolve_all_arguments_for_named_types` × 7 areas (pure Rust, 25k types).
+Total runtime: ~2.4s clean run on 12-CPU dev box.
