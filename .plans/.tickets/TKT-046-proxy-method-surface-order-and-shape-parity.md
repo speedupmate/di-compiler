@@ -4,7 +4,7 @@ title: Proxy method surface, order, and class-shape parity
 phase: 08-parity-closure
 feature: code-content-parity-closure
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-039, TKT-042]
 touches:

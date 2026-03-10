@@ -4,7 +4,7 @@ title: Interceptor namespace and structure parity
 phase: 08-parity-closure
 feature: interceptor-namespace-structure-parity
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-017]
 touches:

@@ -4,7 +4,7 @@ title: di.xml merger
 phase: 02-di-xml-reader
 feature: di-xml-merger
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-010]
 touches:

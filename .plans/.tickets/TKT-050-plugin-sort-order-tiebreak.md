@@ -4,7 +4,7 @@ title: Add secondary sort-by-name tiebreak for plugins with equal sort_order
 phase: 08-parity-closure
 feature: 30-plugin-list-metadata-generation
 owner: Unassigned
-status: Ready
+status: Done
 estimate: XS
 depends_on: []
 touches:

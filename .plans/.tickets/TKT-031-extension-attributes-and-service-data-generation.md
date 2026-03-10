@@ -4,7 +4,7 @@ title: Extension attributes and service data generation
 phase: 08-parity-closure
 feature: extension-attributes-generation
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-030]
 touches:

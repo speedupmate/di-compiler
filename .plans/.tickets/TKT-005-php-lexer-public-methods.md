@@ -4,7 +4,7 @@ title: PHP lexer — public method signature extraction
 phase: 01-php-extractor
 feature: php-lexer-tier1
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-004]
 touches:

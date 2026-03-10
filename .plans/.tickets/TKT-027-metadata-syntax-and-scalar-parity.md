@@ -4,7 +4,7 @@ title: Metadata syntax and scalar parity
 phase: 08-parity-closure
 feature: metadata-validity-parity
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-016, TKT-023]
 touches:

@@ -4,7 +4,7 @@ title: tree-sitter-php Tier 2 fallback extractor
 phase: 01-php-extractor
 feature: php-treesitter-tier2
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-001]
 touches:

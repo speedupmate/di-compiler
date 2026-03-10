@@ -4,7 +4,7 @@ title: Extract result orchestrator
 phase: 01-php-extractor
 feature: extract-result-type
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-003, TKT-004, TKT-005, TKT-006, TKT-007]
 touches:

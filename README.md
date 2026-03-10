@@ -143,10 +143,25 @@ This project targets compile pipeline parity and uses `generated/_code` + `gener
 - Ticket index: `.plans/.tickets/README.md`
 - One execution slice per ticket; keep ticket status current when landing work.
 
+## Performance
+
+Typical clean run on a 12-CPU dev box with ~18,800 PHP files and 570 di.xml files:
+
+| Phase | Time |
+|-------|------|
+| Phase 1+2 — PHP scan | ~830ms |
+| Phase 3a/3b — di.xml parse | ~190ms |
+| Phase 4–6 — detection + codegen | ~440ms |
+| Phase 7 — metadata generation | ~1.0s |
+| **Total** | **~2.4s** |
+
+Use `--verbose` to see per-phase and Phase 7 sub-step timing.
+
 ## Known Limitations
 
-- Some parity gaps may remain in edge metadata structures and plugin/interception key-space behavior.
-- Metadata key order is normalized for comparison; semantic drift is tracked via path/type/value mismatch reports.
+- `code_extra=3`: three generated files differ from the PHP archive baseline (edge ordering cases).
+- `metadata_changed=16`: key-ordering noise only; Magento runtime uses key lookup so there is no behavioral impact. Exact byte-for-byte parity is a known deferred item (TKT-034).
+- Composer-seeded module root discovery not yet implemented; falls back to `registration.php` DFS (TKT-035).
 
 ## License
 

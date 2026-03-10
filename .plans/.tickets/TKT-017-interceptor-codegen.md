@@ -4,7 +4,7 @@ title: Interceptor PHP code generator
 phase: 04-code-generator
 feature: interceptor-codegen
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-013]
 touches:

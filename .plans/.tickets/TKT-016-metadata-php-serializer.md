@@ -4,7 +4,7 @@ title: Metadata PHP serializer
 phase: 04-code-generator
 feature: metadata-php-serializer
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-015]
 touches:

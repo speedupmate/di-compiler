@@ -4,7 +4,7 @@ title: PHP shell Tier 3 fallback extractor
 phase: 01-php-extractor
 feature: php-fallback-tier3
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: [TKT-001]
 touches:

@@ -4,7 +4,7 @@ title: DiConfig struct + query methods
 phase: 02-di-xml-reader
 feature: di-config-model
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-011]
 touches:

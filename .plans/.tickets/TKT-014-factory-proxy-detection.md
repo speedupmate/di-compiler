@@ -4,7 +4,7 @@ title: Factory + Proxy detection
 phase: 03-di-resolver
 feature: factory-detection, proxy-detection
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-008, TKT-012]
 touches:

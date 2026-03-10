@@ -4,7 +4,7 @@ title: Fixture corpus + insta snapshot tests
 phase: 01-php-extractor
 feature: snapshot-test-corpus
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-008]
 touches:

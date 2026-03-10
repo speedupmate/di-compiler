@@ -4,7 +4,7 @@ title: PHP lexer — constructor parameter extraction
 phase: 01-php-extractor
 feature: php-lexer-tier1
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-003]
 touches:

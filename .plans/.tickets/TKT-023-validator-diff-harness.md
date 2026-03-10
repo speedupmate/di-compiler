@@ -4,7 +4,7 @@ title: Validator diff harness
 phase: 05-validator
 feature: validator-harness
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-016, TKT-017, TKT-018, TKT-019, TKT-020, TKT-021, TKT-022]
 touches:

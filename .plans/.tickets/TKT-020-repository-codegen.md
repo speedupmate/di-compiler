@@ -4,7 +4,7 @@ title: Repository code generator
 phase: 04-code-generator
 feature: repository-codegen
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-008, TKT-012]
 touches:

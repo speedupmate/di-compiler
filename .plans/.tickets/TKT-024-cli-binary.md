@@ -4,7 +4,7 @@ title: CLI binary
 phase: 06-cli
 feature: cli-binary
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-001, TKT-008, TKT-011, TKT-015, TKT-016, TKT-017, TKT-018, TKT-019, TKT-020, TKT-021, TKT-023]
 touches:

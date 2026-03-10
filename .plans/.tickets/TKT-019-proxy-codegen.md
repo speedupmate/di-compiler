@@ -4,7 +4,7 @@ title: Proxy PHP code generator
 phase: 04-code-generator
 feature: proxy-codegen
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-014]
 touches:

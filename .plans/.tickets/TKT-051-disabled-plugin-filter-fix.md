@@ -4,7 +4,7 @@ title: Fix filter_enabled_di_xml dropping disabled plugin entries
 phase: 08-parity-closure
 feature: 30-plugin-list-metadata-generation
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: []
 touches:

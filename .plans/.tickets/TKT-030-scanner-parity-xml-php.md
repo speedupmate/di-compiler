@@ -4,7 +4,7 @@ title: Scanner parity for XML and PHP triggers
 phase: 08-parity-closure
 feature: scanner-parity-xml-php
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-014]
 touches:

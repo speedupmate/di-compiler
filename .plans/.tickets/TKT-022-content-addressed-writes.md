@@ -4,7 +4,7 @@ title: Content-addressed file writes
 phase: 04-code-generator
 feature: (cross-cutting)
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: [TKT-017, TKT-018, TKT-019, TKT-020, TKT-021]
 touches:

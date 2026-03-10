@@ -4,7 +4,7 @@ title: PHP file walker + module path reader
 phase: 01-php-extractor
 feature: php-file-walker
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-001]
 touches:

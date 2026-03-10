@@ -4,7 +4,7 @@ title: Interceptor method and signature parity
 phase: 08-parity-closure
 feature: interceptor-method-signature-parity
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-028]
 touches:

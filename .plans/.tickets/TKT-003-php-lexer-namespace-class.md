@@ -4,7 +4,7 @@ title: PHP lexer — namespace + class header extraction
 phase: 01-php-extractor
 feature: php-lexer-tier1
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-001]
 touches:

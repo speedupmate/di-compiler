@@ -4,7 +4,7 @@ title: Cargo workspace scaffold
 phase: 01-php-extractor
 feature: workspace-scaffold
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: []
 touches:

@@ -4,7 +4,7 @@ title: Exclude pure interfaces from plugin-list Section 1 unless directly regist
 phase: 08-parity-closure
 feature: 30-plugin-list-metadata-generation
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: []
 touches:

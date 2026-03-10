@@ -4,7 +4,7 @@ title: rayon parallel file parsing + code generation
 phase: 07-performance
 feature: parallel-rayon
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-008, TKT-022]
 touches:

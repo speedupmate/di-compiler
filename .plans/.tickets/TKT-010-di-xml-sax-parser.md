@@ -4,7 +4,7 @@ title: di.xml SAX parser
 phase: 02-di-xml-reader
 feature: di-xml-parser
 owner: Unassigned
-status: Ready
+status: Done
 estimate: L
 depends_on: [TKT-001]
 touches:

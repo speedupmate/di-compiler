@@ -4,7 +4,7 @@ title: Extension/factory content parity: ordering and target mapping
 phase: 08-parity-closure
 feature: code-content-parity-closure
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-031, TKT-034]
 touches:

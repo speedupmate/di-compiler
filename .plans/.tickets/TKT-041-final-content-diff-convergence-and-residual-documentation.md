@@ -4,7 +4,7 @@ title: Final content diff convergence and residual documentation
 phase: 08-parity-closure
 feature: code-content-parity-closure
 owner: Unassigned
-status: In Progress
+status: Done
 estimate: S
 depends_on: [TKT-040, TKT-045]
 touches:

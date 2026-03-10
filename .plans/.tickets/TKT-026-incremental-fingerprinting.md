@@ -4,7 +4,7 @@ title: Incremental compilation fingerprinting
 phase: 07-performance
 feature: incremental-fingerprinting
 owner: Unassigned
-status: Ready
+status: Done
 estimate: M
 depends_on: [TKT-025]
 touches:

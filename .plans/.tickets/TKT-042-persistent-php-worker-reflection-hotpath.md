@@ -4,7 +4,7 @@ title: Persistent PHP worker for reflection hot paths
 phase: 09-performance-hardening
 feature: php-reflection-worker-pool
 owner: Unassigned
-status: In Progress
+status: Done
 estimate: M
 depends_on: [TKT-035]
 touches:
