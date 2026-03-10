@@ -557,4 +557,52 @@ mod tests {
         let frontend = super::find_di_xml_files_for_area(root, "frontend", &empty_order);
         assert!(frontend.contains(&module_root.join("etc/frontend/di.xml")));
     }
+
+    #[test]
+    fn test_find_di_xml_files_respects_module_order_tiebreak() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("app/etc")).unwrap();
+        fs::write(
+            root.join("app/etc/di.xml"),
+            r#"<?xml version="1.0"?><config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"></config>"#,
+        )
+        .unwrap();
+
+        let module_a = root.join("vendor/magento/module-a");
+        let module_b = root.join("vendor/magento/module-b");
+        for module in [&module_a, &module_b] {
+            fs::create_dir_all(module.join("etc")).unwrap();
+            fs::write(
+                module.join("etc/di.xml"),
+                r#"<?xml version="1.0"?><config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"></config>"#,
+            )
+            .unwrap();
+        }
+        fs::write(
+            module_a.join("etc/module.xml"),
+            r#"<?xml version="1.0"?><config><module name="Magento_A"/></config>"#,
+        )
+        .unwrap();
+        fs::write(
+            module_b.join("etc/module.xml"),
+            r#"<?xml version="1.0"?><config><module name="Magento_B"/></config>"#,
+        )
+        .unwrap();
+
+        let mut module_order = std::collections::HashMap::new();
+        module_order.insert("Magento_B".to_string(), 0usize);
+        module_order.insert("Magento_A".to_string(), 1usize);
+
+        let paths = super::find_di_xml_files(root, &module_order);
+        let vendor_paths: Vec<_> = paths
+            .iter()
+            .filter(|p| p.starts_with(root.join("vendor/magento")))
+            .collect();
+
+        assert_eq!(vendor_paths.len(), 2);
+        assert_eq!(vendor_paths[0], &module_b.join("etc/di.xml"));
+        assert_eq!(vendor_paths[1], &module_a.join("etc/di.xml"));
+    }
 }

@@ -4,7 +4,7 @@ title: Fix _i_ vs _ins_ shared/non-shared instance resolution
 phase: 08-parity-closure
 feature: 36-di-merge-order-and-null-surface
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: [TKT-048, TKT-051]
 touches:

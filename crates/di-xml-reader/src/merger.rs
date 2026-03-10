@@ -357,4 +357,181 @@ mod tests {
         let vt = merged.virtual_types.get("FooVirtual").unwrap();
         assert_eq!(vt.type_name, "BaseB");
     }
+
+    #[test]
+    fn test_apply_module_config_on_primary_replaces_argument_value_shallow() {
+        let mut primary = DiConfig::default();
+        primary.type_configs.insert(
+            "Magento\\Framework\\EntityManager\\OperationPool".into(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "operations".into(),
+                    items: vec![Argument::Array {
+                        name: "default".into(),
+                        items: vec![Argument::String {
+                            name: "create".into(),
+                            value: "Create".into(),
+                            sort_order: 0,
+                        }],
+                        sort_order: 0,
+                    }],
+                    sort_order: 0,
+                }],
+            },
+        );
+
+        let mut module = DiConfig::default();
+        module.type_configs.insert(
+            "Magento\\Framework\\EntityManager\\OperationPool".into(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "operations".into(),
+                    items: vec![Argument::Array {
+                        name: "Magento\\AsynchronousOperations\\Api\\Data\\OperationListInterface"
+                            .into(),
+                        items: vec![Argument::String {
+                            name: "create".into(),
+                            value: "CreateByTopic".into(),
+                            sort_order: 0,
+                        }],
+                        sort_order: 0,
+                    }],
+                    sort_order: 0,
+                }],
+            },
+        );
+
+        let merged = apply_module_config_on_primary(primary, module);
+        let tc = merged
+            .type_configs
+            .get("Magento\\Framework\\EntityManager\\OperationPool")
+            .expect("operation pool config");
+        let operations = tc
+            .arguments
+            .iter()
+            .find(|a| matches!(a, Argument::Array { name, .. } if name == "operations"))
+            .expect("operations argument");
+        let names: Vec<&str> = match operations {
+            Argument::Array { items, .. } => items
+                .iter()
+                .map(|item| match item {
+                    Argument::Array { name, .. } => name.as_str(),
+                    other => panic!("expected nested array item, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected array argument, got {other:?}"),
+        };
+        assert_eq!(
+            names,
+            vec!["Magento\\AsynchronousOperations\\Api\\Data\\OperationListInterface"]
+        );
+    }
+
+    #[test]
+    fn test_apply_module_config_on_primary_keeps_non_overridden_arguments() {
+        let mut primary = DiConfig::default();
+        primary.type_configs.insert(
+            "Foo\\Type".into(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![
+                    Argument::String {
+                        name: "first".into(),
+                        value: "one".into(),
+                        sort_order: 0,
+                    },
+                    Argument::String {
+                        name: "second".into(),
+                        value: "two".into(),
+                        sort_order: 0,
+                    },
+                ],
+            },
+        );
+
+        let mut module = DiConfig::default();
+        module.type_configs.insert(
+            "Foo\\Type".into(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::String {
+                    name: "second".into(),
+                    value: "override".into(),
+                    sort_order: 0,
+                }],
+            },
+        );
+
+        let merged = apply_module_config_on_primary(primary, module);
+        let tc = merged.type_configs.get("Foo\\Type").expect("foo config");
+
+        let first = tc
+            .arguments
+            .iter()
+            .find_map(|arg| match arg {
+                Argument::String { name, value, .. } if name == "first" => Some(value),
+                _ => None,
+            })
+            .expect("first argument");
+        let second = tc
+            .arguments
+            .iter()
+            .find_map(|arg| match arg {
+                Argument::String { name, value, .. } if name == "second" => Some(value),
+                _ => None,
+            })
+            .expect("second argument");
+
+        assert_eq!(first, "one");
+        assert_eq!(second, "override");
+    }
+
+    #[test]
+    fn test_plugin_disable_is_sticky_across_later_redeclarations() {
+        let mut c1 = DiConfig::default();
+        c1.plugins.insert(
+            "Foo\\Bar".into(),
+            vec![Plugin {
+                name: "p".into(),
+                type_name: "Foo\\Plugin".into(),
+                sort_order: 10,
+                disabled: false,
+            }],
+        );
+
+        // Disabled-only override (no type) flips plugin off.
+        let mut c2 = DiConfig::default();
+        c2.plugins.insert(
+            "Foo\\Bar".into(),
+            vec![Plugin {
+                name: "p".into(),
+                type_name: String::new(),
+                sort_order: 0,
+                disabled: true,
+            }],
+        );
+
+        // Later redeclaration should not re-enable the plugin.
+        let mut c3 = DiConfig::default();
+        c3.plugins.insert(
+            "Foo\\Bar".into(),
+            vec![Plugin {
+                name: "p".into(),
+                type_name: "Foo\\Plugin\\Override".into(),
+                sort_order: 20,
+                disabled: false,
+            }],
+        );
+
+        let merged = merge_configs(vec![c1, c2, c3]);
+        let plugin = merged
+            .plugins
+            .get("Foo\\Bar")
+            .and_then(|v| v.iter().find(|p| p.name == "p"))
+            .expect("merged plugin");
+        assert_eq!(plugin.type_name, "Foo\\Plugin\\Override");
+        assert!(plugin.disabled);
+    }
 }

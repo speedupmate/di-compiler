@@ -1,7 +1,7 @@
 # 30: Plugin List Metadata Generation
 
 - Category: Correctness
-- Status: Planned
+- Status: In Progress
 - Implementation Phase: 08-parity-closure
 - Owner: Unassigned
 - Feature ID: `plugin-list-metadata-generation`

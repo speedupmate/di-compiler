@@ -17,7 +17,7 @@ One file per feature. Status values: Planned | In Progress | Implemented.
 | 10 | [interceptor-detection](10-interceptor-detection.md) | 03 | Planned |
 | 11 | [factory-detection](11-factory-detection.md) | 03 | Planned |
 | 12 | [proxy-detection](12-proxy-detection.md) | 03 | Planned |
-| 13 | [arguments-resolver](13-arguments-resolver.md) | 03 | Planned |
+| 13 | [arguments-resolver](13-arguments-resolver.md) | 03 | Implemented |
 | 14 | [interceptor-codegen](14-interceptor-codegen.md) | 04 | Planned |
 | 15 | [factory-codegen](15-factory-codegen.md) | 04 | Planned |
 | 16 | [proxy-codegen](16-proxy-codegen.md) | 04 | Planned |
@@ -34,8 +34,11 @@ One file per feature. Status values: Planned | In Progress | Implemented.
 | 27 | [interceptor-method-signature-parity](27-interceptor-method-signature-parity.md) | 08 | Planned |
 | 28 | [scanner-parity-xml-php](28-scanner-parity-xml-php.md) | 08 | Planned |
 | 29 | [extension-attributes-generation](29-extension-attributes-generation.md) | 08 | Planned |
-| 30 | [plugin-list-metadata-generation](30-plugin-list-metadata-generation.md) | 08 | Planned |
-| 31 | [app-action-list-and-output-layout](31-app-action-list-and-output-layout.md) | 08 | Planned |
-| 32 | [runtime-map-generator-coverage](32-runtime-map-generator-coverage.md) | 08 | Planned |
+| 30 | [plugin-list-metadata-generation](30-plugin-list-metadata-generation.md) | 08 | In Progress |
+| 31 | [app-action-list-and-output-layout](31-app-action-list-and-output-layout.md) | 08 | In Progress |
+| 32 | [runtime-map-generator-coverage](32-runtime-map-generator-coverage.md) | 08 | In Progress |
 | 33 | [code-content-parity-closure](33-code-content-parity-closure.md) | 08 | In Progress |
 | 34 | [php-reflection-worker-pool](34-php-reflection-worker-pool.md) | 09 | In Progress |
+| 35 | [interface-argument-inheritance](35-interface-argument-inheritance.md) | 03 | Implemented |
+| 36 | [di-merge-order-and-null-surface](36-di-merge-order-and-null-surface.md) | 08 | Implemented |
+| 37 | [argument-surface-extra-closure](37-argument-surface-extra-closure.md) | 08 | Planned |

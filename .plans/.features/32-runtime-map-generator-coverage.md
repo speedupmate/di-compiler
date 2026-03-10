@@ -1,7 +1,7 @@
 # 32: Runtime Map Generator Coverage
 
 - Category: Correctness
-- Status: Planned
+- Status: In Progress
 - Implementation Phase: 08-parity-closure
 - Owner: Unassigned
 - Feature ID: `runtime-map-generator-coverage`

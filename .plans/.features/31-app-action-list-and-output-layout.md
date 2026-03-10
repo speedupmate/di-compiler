@@ -1,7 +1,7 @@
 # 31: App Action List and Output Layout Parity
 
 - Category: Correctness
-- Status: Planned
+- Status: In Progress
 - Implementation Phase: 08-parity-closure
 - Owner: Unassigned
 - Feature ID: `app-action-list-and-output-layout`

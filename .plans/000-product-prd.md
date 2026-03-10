@@ -26,38 +26,51 @@ Correctness first. Speed second. Never silent failures.
 - Validated by diff harness before any release (TKT-023)
 - No PHP runtime dependency at compile time (PHP fallback is opt-in, not required)
 
-## Current Status (2026-03-08)
+## Current Status (2026-03-10)
 
-### Runtime Behavior
+### Metadata Semantic Parity (Area Files)
 
-`bin/magento list` reports **177 commands in compiled mode = 177 in developer mode** —
-runtime behavior parity achieved for command dispatch. This was validated after two
-argument-resolver fixes (interface arg inheritance + recursive array merge). Multiple
-classes verified against PHP runtime via `$config->getArguments(...)` — metadata
-semantics match PHP exactly.
+Latest `compare_metadata_parity.php` snapshot:
 
-PHP runtime (`$config->getArguments()`) is now the primary correctness ground truth.
-Comparison against the archived baseline (`generated/_code/`, `generated/_metadata/`) is
-a secondary signal for byte-level file format work.
+- `global`: missing `0`, extra `40`, mismatches `0`
+- `frontend`: missing `0`, extra `40`, mismatches `0`
+- `adminhtml`: missing `0`, extra `40`, mismatches `0`
+- `crontab`: missing `0`, extra `40`, mismatches `0`
+- `webapi_rest`: missing `0`, extra `40`, mismatches `0`
+- `webapi_soap`: missing `0`, extra `40`, mismatches `0`
+- `graphql`: missing `0`, extra `40`, mismatches `0`
 
-### Code File Parity (vs Archive Baseline)
+`preferences` and `instanceTypes` are now at zero drift in all areas.
+Remaining semantic gap in area files is concentrated in `arguments` key-surface extras,
+which are currently accepted as deferred residual for this milestone.
 
-Content diffs in interceptors, factories, and proxies remain. The archived baseline
-numbers from 2026-03-05 (723 missing / 13 extra / 4219 content-different code files) are
-no longer the active tracking metric — runtime semantic parity is.
+### Archive Compare Snapshot (Generated vs _Generated)
 
-### Metadata File Parity (vs Archive Baseline)
+From `generated/diff/summary.json`:
 
-Metadata runtime semantics match PHP runtime. Remaining archive diffs are key-ordering
-artifacts (BTreeMap vs PHP insertion order) and minor serialization formatting, not
-semantic gaps.
+- `code_missing`: `0`
+- `code_extra`: `3`
+- `code_changed`: `0`
+- `metadata_missing`: `0`
+- `metadata_extra`: `0`
+- `metadata_changed`: `16`
+
+### Performance Snapshot
+
+Latest full run with `--compare-archive`:
+
+- Total: `23.885s`
+- Phase 5 (argument resolution): `0.672s`
+- Phase 7 (metadata generation): `4.142s`
+- Archive compare step: `16.121s`
+
+The prior Phase 5 regression (~103s) is closed.
 
 ### Primary Remaining Gaps
 
-- Code file byte-exact content (interceptors, factories, proxies): namespace structure, method signatures, scanner trigger/skip rules
-- Missing generated entity types: plugin-list metadata, app action list metadata, extension attributes/service data
-- Metadata key-ordering vs PHP insertion order (non-semantic, archive diff only)
-- Metadata syntax: area files may still contain invalid numeric literals (`php -n -l`)
+- Area-config argument key-surface extras (`40` keys repeated across all areas, deferred)
+- Plugin-list metadata parity (still significant drift in comparable reports)
+- Archive compare closure for `code_extra=3` and `metadata_changed=16`
 
 ## Technical Guardrails
 

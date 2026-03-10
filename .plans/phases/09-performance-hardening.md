@@ -19,16 +19,18 @@ Drive hot-path optimizations that materially reduce wall-clock compile time with
 - No regression in archive compare counts (`code/metadata missing|extra|changed`).
 - Performance work is documented and linked to local tickets.
 
-## Current Status (2026-03-06)
+## Current Status (2026-03-10)
 
-- Warm benchmark with worker branch:
-  - Total: `5.029s`
-  - Phase 4: `0.659s`
-  - Phase 6: `0.150s`
-  - Phase 7: `1.908s`
-- Residual parity deltas still tracked in Phase 08:
-  - code extra `39`, code changed `32`
-  - metadata changed `16`
+- Recent regression fix: Phase 5 is back under 1s after replacing linear
+  case-insensitive lookups with indexed lookups in DI config access paths.
+- Latest full run with `--compare-archive`:
+  - Total: `23.885s`
+  - Phase 5: `0.672s`
+  - Phase 7: `4.142s`
+  - Archive compare: `16.121s`
+- Residual parity closure remains tracked in Phase 08:
+  - `code_extra=3`
+  - `metadata_changed=16`
 
 ## Features In This Phase
 

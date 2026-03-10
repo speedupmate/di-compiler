@@ -18,13 +18,13 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [012](TKT-012-di-config-struct-queries.md) | DiConfig struct + query methods | 02 | Ready | 011 |
 | [013](TKT-013-interceptor-detection.md) | Interceptor detection | 03 | Ready | 008, 012 |
 | [014](TKT-014-factory-proxy-detection.md) | Factory + Proxy detection | 03 | Ready | 008, 012 |
-| [015](TKT-015-arguments-resolver.md) | Arguments resolver | 03 | Ready | 012, 008 |
+| [015](TKT-015-arguments-resolver.md) | Arguments resolver | 03 | Done | 012, 008 |
 | [016](TKT-016-metadata-php-serializer.md) | Metadata PHP serializer | 04 | Ready | 015 |
 | [017](TKT-017-interceptor-codegen.md) | Interceptor code generator | 04 | Ready | 013 |
 | [018](TKT-018-factory-codegen.md) | Factory code generator | 04 | Ready | 014 |
 | [019](TKT-019-proxy-codegen.md) | Proxy code generator | 04 | Ready | 014 |
 | [020](TKT-020-repository-codegen.md) | Repository code generator | 04 | Ready | 008, 012 |
-| [021](TKT-021-area-config-codegen.md) | Area config code generator | 04 | Ready | 015 |
+| [021](TKT-021-area-config-codegen.md) | Area config code generator | 04 | Done | 015 |
 | [022](TKT-022-content-addressed-writes.md) | Content-addressed writes | 04 | Ready | 017–021 |
 | [023](TKT-023-validator-diff-harness.md) | Validator diff harness | 05 | Ready | 016–022 |
 | [024](TKT-024-cli-binary.md) | CLI binary | 06 | Ready | all |
@@ -44,10 +44,18 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [038](TKT-038-interceptor-content-parity-method-surface-and-ctor-inheritance.md) | Interceptor content parity: method surface and constructor inheritance | 08 | Done | 029, 034 |
 | [039](TKT-039-proxy-content-parity-defaults-and-interface-resolution.md) | Proxy content parity: defaults and interface resolution | 08 | Done | 034 |
 | [040](TKT-040-extension-factory-content-parity-order-and-target-mapping.md) | Extension/factory content parity: ordering and target mapping | 08 | Ready | 031, 034 |
-| [041](TKT-041-final-content-diff-convergence-and-residual-documentation.md) | Final content diff convergence and residual documentation | 08 | In Progress | 040, 044, 045, 046 |
+| [041](TKT-041-final-content-diff-convergence-and-residual-documentation.md) | Final content diff convergence and residual documentation | 08 | In Progress | 040, 045 |
 | [042](TKT-042-persistent-php-worker-reflection-hotpath.md) | Persistent PHP worker for reflection hot paths | 09 | In Progress | 035 |
-| [043](TKT-043-metadata-type-universe-contract.md) | Metadata type-universe contract (real + virtual + generated) | 08 | Ready | 034 |
-| [044](TKT-044-area-config-and-interception-virtual-generated-coverage.md) | Area-config and interception metadata coverage for virtual/generated types | 08 | Ready | 043 |
-| [045](TKT-045-plugin-list-key-space-and-scope-parity.md) | Plugin-list key-space and scope parity | 08 | Ready | 043, 044 |
+| [043](TKT-043-metadata-type-universe-contract.md) | Metadata type-universe contract (real + virtual + generated) | 08 | Done | 034 |
+| [044](TKT-044-area-config-and-interception-virtual-generated-coverage.md) | Area-config and interception metadata coverage for virtual/generated types | 08 | Done | 043 |
+| [045](TKT-045-plugin-list-key-space-and-scope-parity.md) | Plugin-list key-space and scope parity | 08 | Done | 043, 044 |
 | [046](TKT-046-proxy-method-surface-order-and-shape-parity.md) | Proxy method surface, order, and class-shape parity | 08 | Ready | 039, 042 |
 | [047](TKT-047-debugging-knowledge-base-and-skill-packaging.md) | Debugging knowledge base relocation and skill packaging | 09 | Done | 037 |
+| [048](TKT-048-di-merge-config-order-fix.md) | Fix config.php module-order HashMap ordering bug | 08 | Done | — |
+| [049](TKT-049-plugin-list-interface-inheritance-fix.md) | Exclude pure interfaces from plugin-list Section 1 unless directly registered | 08 | Ready | — |
+| [050](TKT-050-plugin-sort-order-tiebreak.md) | Add secondary sort-by-name tiebreak for plugins with equal sort_order | 08 | Ready | — |
+| [051](TKT-051-disabled-plugin-filter-fix.md) | Fix filter_enabled_di_xml dropping disabled plugin entries | 08 | Ready | — |
+| [052](TKT-052-dxml-only-null-emission.md) | Emit NULL for di.xml-only configured types missing from PHP scan | 08 | Done | 035 |
+| [053](TKT-053-shared-nonshared-instance-fix.md) | Fix _i_ vs _ins_ shared/non-shared instance resolution | 08 | Done | 048, 051 |
+| [054](TKT-054-php-constant-bootstrap.md) | Bootstrap const_map from PHP runtime get_defined_constants | 08 | Done | — |
+| [055](TKT-055-argument-surface-extra-closure.md) | Deferred closure of remaining arguments extra=40 surface | 08 | Planned | 052 |

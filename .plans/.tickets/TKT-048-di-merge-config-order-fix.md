@@ -4,7 +4,7 @@ title: Fix config.php module-order HashMap ordering bug
 phase: 08-parity-closure
 feature: 36-di-merge-order-and-null-surface
 owner: Unassigned
-status: Ready
+status: Done
 estimate: S
 depends_on: []
 touches:

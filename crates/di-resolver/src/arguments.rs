@@ -459,7 +459,9 @@ fn resolve_di_argument(
             // to the preferred concrete type.
             let is_virtual_type = di_config.virtual_types.contains_key(&name);
             let has_explicit_preference = di_config.preferences.contains_key(&name)
-                || di_config.preference_keys_lc.contains_key(&name.to_ascii_lowercase());
+                || di_config
+                    .preference_keys_lc
+                    .contains_key(&name.to_ascii_lowercase());
             // For real class / interface references, apply the full preference chain
             // (including interception preferences so intercepted concretes become \Interceptor).
             let concrete = if is_virtual_type && !has_explicit_preference {
@@ -1370,9 +1372,10 @@ mod tests {
             .find(|a| a.name == "validators")
             .expect("validators arg");
         let by_name: HashMap<_, _> = match &validators.resolved {
-            ResolvedArgValue::Array(items) => {
-                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
-            }
+            ResolvedArgValue::Array(items) => items
+                .iter()
+                .map(|i| (i.name.as_str(), &i.resolved))
+                .collect(),
             other => panic!("expected configured array, got {other:?}"),
         };
         assert!(matches!(
@@ -1420,9 +1423,10 @@ mod tests {
             .find(|a| a.name == "validators")
             .expect("validators arg");
         let by_name: HashMap<_, _> = match &validators.resolved {
-            ResolvedArgValue::Array(items) => {
-                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
-            }
+            ResolvedArgValue::Array(items) => items
+                .iter()
+                .map(|i| (i.name.as_str(), &i.resolved))
+                .collect(),
             other => panic!("expected configured array, got {other:?}"),
         };
         assert!(matches!(

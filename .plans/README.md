@@ -35,4 +35,8 @@ Canonical compare baseline for this repo is:
 - Phase terminology remains `phases/`.
 - Existing `.plans` structure is preserved and updated in place.
 - External tracker mirrors local tickets; technical source-of-truth remains in repo docs.
-- Phase 09 is now active for hot-path performance hardening work (reflection + discovery caching).
+- Phase 09 is active for hot-path performance hardening work (reflection + discovery caching).
+- Current area-metadata parity target for this milestone is:
+  - `missing=0`
+  - `mismatches=0`
+  - `extra=40` accepted as deferred residual (tracked by Feature 37 / TKT-055).

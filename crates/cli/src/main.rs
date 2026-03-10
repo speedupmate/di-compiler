@@ -1216,7 +1216,10 @@ fn main() {
                 // virtual-type names should not participate in argument object resolution.
                 // Explicit DI preferences for VT aliases are already present in
                 // area_di_config.preferences and remain intact.
-                if area_di_config_for_args.virtual_types.contains_key(from.as_str()) {
+                if area_di_config_for_args
+                    .virtual_types
+                    .contains_key(from.as_str())
+                {
                     continue;
                 }
                 area_di_config_for_args
@@ -4956,15 +4959,20 @@ fn maybe_push_proxy_target(candidate: &str, out: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_argument_type_names, build_interception_registry, build_interception_type_names,
-        infer_comparable_fix_categories, render_comparable_metadata_report_text,
-        ComparableMetadataReport, ComparableReportSummary, ComparableTypeMismatchSample,
-        ComparableValueMismatchSample,
+        apply_setup_di_compile_runtime_overrides, build_argument_type_names,
+        build_interception_registry, build_interception_type_names,
+        canonicalize_instance_reference_case, infer_comparable_fix_categories,
+        render_comparable_metadata_report_text, ComparableMetadataReport, ComparableReportSummary,
+        ComparableTypeMismatchSample, ComparableValueMismatchSample,
     };
-    use di_xml_reader::{DiConfig, VirtualType};
+    use di_resolver::{
+        ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
+    };
+    use di_xml_reader::{Argument, DiConfig, VirtualType};
     use php_extractor::types::{ClassInfo, ClassKind};
     use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn class_info(fqcn: &str, extends: Option<&str>, is_abstract: bool) -> ClassInfo {
         let (namespace, name) = fqcn
@@ -5247,5 +5255,172 @@ mod tests {
         assert!(text.contains("missing_paths_sample:"));
         assert!(text.contains("extra_paths_sample:"));
         assert!(text.contains("value_mismatches_sample:"));
+    }
+
+    #[test]
+    fn setup_runtime_overrides_write_expected_setup_arguments() {
+        let root = std::env::temp_dir().join(format!(
+            "fast-di-compile-setup-override-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+
+        std::fs::create_dir_all(root.join("vendor/magento/framework")).expect("framework dir");
+        std::fs::create_dir_all(root.join("vendor/magento/framework-amqp"))
+            .expect("framework-amqp dir");
+        std::fs::create_dir_all(root.join("vendor/acme/module-a")).expect("module-a dir");
+        std::fs::create_dir_all(root.join("app/code/Acme/ModuleB")).expect("module-b dir");
+
+        let module_paths = vec![
+            root.join("vendor/acme/module-a"),
+            root.join("app/code/Acme/ModuleB"),
+        ];
+
+        let mut di_config = DiConfig::default();
+        apply_setup_di_compile_runtime_overrides(&mut di_config, &root, &module_paths, "php");
+
+        let scanner = di_config
+            .type_configs
+            .get("Magento\\Setup\\Module\\Di\\Code\\Reader\\ClassesScanner")
+            .expect("classes scanner type config");
+        let exclude_patterns = scanner
+            .arguments
+            .iter()
+            .find(|arg| matches!(arg, Argument::Array { name, .. } if name == "excludePatterns"))
+            .expect("excludePatterns argument");
+        let groups: HashMap<_, _> = match exclude_patterns {
+            Argument::Array { items, .. } => items
+                .iter()
+                .map(|item| match item {
+                    Argument::Array { name, items, .. } => (name.as_str(), items),
+                    other => panic!("expected grouped array item, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected array argument, got {other:?}"),
+        };
+
+        let application = groups
+            .get("application")
+            .expect("application exclude patterns");
+        let application_values: Vec<&str> = application
+            .iter()
+            .map(|item| match item {
+                Argument::String { value, .. } => value.as_str(),
+                other => panic!("expected string pattern, got {other:?}"),
+            })
+            .collect();
+        assert!(application_values.iter().any(|p| p.contains("module-a")));
+        assert!(application_values.iter().any(|p| p.contains("ModuleB")));
+
+        let framework = groups.get("framework").expect("framework exclude patterns");
+        let framework_values: Vec<&str> = framework
+            .iter()
+            .map(|item| match item {
+                Argument::String { value, .. } => value.as_str(),
+                other => panic!("expected string pattern, got {other:?}"),
+            })
+            .collect();
+        assert!(framework_values
+            .iter()
+            .any(|p| p.contains("framework\\-amqp")));
+
+        let setup = groups.get("setup").expect("setup exclude patterns");
+        let setup_values: Vec<&str> = setup
+            .iter()
+            .map(|item| match item {
+                Argument::String { value, .. } => value.as_str(),
+                other => panic!("expected string pattern, got {other:?}"),
+            })
+            .collect();
+        assert!(setup_values.iter().any(|p| p.contains("/setup")));
+
+        let modification_chain = di_config
+            .type_configs
+            .get("Magento\\Setup\\Module\\Di\\Compiler\\Config\\ModificationChain")
+            .expect("modification chain type config");
+        let modifications_list = modification_chain
+            .arguments
+            .iter()
+            .find(|arg| matches!(arg, Argument::Array { name, .. } if name == "modificationsList"))
+            .expect("modificationsList argument");
+        match modifications_list {
+            Argument::Array { items, .. } => assert_eq!(items.len(), 4),
+            other => panic!("expected array argument, got {other:?}"),
+        }
+
+        let plugin_list = di_config
+            .type_configs
+            .get("Magento\\Setup\\Module\\Di\\Code\\Generator\\PluginList")
+            .expect("setup plugin list config");
+        let cache_arg = plugin_list
+            .arguments
+            .iter()
+            .find_map(|arg| match arg {
+                Argument::Object { name, value, .. } if name == "cache" => Some(value.as_str()),
+                _ => None,
+            })
+            .expect("cache object argument");
+        assert_eq!(
+            cache_arg,
+            "Magento\\Framework\\App\\Interception\\Cache\\CompiledConfig"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonicalize_instance_reference_case_updates_instances_in_nested_values() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Magento\\Framework\\Filesystem\\Directory\\ReadFactory".to_string(),
+            class_info(
+                "Magento\\Framework\\Filesystem\\Directory\\ReadFactory",
+                None,
+                false,
+            ),
+        );
+
+        let mut args_map: HashMap<String, Vec<ResolvedArg>> = HashMap::new();
+        args_map.insert(
+            "Foo\\Type".to_string(),
+            vec![
+                ResolvedArg {
+                    name: "readFactory".to_string(),
+                    resolved: ResolvedArgValue::SharedInstance(
+                        "Magento\\Framework\\FileSystem\\Directory\\ReadFactory".to_string(),
+                    ),
+                },
+                ResolvedArg {
+                    name: "shape".to_string(),
+                    resolved: ResolvedArgValue::PlainArray(vec![ResolvedArrayItem {
+                        name: "instance".to_string(),
+                        value: ResolvedArrayValue::Scalar(ResolvedScalar::String(
+                            "Magento\\Framework\\FileSystem\\Directory\\ReadFactory".to_string(),
+                        )),
+                    }]),
+                },
+            ],
+        );
+
+        canonicalize_instance_reference_case(&mut args_map, &class_map);
+
+        let args = args_map.get("Foo\\Type").expect("canonicalized args");
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::SharedInstance(v)
+            if v == "Magento\\Framework\\Filesystem\\Directory\\ReadFactory"
+        ));
+        assert!(matches!(
+            &args[1].resolved,
+            ResolvedArgValue::PlainArray(items)
+                if matches!(
+                    &items[0].value,
+                    ResolvedArrayValue::Scalar(ResolvedScalar::String(v))
+                    if v == "Magento\\Framework\\Filesystem\\Directory\\ReadFactory"
+                )
+        ));
     }
 }

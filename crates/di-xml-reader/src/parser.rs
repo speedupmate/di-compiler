@@ -528,12 +528,12 @@ mod tests {
             matches!(&tc.arguments[0], Argument::Object { name, value, .. } if name == "dep" && value == "Some\\Dep")
         );
         assert!(
-            matches!(&tc.arguments[1], Argument::String { name, value } if name == "label" && value == "hello")
+            matches!(&tc.arguments[1], Argument::String { name, value, .. } if name == "label" && value == "hello")
         );
         assert!(
-            matches!(&tc.arguments[2], Argument::Boolean { name, value } if name == "flag" && *value)
+            matches!(&tc.arguments[2], Argument::Boolean { name, value, .. } if name == "flag" && *value)
         );
-        assert!(matches!(&tc.arguments[3], Argument::Null { name } if name == "nul"));
+        assert!(matches!(&tc.arguments[3], Argument::Null { name, .. } if name == "nul"));
     }
 
     #[test]
@@ -573,7 +573,7 @@ mod tests {
         let tc = config.type_configs.get("Foo\\Bar").unwrap();
         assert_eq!(tc.arguments.len(), 1);
         assert!(
-            matches!(&tc.arguments[0], Argument::String { name, value } if name == "clientIdRegex" && value == "/[^a-z_\\-0-9]/i")
+            matches!(&tc.arguments[0], Argument::String { name, value, .. } if name == "clientIdRegex" && value == "/[^a-z_\\-0-9]/i")
         );
     }
 
