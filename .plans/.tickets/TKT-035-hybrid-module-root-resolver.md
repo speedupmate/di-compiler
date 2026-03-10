@@ -4,7 +4,7 @@ title: Hybrid module-root resolver (Composer seed + registration fallback)
 phase: 09-performance-hardening
 feature: module-root-discovery-hybrid
 owner: Unassigned
-status: In Progress
+status: Wont Do
 estimate: M
 depends_on: [TKT-034]
 touches:
@@ -50,3 +50,17 @@ Introduce a single shared module-root resolver used by both PHP extraction and D
 
 - Aggressive canonicalization can drop valid module roots in multi-module packages.
 - Composer metadata shape differences (`installed.json` variants) can cause environment-specific drift.
+
+## Won't Do — Rationale (2026-03-10)
+
+The meaningful work in this ticket is already done:
+
+- Nested module root discovery via `registration.php` is in place.
+- DI XML discovery vendor-root DFS results are cached, eliminating repeated traversal.
+
+The remaining scope (shared resolver abstraction + Composer-seeded path) is
+architectural cleanup that delivers no measurable runtime improvement. Phase 1+2
+is bottlenecked on tree-sitter parsing time (~830ms for 18,800 files), not on
+module root discovery. The Composer seed would shave at most 10–20ms. The
+refactoring risk (Composer metadata shape variants, multi-module package edge
+cases) is not justified by that gain.
