@@ -1,5 +1,5 @@
 //! TKT-012: DiConfig query methods replicating PHP ObjectManager/Config/Config.php behavior.
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::model::{Argument, DiConfig, Plugin};
 
@@ -9,7 +9,7 @@ impl DiConfig {
     /// Follows the preference chain with cycle detection.
     /// Returns the input type if no preference is configured.
     pub fn get_preference(&self, fqcn: &str) -> String {
-        let mut visited = HashSet::new();
+        let mut visited = FxHashSet::default();
         let mut current = normalize(fqcn);
         loop {
             if visited.contains(&current) {
@@ -36,7 +36,7 @@ impl DiConfig {
     /// If `name` is a virtualType, returns the concrete type_name.
     /// Otherwise returns `name` unchanged.
     pub fn get_instance_type(&self, name: &str) -> String {
-        let mut visited = HashSet::new();
+        let mut visited = FxHashSet::default();
         let mut current = normalize(name);
         loop {
             if visited.contains(&current) {
@@ -100,7 +100,7 @@ impl DiConfig {
         use crate::parser::parse_di_xml_impl;
 
         let mut configs = Vec::new();
-        let di_xml_paths = find_di_xml_files(magento_root, &std::collections::HashMap::new());
+        let di_xml_paths = find_di_xml_files(magento_root, &FxHashMap::default());
         for path in di_xml_paths {
             match parse_di_xml_impl(&path) {
                 Ok(c) => configs.push(c),
@@ -144,7 +144,7 @@ fn type_config_case_insensitive<'a>(
 /// from `app/etc/config.php` (the `module_order` map), then by path.
 pub fn find_di_xml_files(
     magento_root: &std::path::Path,
-    module_order: &std::collections::HashMap<String, usize>,
+    module_order: &FxHashMap<String, usize>,
 ) -> Vec<std::path::PathBuf> {
     collect_di_xml_files(magento_root, None, module_order)
 }
@@ -157,7 +157,7 @@ pub fn find_di_xml_files(
 pub fn find_di_xml_files_for_area(
     magento_root: &std::path::Path,
     area: &str,
-    module_order: &std::collections::HashMap<String, usize>,
+    module_order: &FxHashMap<String, usize>,
 ) -> Vec<std::path::PathBuf> {
     collect_di_xml_files(magento_root, Some(area), module_order)
 }
@@ -169,7 +169,7 @@ pub fn find_di_xml_files_for_area(
 /// registrations across ALL areas, not just the global scope.
 pub fn find_all_di_xml_files(
     magento_root: &std::path::Path,
-    module_order: &std::collections::HashMap<String, usize>,
+    module_order: &FxHashMap<String, usize>,
 ) -> Vec<std::path::PathBuf> {
     const AREAS: &[&str] = &[
         "global",
@@ -180,7 +180,7 @@ pub fn find_all_di_xml_files(
         "webapi_soap",
         "graphql",
     ];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut result = Vec::new();
     // Global first
     for p in collect_di_xml_files(magento_root, None, module_order) {
@@ -207,7 +207,7 @@ pub fn find_all_di_xml_files(
 fn collect_di_xml_files(
     magento_root: &std::path::Path,
     area: Option<&str>,
-    module_order: &std::collections::HashMap<String, usize>,
+    module_order: &FxHashMap<String, usize>,
 ) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<(u8, usize, std::path::PathBuf)> = Vec::new();
 
@@ -285,7 +285,7 @@ fn collect_di_xml_files(
         base: &std::path::Path,
         priority: u8,
         area: Option<&str>,
-        module_order: &std::collections::HashMap<String, usize>,
+        module_order: &FxHashMap<String, usize>,
         out: &mut Vec<(u8, usize, std::path::PathBuf)>,
         discover_nested_modules: bool,
     ) {
@@ -325,9 +325,9 @@ fn collect_di_xml_files(
     fn cached_discover_module_roots(package_root: &std::path::Path) -> Vec<std::path::PathBuf> {
         use std::sync::{Mutex, OnceLock};
         static CACHE: OnceLock<
-            Mutex<std::collections::HashMap<std::path::PathBuf, Vec<std::path::PathBuf>>>,
+            Mutex<FxHashMap<std::path::PathBuf, Vec<std::path::PathBuf>>>,
         > = OnceLock::new();
-        let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let cache = CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
         {
             let map = cache.lock().unwrap();
             if let Some(cached) = map.get(package_root) {
@@ -427,9 +427,9 @@ fn module_name_from_module_xml(module_root: &std::path::Path) -> Option<String> 
 /// re-reading the same module.xml files on repeated `collect_di_xml_files` calls.
 fn cached_module_name(module_root: &std::path::Path) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, Option<String>>>> =
+    static CACHE: OnceLock<Mutex<FxHashMap<std::path::PathBuf, Option<String>>>> =
         OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let cache = CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
     {
         let map = cache.lock().unwrap();
         if let Some(cached) = map.get(module_root) {
@@ -448,6 +448,7 @@ fn cached_module_name(module_root: &std::path::Path) -> Option<String> {
 mod tests {
 
     use crate::model::{DiConfig, Plugin};
+    use rustc_hash::FxHashMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -550,7 +551,7 @@ mod tests {
         )
         .unwrap();
 
-        let empty_order = std::collections::HashMap::new();
+        let empty_order = FxHashMap::default();
         let global = super::find_di_xml_files(root, &empty_order);
         assert!(global.contains(&module_root.join("etc/di.xml")));
 
@@ -591,7 +592,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut module_order = std::collections::HashMap::new();
+        let mut module_order = FxHashMap::default();
         module_order.insert("Magento_B".to_string(), 0usize);
         module_order.insert("Magento_A".to_string(), 1usize);
 

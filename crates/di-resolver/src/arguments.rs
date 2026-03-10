@@ -12,7 +12,7 @@
 //!   Array             → `['_vac_' => [...]]`
 //!   Global arg ref    → `['_a_'   => 'name', '_d_' => default]`
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use php_extractor::{types::ClassKind, ClassInfo};
 
@@ -25,11 +25,11 @@ use di_xml_reader::{Argument, DiConfig};
 ///
 /// Returns a map of FQCN → Vec<ResolvedArg>.
 pub fn resolve_all_arguments(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
-    const_map: &HashMap<String, String>,
-) -> HashMap<String, Vec<ResolvedArg>> {
-    let mut result = HashMap::new();
+    const_map: &FxHashMap<String, String>,
+) -> FxHashMap<String, Vec<ResolvedArg>> {
+    let mut result = FxHashMap::default();
 
     for (fqcn, info) in class_map {
         let resolved = resolve_for_class(fqcn, info, class_map, di_config, const_map);
@@ -51,12 +51,12 @@ pub fn resolve_all_arguments(
 /// generated classes (interceptors, factories, proxies) or types missing from the scan.
 pub fn resolve_all_arguments_for_named_types(
     type_names: &[String],
-    class_map: &HashMap<String, ClassInfo>,
-    base_class_fqcns: &HashSet<String>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    base_class_fqcns: &FxHashSet<String>,
     di_config: &DiConfig,
-    const_map: &HashMap<String, String>,
-) -> HashMap<String, Vec<ResolvedArg>> {
-    let mut result = HashMap::new();
+    const_map: &FxHashMap<String, String>,
+) -> FxHashMap<String, Vec<ResolvedArg>> {
+    let mut result = FxHashMap::default();
     for type_name in type_names {
         let name = type_name.trim_start_matches('\\');
         let kind = class_map.get(name).map(|c| c.kind.clone());
@@ -103,12 +103,12 @@ pub fn resolve_all_arguments_for_named_types(
 pub fn resolve_for_class(
     fqcn: &str,
     info: &ClassInfo,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
-    const_map: &HashMap<String, String>,
+    const_map: &FxHashMap<String, String>,
 ) -> Vec<ResolvedArg> {
     let di_args = merged_di_arguments_for_type_name(fqcn, class_map, di_config);
-    let di_arg_map: HashMap<&str, &Argument> =
+    let di_arg_map: FxHashMap<&str, &Argument> =
         di_args.iter().map(|a| (argument_name(a), a)).collect();
     let Some(ctor) = &info.constructor else {
         return vec![];
@@ -178,9 +178,9 @@ pub fn resolve_for_class(
 
 fn resolve_for_type_name(
     type_name: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
-    const_map: &HashMap<String, String>,
+    const_map: &FxHashMap<String, String>,
 ) -> Vec<ResolvedArg> {
     let normalized = normalize(type_name);
     let is_virtual = di_config.virtual_types.contains_key(&normalized);
@@ -259,13 +259,13 @@ fn resolve_for_type_name(
 
 fn class_info_with_inherited_constructor(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> Option<ClassInfo> {
     let mut info = class_map.get(fqcn)?.clone();
     if info.constructor.is_some() {
         return Some(info);
     }
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut cursor = info.extends.clone();
     while let Some(parent) = cursor {
         if !seen.insert(parent.clone()) {
@@ -285,7 +285,7 @@ fn class_info_with_inherited_constructor(
 
 fn merged_di_arguments_for_type_name(
     type_name: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
 ) -> Vec<Argument> {
     // Build the full type chain: PHP class hierarchy (root→leaf) followed by
@@ -315,7 +315,7 @@ fn merged_di_arguments_for_type_name(
     let mut extends_chain: Vec<String> = Vec::new();
     {
         let mut cursor = concrete.clone();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
         while !cursor.is_empty() && seen.insert(cursor.clone()) {
             extends_chain.push(cursor.clone());
             match class_map.get(&cursor).and_then(|i| i.extends.as_ref()) {
@@ -331,10 +331,10 @@ fn merged_di_arguments_for_type_name(
     //     Interfaces are inserted before the class so the class's own args win.
     let mut class_hierarchy: Vec<String> = Vec::new();
     {
-        let mut parent_implements: HashSet<String> = HashSet::new();
+        let mut parent_implements: FxHashSet<String> = FxHashSet::default();
         for class_name in &extends_chain {
             if let Some(info) = class_map.get(class_name) {
-                let class_implements: HashSet<String> =
+                let class_implements: FxHashSet<String> =
                     info.implements.iter().map(|i| normalize(i)).collect();
                 let mut new_interfaces: Vec<String> = class_implements
                     .difference(&parent_implements)
@@ -360,7 +360,7 @@ fn merged_di_arguments_for_type_name(
     //    semantics) rather than replacing — this is critical for arguments like `commands`
     //    that are contributed by many di.xml files across many modules.
     let mut merged: Vec<Argument> = Vec::new();
-    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut by_name: FxHashMap<String, usize> = FxHashMap::default();
 
     for ancestor in &class_hierarchy {
         let chain = virtual_type_chain(ancestor, di_config);
@@ -408,7 +408,7 @@ fn merge_argument_into(dst: &mut Argument, src: &Argument) {
 
 fn virtual_type_chain(type_name: &str, di_config: &DiConfig) -> Vec<String> {
     let mut chain = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut current = normalize(type_name);
     loop {
         if !seen.insert(current.clone()) {
@@ -448,7 +448,7 @@ fn first_non_null_class_type_hint_arm(type_hint: &str) -> Option<String> {
 fn resolve_di_argument(
     arg: &Argument,
     di_config: &DiConfig,
-    const_map: &HashMap<String, String>,
+    const_map: &FxHashMap<String, String>,
 ) -> ResolvedArgValue {
     match arg {
         Argument::Object { value, shared, .. } => {
@@ -533,7 +533,7 @@ fn resolve_di_argument(
 fn resolve_configured_instance_argument(
     arg: &Argument,
     di_config: &DiConfig,
-    const_map: &HashMap<String, String>,
+    const_map: &FxHashMap<String, String>,
 ) -> ResolvedArgValue {
     resolve_di_argument(arg, di_config, const_map)
 }
@@ -542,7 +542,7 @@ fn resolve_configured_non_object_argument(
     arg: &Argument,
     constructor_default: Option<&str>,
     di_config: &DiConfig,
-    const_map: &HashMap<String, String>,
+    const_map: &FxHashMap<String, String>,
 ) -> ResolvedArgValue {
     match arg {
         // When constructor param is non-object but di.xml provides xsi:type="object",
@@ -573,7 +573,7 @@ fn resolve_configured_non_object_argument(
 /// Resolve a PHP constant expression of the form `ClassName::CONST_NAME` to its actual
 /// value using the pre-built const_map.  If the expression is not in `ClassName::CONST_NAME`
 /// form (or has no match), the raw string is returned unchanged.
-fn resolve_php_constant_expr(expr: &str, const_map: &HashMap<String, String>) -> String {
+fn resolve_php_constant_expr(expr: &str, const_map: &FxHashMap<String, String>) -> String {
     let normalized = expr.trim().trim_start_matches('\\');
     if let Some(resolved) = const_map.get(normalized) {
         return resolved.clone();
@@ -583,7 +583,7 @@ fn resolve_php_constant_expr(expr: &str, const_map: &HashMap<String, String>) ->
 
 fn resolve_non_object_default(
     default_value: Option<&str>,
-    const_map: &HashMap<String, String>,
+    const_map: &FxHashMap<String, String>,
 ) -> ResolvedArgValue {
     let Some(raw) = default_value else {
         return ResolvedArgValue::Null;
@@ -1105,8 +1105,8 @@ mod tests {
         }
     }
 
-    fn preprocessor_pool_fixture() -> (HashMap<String, ClassInfo>, DiConfig) {
-        let mut class_map = HashMap::new();
+    fn preprocessor_pool_fixture() -> (FxHashMap<String, ClassInfo>, DiConfig) {
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Magento\\Framework\\View\\Asset\\PreProcessor\\Pool".to_string(),
             make_class_with_constructor(
@@ -1195,13 +1195,13 @@ mod tests {
 
     #[test]
     fn test_resolves_object_param_as_shared_instance() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("logger", Some("App\\Logger"))]),
         );
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert_eq!(args.len(), 1);
         assert!(
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_di_xml_string_override() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("label", Some("string"))]),
@@ -1228,7 +1228,7 @@ mod tests {
                 }],
             },
         );
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert!(matches!(
             &args[0].resolved,
@@ -1238,27 +1238,27 @@ mod tests {
 
     #[test]
     fn test_null_for_no_type_hint() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("options", None)]),
         );
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
     }
 
     #[test]
     fn test_nullable_object_type_hint_normalized() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("dep", Some("?App\\Dep"))]),
         );
 
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert!(matches!(
             &args[0].resolved,
@@ -1268,14 +1268,14 @@ mod tests {
 
     #[test]
     fn test_union_with_primitive_uses_class_arm() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("dep", Some("string|App\\Dep"))]),
         );
 
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert!(matches!(
             &args[0].resolved,
@@ -1285,21 +1285,21 @@ mod tests {
 
     #[test]
     fn test_union_without_class_resolves_null() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("dep", Some("string|null"))]),
         );
 
         let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
     }
 
     #[test]
     fn test_non_object_param_with_object_di_value_serializes_as_v_instance_shape() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Method".to_string(),
             make_class("App\\Method", vec![("formBlockType", None)]),
@@ -1319,7 +1319,7 @@ mod tests {
             },
         );
 
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Method"];
         assert!(matches!(
             &args[0].resolved,
@@ -1336,7 +1336,7 @@ mod tests {
 
     #[test]
     fn test_virtual_type_object_item_honors_explicit_preference() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\RequestValidator".to_string(),
             make_class("App\\RequestValidator", vec![("validators", Some("array"))]),
@@ -1372,13 +1372,13 @@ mod tests {
         );
         di_config.refresh_lookup_indexes();
 
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\RequestValidator"];
         let validators = args
             .iter()
             .find(|a| a.name == "validators")
             .expect("validators arg");
-        let by_name: HashMap<_, _> = match &validators.resolved {
+        let by_name: FxHashMap<_, _> = match &validators.resolved {
             ResolvedArgValue::Array(items) => items
                 .iter()
                 .map(|i| (i.name.as_str(), &i.resolved))
@@ -1394,7 +1394,7 @@ mod tests {
 
     #[test]
     fn test_virtual_type_object_item_without_explicit_preference_keeps_alias() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\RequestValidator".to_string(),
             make_class("App\\RequestValidator", vec![("validators", Some("array"))]),
@@ -1425,13 +1425,13 @@ mod tests {
             },
         );
 
-        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\RequestValidator"];
         let validators = args
             .iter()
             .find(|a| a.name == "validators")
             .expect("validators arg");
-        let by_name: HashMap<_, _> = match &validators.resolved {
+        let by_name: FxHashMap<_, _> = match &validators.resolved {
             ResolvedArgValue::Array(items) => items
                 .iter()
                 .map(|i| (i.name.as_str(), &i.resolved))
@@ -1451,13 +1451,13 @@ mod tests {
         let map = resolve_all_arguments_for_named_types(
             &["AssetPreProcessorPool".to_string()],
             &class_map,
-            &HashSet::new(),
+            &FxHashSet::default(),
             &di_config,
-            &HashMap::new(),
+            &FxHashMap::default(),
         );
         let args = &map["AssetPreProcessorPool"];
 
-        let by_name: HashMap<_, _> = args
+        let by_name: FxHashMap<_, _> = args
             .iter()
             .map(|a| (a.name.as_str(), &a.resolved))
             .collect();
@@ -1492,9 +1492,9 @@ mod tests {
         let map = resolve_all_arguments_for_named_types(
             &["\\AssetPreProcessorPool".to_string()],
             &class_map,
-            &HashSet::new(),
+            &FxHashSet::default(),
             &di_config,
-            &HashMap::new(),
+            &FxHashMap::default(),
         );
         let args = map.get("\\AssetPreProcessorPool").expect("resolved args");
         assert!(args.iter().any(|a| a.name == "objectManager"));
@@ -1503,7 +1503,7 @@ mod tests {
 
     #[test]
     fn test_init_parameter_without_constructor_default_sets_global_arg_ref_without_default() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("mode", None)]),
@@ -1522,7 +1522,7 @@ mod tests {
             },
         );
 
-        let mut const_map = HashMap::new();
+        let mut const_map = FxHashMap::default();
         const_map.insert("App\\State::MODE".to_string(), "MAGE_MODE".to_string());
 
         let map = resolve_all_arguments(&class_map, &di_config, &const_map);
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test]
     fn test_interface_arguments_merge_into_concrete_with_recursive_array_merge() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         let mut command_list = make_class(
             "Magento\\Framework\\Console\\CommandList",
             vec![("commands", Some("array"))],
@@ -1595,7 +1595,7 @@ mod tests {
             },
         );
 
-        let resolved = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let resolved = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = resolved
             .get("Magento\\Framework\\Console\\CommandList")
             .expect("resolved arguments");
@@ -1603,7 +1603,7 @@ mod tests {
             .iter()
             .find(|a| a.name == "commands")
             .expect("commands argument must exist");
-        let by_name: HashMap<_, _> = match &commands.resolved {
+        let by_name: FxHashMap<_, _> = match &commands.resolved {
             ResolvedArgValue::Array(items) => items
                 .iter()
                 .map(|i| (i.name.as_str(), &i.resolved))
@@ -1628,7 +1628,7 @@ mod tests {
 
     #[test]
     fn test_virtual_type_array_argument_merges_parent_sources_without_dropping_entries() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
             make_class(
@@ -1727,9 +1727,9 @@ mod tests {
         let resolved = resolve_all_arguments_for_named_types(
             &["systemConfigSnapshotSourceAggregated".to_string()],
             &class_map,
-            &HashSet::new(),
+            &FxHashSet::default(),
             &di_config,
-            &HashMap::new(),
+            &FxHashMap::default(),
         );
         let args = resolved
             .get("systemConfigSnapshotSourceAggregated")
@@ -1738,7 +1738,7 @@ mod tests {
             .iter()
             .find(|a| a.name == "sources")
             .expect("sources argument must exist");
-        let by_name: HashMap<_, _> = match &sources.resolved {
+        let by_name: FxHashMap<_, _> = match &sources.resolved {
             ResolvedArgValue::Array(items) => items
                 .iter()
                 .map(|i| (i.name.as_str(), &i.resolved))
@@ -1749,7 +1749,7 @@ mod tests {
         assert_eq!(by_name.len(), 3);
         for key in ["modular", "dynamic", "initial"] {
             let entry = by_name.get(key).copied().expect("source entry");
-            let inner: HashMap<_, _> = match entry {
+            let inner: FxHashMap<_, _> = match entry {
                 ResolvedArgValue::Array(items) => items
                     .iter()
                     .map(|i| (i.name.as_str(), &i.resolved))
@@ -1763,7 +1763,7 @@ mod tests {
 
     #[test]
     fn test_optional_constructor_var_export_array_default_is_parsed_as_plain_array() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Magento\\Store\\Model\\StoreResolver\\ReaderList".to_string(),
             make_class_with_constructor(
@@ -1783,14 +1783,14 @@ mod tests {
             ),
         );
 
-        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &FxHashMap::default());
         let args = &map["Magento\\Store\\Model\\StoreResolver\\ReaderList"];
         let resolver_map = args
             .iter()
             .find(|a| a.name == "resolverMap")
             .expect("resolverMap arg");
 
-        let by_key: HashMap<_, _> = match &resolver_map.resolved {
+        let by_key: FxHashMap<_, _> = match &resolver_map.resolved {
             ResolvedArgValue::PlainArray(items) => {
                 items.iter().map(|i| (i.name.as_str(), &i.value)).collect()
             }
@@ -1817,7 +1817,7 @@ mod tests {
 
     #[test]
     fn test_optional_constructor_short_array_default_is_parsed_as_plain_array() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\ArrayDefaults".to_string(),
             make_class_with_constructor(
@@ -1837,14 +1837,14 @@ mod tests {
             ),
         );
 
-        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &HashMap::new());
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &FxHashMap::default());
         let args = &map["App\\ArrayDefaults"];
         let payload = args
             .iter()
             .find(|a| a.name == "payload")
             .expect("payload arg");
 
-        let by_key: HashMap<_, _> = match &payload.resolved {
+        let by_key: FxHashMap<_, _> = match &payload.resolved {
             ResolvedArgValue::PlainArray(items) => {
                 items.iter().map(|i| (i.name.as_str(), &i.value)).collect()
             }
@@ -1865,7 +1865,7 @@ mod tests {
         ));
 
         let nested = by_key.get("c").copied().expect("nested c");
-        let nested_map: HashMap<_, _> = match nested {
+        let nested_map: FxHashMap<_, _> = match nested {
             ResolvedArrayValue::Array(items) => {
                 items.iter().map(|i| (i.name.as_str(), &i.value)).collect()
             }

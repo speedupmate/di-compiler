@@ -1,20 +1,20 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Merged DI configuration from all di.xml files.
 #[derive(Debug, Default, Clone)]
 pub struct DiConfig {
     /// preference @for → @type
-    pub preferences: HashMap<String, String>,
+    pub preferences: FxHashMap<String, String>,
     /// type @name → Vec<Plugin>
-    pub plugins: HashMap<String, Vec<Plugin>>,
+    pub plugins: FxHashMap<String, Vec<Plugin>>,
     /// virtualType @name → @type (parent)
-    pub virtual_types: HashMap<String, VirtualType>,
+    pub virtual_types: FxHashMap<String, VirtualType>,
     /// type @name → TypeConfig
-    pub type_configs: HashMap<String, TypeConfig>,
+    pub type_configs: FxHashMap<String, TypeConfig>,
     /// Lowercased preference key -> canonical key (for fast case-insensitive lookup)
-    pub preference_keys_lc: HashMap<String, String>,
+    pub preference_keys_lc: FxHashMap<String, String>,
     /// Lowercased type config key -> canonical key (for fast case-insensitive lookup)
-    pub type_config_keys_lc: HashMap<String, String>,
+    pub type_config_keys_lc: FxHashMap<String, String>,
 }
 
 impl DiConfig {

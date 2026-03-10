@@ -25,7 +25,7 @@ struct Scanner<'a> {
     /// Current file namespace (populated when `namespace` keyword is parsed).
     namespace: String,
     /// File-level `use` imports: short alias → fully-qualified class name.
-    use_map: std::collections::HashMap<String, String>,
+    use_map: rustc_hash::FxHashMap<String, String>,
 }
 
 impl<'a> Scanner<'a> {
@@ -34,7 +34,7 @@ impl<'a> Scanner<'a> {
             src,
             pos: 0,
             namespace: String::new(),
-            use_map: std::collections::HashMap::new(),
+            use_map: rustc_hash::FxHashMap::default(),
         }
     }
 

@@ -10,7 +10,8 @@
 //!   7. Generate metadata files (area configs, interception.php)
 //!   8. Incremental writes (skip unchanged — TKT-022/026)
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -116,7 +117,7 @@ struct Args {
 #[derive(Serialize, Deserialize, Default)]
 struct IncrementalCache {
     /// Map of absolute path → blake3 hex hash of that file at last compile
-    files: HashMap<String, String>,
+    files: FxHashMap<String, String>,
 }
 
 impl IncrementalCache {
@@ -136,17 +137,6 @@ impl IncrementalCache {
     fn hash_of(path: &Path) -> Option<String> {
         let data = std::fs::read(path).ok()?;
         Some(blake3::hash(&data).to_hex().to_string())
-    }
-
-    fn is_unchanged(&self, path: &Path) -> bool {
-        let key = path.to_string_lossy().to_string();
-        let Some(cached) = self.files.get(&key) else {
-            return false;
-        };
-        let Some(current) = Self::hash_of(path) else {
-            return false;
-        };
-        *cached == current
     }
 
     fn record(&mut self, path: &Path) {
@@ -448,39 +438,40 @@ fn main() {
 
     let pb = progress_bar(php_files.len() as u64, "Extracting PHP classes");
 
-    let class_map: Arc<Mutex<HashMap<String, ClassInfo>>> = Arc::new(Mutex::new(HashMap::new()));
-    let fallback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let failure_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fallback_count = std::sync::atomic::AtomicUsize::new(0);
+    let failure_count = std::sync::atomic::AtomicUsize::new(0);
 
-    // Share cache for read access in parallel section
-    let cache_ref = &cache;
+    // (cache_ref is unused since di.xml parse-skip was removed as a correctness fix)
+    let _cache_ref = &cache;
 
-    php_files.par_iter().for_each(|path| {
-        let result = extract_file(path);
-        pb.inc(1);
-        match result {
-            ExtractResult::Ok(info) => {
-                let mut map = class_map.lock().unwrap();
-                map.insert(info.fqcn.clone(), info);
+    let class_map: FxHashMap<String, ClassInfo> = php_files
+        .par_iter()
+        .filter_map(|path| {
+            let result = extract_file(path);
+            pb.inc(1);
+            match result {
+                ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
+                ExtractResult::NoClass => None,
+                ExtractResult::PhpFallbackFailed(e) => {
+                    fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::warn!("Fallback failed for {}: {}", path.display(), e);
+                    None
+                }
+                ExtractResult::LexError(e) => {
+                    failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::warn!("Lex error for {}: {e}", path.display());
+                    None
+                }
+                ExtractResult::ParseFailure(e) => {
+                    failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::warn!("Parse failure for {}: {}", path.display(), e);
+                    None
+                }
             }
-            ExtractResult::NoClass => {}
-            ExtractResult::PhpFallbackFailed(e) => {
-                fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                log::warn!("Fallback failed for {}: {}", path.display(), e);
-            }
-            ExtractResult::LexError(e) => {
-                failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                log::warn!("Lex error for {}: {e}", path.display());
-            }
-            ExtractResult::ParseFailure(e) => {
-                failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                log::warn!("Parse failure for {}: {}", path.display(), e);
-            }
-        }
-    });
+        })
+        .collect();
     pb.finish_with_message("done");
 
-    let class_map = Arc::try_unwrap(class_map).unwrap().into_inner().unwrap();
     let fallbacks = fallback_count.load(std::sync::atomic::Ordering::Relaxed);
     let failures = failure_count.load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
@@ -505,13 +496,11 @@ fn main() {
 
     let pb = progress_bar(di_xml_files.len() as u64, "Parsing di.xml (global)");
     // Parse with path retained so we can split primary (app/etc/di.xml) from modules.
+    // NOTE: di.xml files must always be parsed — skipping unchanged files would drop
+    // them from the merge entirely, producing an incomplete di_config (correctness bug).
     let global_di_path_configs: Vec<_> = di_xml_files
         .par_iter()
         .filter_map(|path| {
-            if args.incremental && cache_ref.is_unchanged(path) {
-                pb.inc(1);
-                return None;
-            }
             let r = parse_di_xml(path);
             pb.inc(1);
             match r {
@@ -546,7 +535,7 @@ fn main() {
     let global_di_configs: Vec<DiConfig> =
         global_di_path_configs.into_iter().map(|(_, c)| c).collect();
     // HashSet for O(1) membership tests — used in Phase 3b and Phase 7 filters.
-    let di_xml_files_set: HashSet<&PathBuf> = di_xml_files.iter().collect();
+    let di_xml_files_set: FxHashSet<&PathBuf> = di_xml_files.iter().collect();
     log_phase_elapsed("Phase 3a", phase_3a_started);
 
     // -----------------------------------------------------------------------
@@ -612,7 +601,7 @@ fn main() {
     let phase_4_started = Instant::now();
     let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
     let proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
-    let mut extra_existing_proxy_targets: HashSet<String> = HashSet::new();
+    let mut extra_existing_proxy_targets: FxHashSet<String> = FxHashSet::default();
     if let Some(index) = &composer_autoload {
         for target in proxy_targets {
             if class_map.contains_key(&target) {
@@ -644,7 +633,7 @@ fn main() {
 
     // Extension class factories are generated by Magento's PHP scanner path.
     // Include them even when no constructor/XML factory trigger references them.
-    let mut factory_seen: HashSet<String> = factories
+    let mut factory_seen: FxHashSet<String> = factories
         .iter()
         .map(|spec| spec.factory_fqcn.clone())
         .collect();
@@ -767,9 +756,9 @@ fn main() {
     // TKT-054: Bootstrap with PHP extension constants first (e.g. MCRYPT_BLOWFISH,
     // MCRYPT_MODE_ECB) that are never defined in any Magento PHP source file.
     // Source-scan constants added after will override these builtins on collision.
-    let const_map: HashMap<String, String> = {
+    let const_map: FxHashMap<String, String> = {
         // Collect unique ClassName::CONST_NAME expressions from all di_config arguments
-        let mut init_exprs: HashSet<String> = HashSet::new();
+        let mut init_exprs: FxHashSet<String> = FxHashSet::default();
         let mut collect_from_arg = |arg: &Argument| {
             if let Argument::Init { value, .. } = arg {
                 let normalized = value.trim().trim_start_matches('\\');
@@ -812,9 +801,9 @@ fn main() {
     log::info!("Resolved arguments for {} classes", args_map.len());
 
     // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
-    let intercepted_set: std::collections::HashSet<&str> =
+    let intercepted_set: FxHashSet<&str> =
         interceptors.iter().map(|s| s.fqcn.as_str()).collect();
-    let all_fqcns_phase5: HashMap<String, bool> = interception_class_map
+    let all_fqcns_phase5: FxHashMap<String, bool> = interception_class_map
         .keys()
         .map(|fqcn| {
             let intercepted = intercepted_set.contains(fqcn.as_str());
@@ -851,7 +840,7 @@ fn main() {
         "Generating code",
     );
     let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reflected_ctor_params: HashMap<String, Vec<ConstructorParam>> = interceptors
+    let reflected_ctor_params: FxHashMap<String, Vec<ConstructorParam>> = interceptors
         .par_iter()
         .filter_map(|spec| {
             let info = interceptor_target_info_with_inherited_constructor(
@@ -909,7 +898,7 @@ fn main() {
     });
 
     let unique_proxy_targets: Vec<String> = {
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         proxies
             .iter()
             .filter_map(|spec| {
@@ -921,7 +910,7 @@ fn main() {
             })
             .collect()
     };
-    let reflected_proxy_kinds: HashMap<String, ClassKind> = unique_proxy_targets
+    let reflected_proxy_kinds: FxHashMap<String, ClassKind> = unique_proxy_targets
         .par_iter()
         .filter_map(|target_fqcn| {
             if interception_class_map.contains_key(target_fqcn) {
@@ -931,7 +920,7 @@ fn main() {
             Some((target_fqcn.clone(), kind))
         })
         .collect();
-    let reflected_proxy_methods: HashMap<String, Vec<MethodSignature>> = unique_proxy_targets
+    let reflected_proxy_methods: FxHashMap<String, Vec<MethodSignature>> = unique_proxy_targets
         .par_iter()
         .filter_map(|target_fqcn| {
             let mut reflected_methods =
@@ -1085,12 +1074,14 @@ fn main() {
         &args.fallback_php,
     );
     apply_resolved_constants_to_di_config(&mut metadata_base_di_config, &resolved_const_values);
+    // Freeze into Arc so the area par_iter loop can share it without cloning.
+    let metadata_base_di_config = std::sync::Arc::new(metadata_base_di_config);
 
     let generated_class_map = extract_generated_class_map(&code_root);
     let mut metadata_class_map = merged_class_map(&interception_class_map, &generated_class_map);
     // Source-only FQCNs for null-emission filtering: PHP emits NULL only for scanned
     // source concrete classes, not for generated artifacts (interceptors, factories, proxies).
-    let base_class_fqcns: HashSet<String> = interception_class_map.keys().cloned().collect();
+    let base_class_fqcns: FxHashSet<String> = interception_class_map.keys().cloned().collect();
     let argument_type_names = build_argument_type_names(
         &interception_class_map,
         &generated_class_map,
@@ -1113,32 +1104,18 @@ fn main() {
         &proxy_deferred,
         &extension_specs,
     );
-    let reflected_metadata_ctors = enrich_constructor_defaults_with_reflection(
-        &mut metadata_class_map,
-        &args.magento_root,
-        &args.fallback_php,
-    );
-    // Second pass: reflect constructors for classes that appear in the argument
-    // type universe but whose constructor could not be found by our lexer because
-    // they inherit from a class outside our scan scope (e.g. PHP built-in \Exception,
-    // or a third-party library). We restrict this to argument_type_names to avoid
-    // reflecting every abstract base class in the codebase.
-    let reflected_inherited_ctors = enrich_inherited_constructors_with_reflection(
-        &mut metadata_class_map,
-        &argument_type_names,
-        &args.magento_root,
-        &args.fallback_php,
-    );
-    // Virtual types can resolve to third-party classes outside our scanner
-    // scope (for example Monolog\Logger). Reflect those constructor defaults
-    // so VT args include inherited optional defaults (handlers/processors/timezone).
-    let reflected_virtual_target_ctors = enrich_virtual_target_constructors_with_reflection(
-        &mut metadata_class_map,
-        &argument_type_names,
-        &metadata_base_di_config,
-        &args.magento_root,
-        &args.fallback_php,
-    );
+    // All three reflection passes merged into one par_iter — eliminates two
+    // Rayon barriers. Candidates are disjoint: pass 1 has constructors with
+    // constant defaults, pass 2 has no constructor + extends, pass 3 adds
+    // VT targets absent from class_map.
+    let (reflected_metadata_ctors, reflected_inherited_ctors, reflected_virtual_target_ctors) =
+        enrich_all_constructors_with_reflection(
+            &mut metadata_class_map,
+            &argument_type_names,
+            &metadata_base_di_config,
+            &args.magento_root,
+            &args.fallback_php,
+        );
     log::info!(
         "Metadata universe: args {} / interception {} type names (base {}, generated {}, ctor reflections {}, inherited reflections {}, virtual-target reflections {})",
         argument_type_names.len(),
@@ -1169,7 +1146,7 @@ fn main() {
     // Per-area config files — each area merges global + area-specific di.xml overlays.
     // Run in parallel: each area is independent (different files, different output path).
     let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
-    let area_di_configs: HashMap<String, DiConfig> = AREAS
+    let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = AREAS
         .par_iter()
         .map(|&area| {
             let area_di_files = filter_enabled_di_xml(
@@ -1179,38 +1156,43 @@ fn main() {
             );
 
             // Only re-merge if there are area-specific files beyond the global set.
-            let area_di_config = if area_di_files.len() > di_xml_files.len() {
-                let area_only: Vec<_> = area_di_files
-                    .iter()
-                    .filter(|p| !di_xml_files_set.contains(p))
-                    .collect();
-                if area_only.is_empty() {
-                    metadata_base_di_config.clone()
-                } else {
-                    let extra_configs: Vec<_> = area_only
+            // Use Arc::clone for the no-overrides path to avoid cloning the large DiConfig.
+            let area_di_config: std::sync::Arc<DiConfig> =
+                if area_di_files.len() > di_xml_files.len() {
+                    let area_only: Vec<_> = area_di_files
                         .iter()
-                        .filter_map(|p| parse_di_xml(p).ok())
+                        .filter(|p| !di_xml_files_set.contains(p))
                         .collect();
-                    // Area-specific module configs applied via the same two-phase merge as
-                    // global: deep-merge area module configs together, then apply on the
-                    // global base using shallow (array_replace) semantics per PHP behaviour.
-                    let mut merged_area = apply_module_config_on_primary(
-                        metadata_base_di_config.clone(),
-                        merge_configs(extra_configs),
-                    );
-                    apply_resolved_constants_to_di_config(&mut merged_area, &resolved_const_values);
-                    merged_area
-                }
-            } else {
-                metadata_base_di_config.clone()
-            };
+                    if area_only.is_empty() {
+                        std::sync::Arc::clone(&metadata_base_di_config)
+                    } else {
+                        let extra_configs: Vec<_> = area_only
+                            .iter()
+                            .filter_map(|p| parse_di_xml(p).ok())
+                            .collect();
+                        // Area-specific module configs applied via the same two-phase merge as
+                        // global: deep-merge area module configs together, then apply on the
+                        // global base using shallow (array_replace) semantics per PHP behaviour.
+                        let mut merged_area = apply_module_config_on_primary(
+                            (*metadata_base_di_config).clone(),
+                            merge_configs(extra_configs),
+                        );
+                        apply_resolved_constants_to_di_config(
+                            &mut merged_area,
+                            &resolved_const_values,
+                        );
+                        std::sync::Arc::new(merged_area)
+                    }
+                } else {
+                    std::sync::Arc::clone(&metadata_base_di_config)
+                };
 
             // Build area-specific preference overrides and direct interceptor map.
             let area_preference_overrides =
                 build_interception_preference_overrides(&area_di_config, &global_interceptor_map);
             let area_instance_type_overrides = global_interceptor_map.clone();
 
-            let mut area_di_config_for_args = area_di_config.clone();
+            let mut area_di_config_for_args = (*area_di_config).clone();
             for (from, to) in &area_preference_overrides {
                 // Keep VT argument values stable: synthetic interception overrides for
                 // virtual-type names should not participate in argument object resolution.
@@ -1231,7 +1213,7 @@ fn main() {
             // Area-specific di.xml files may define additional virtual types not present
             // in the global di config. Extend the type universe with those for this area.
             let area_type_names: Vec<String> = {
-                let base_set: std::collections::HashSet<&str> =
+                let base_set: FxHashSet<&str> =
                     argument_type_names.iter().map(|s| s.as_str()).collect();
                 let extra: Vec<String> = area_di_config_for_args
                     .virtual_types
@@ -1255,7 +1237,7 @@ fn main() {
                 &const_map,
             );
             canonicalize_instance_reference_case(&mut area_args, &interception_class_map);
-            let area_args: HashMap<String, Vec<di_resolver::ResolvedArg>> = area_args
+            let area_args: FxHashMap<String, Vec<di_resolver::ResolvedArg>> = area_args
                 .into_iter()
                 .filter(|(fqcn, args)| {
                     // Intercepted concrete classes appear under ClassName\Interceptor, not
@@ -1317,7 +1299,7 @@ fn main() {
     );
     for scope in plugin_scopes {
         if let Some(scope_di_config) = area_di_configs.get(scope) {
-            let mut plugin_di_config = scope_di_config.clone();
+            let mut plugin_di_config = (**scope_di_config).clone();
             if scope != "global" {
                 plugin_di_config.virtual_types.clear();
             }
@@ -1462,13 +1444,13 @@ fn resolve_php_constants_in_config(
     di_config: &DiConfig,
     magento_root: &Path,
     php_bin: &str,
-) -> HashMap<String, ResolvedConstValue> {
-    let mut const_exprs = HashSet::new();
+) -> FxHashMap<String, ResolvedConstValue> {
+    let mut const_exprs = FxHashSet::default();
     for type_config in di_config.type_configs.values() {
         collect_const_expressions(&type_config.arguments, &mut const_exprs);
     }
     if const_exprs.is_empty() {
-        return HashMap::new();
+        return FxHashMap::default();
     }
 
     let const_vec: Vec<String> = const_exprs.into_iter().collect();
@@ -1481,7 +1463,7 @@ fn resolve_php_constants_in_config(
         .collect()
 }
 
-fn collect_const_expressions(arguments: &[Argument], out: &mut HashSet<String>) {
+fn collect_const_expressions(arguments: &[Argument], out: &mut FxHashSet<String>) {
     for arg in arguments {
         match arg {
             Argument::Const { value, .. } => {
@@ -1520,7 +1502,7 @@ fn reflect_constant_value(
 
 fn apply_resolved_constants_to_di_config(
     di_config: &mut DiConfig,
-    values: &HashMap<String, ResolvedConstValue>,
+    values: &FxHashMap<String, ResolvedConstValue>,
 ) {
     if values.is_empty() {
         return;
@@ -1532,7 +1514,7 @@ fn apply_resolved_constants_to_di_config(
 
 fn apply_resolved_constants_to_arguments(
     arguments: &mut [Argument],
-    values: &HashMap<String, ResolvedConstValue>,
+    values: &FxHashMap<String, ResolvedConstValue>,
 ) {
     for arg in arguments.iter_mut() {
         match arg {
@@ -1937,104 +1919,49 @@ fn regex_quote_for_hash(input: &str) -> String {
     out
 }
 
-fn enrich_constructor_defaults_with_reflection(
-    class_map: &mut HashMap<String, ClassInfo>,
-    magento_root: &Path,
-    php_bin: &str,
-) -> usize {
-    let candidates: Vec<String> = class_map
-        .iter()
-        .filter_map(|(fqcn, info)| {
-            let needs = info
-                .constructor
-                .as_ref()
-                .map(|ctor| constructor_defaults_need_constant_reflection(&ctor.params))
-                .unwrap_or(false);
-            needs.then_some(fqcn.clone())
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return 0;
-    }
-
-    let reflected: HashMap<String, Vec<ConstructorParam>> = candidates
-        .par_iter()
-        .filter_map(|fqcn| {
-            let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
-            Some((fqcn.clone(), params))
-        })
-        .collect();
-
-    for (fqcn, params) in &reflected {
-        if let Some(info) = class_map.get_mut(fqcn) {
-            info.constructor = Some(Constructor {
-                params: params.clone(),
-            });
-        }
-    }
-
-    reflected.len()
-}
-
-/// Reflect constructors for concrete classes that are in `type_names` but whose
-/// constructor was not found by our lexer (likely inherited from a class outside
-/// our scan scope such as a PHP built-in or third-party library).
+/// Merged single-pass replacement for the three formerly sequential reflection functions.
 ///
-/// Only considers non-abstract classes that explicitly extend something —
-/// classes with no `extends` clause and no constructor genuinely have no params.
-fn enrich_inherited_constructors_with_reflection(
-    class_map: &mut HashMap<String, ClassInfo>,
-    type_names: &[String],
-    magento_root: &Path,
-    php_bin: &str,
-) -> usize {
-    let candidates: Vec<String> = type_names
-        .iter()
-        .filter_map(|fqcn| {
-            let info = class_map.get(fqcn)?;
-            // Only concrete classes with no ctor found that extend something.
-            if info.constructor.is_some() || info.is_abstract || info.extends.is_none() {
-                return None;
-            }
-            Some(fqcn.clone())
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return 0;
-    }
-
-    let reflected: HashMap<String, Vec<ConstructorParam>> = candidates
-        .par_iter()
-        .filter_map(|fqcn| {
-            let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
-            if params.is_empty() {
-                return None; // no-arg constructor — not useful to store
-            }
-            Some((fqcn.clone(), params))
-        })
-        .collect();
-
-    for (fqcn, params) in &reflected {
-        if let Some(info) = class_map.get_mut(fqcn) {
-            info.constructor = Some(Constructor {
-                params: params.clone(),
-            });
-        }
-    }
-
-    reflected.len()
-}
-
-fn enrich_virtual_target_constructors_with_reflection(
-    class_map: &mut HashMap<String, ClassInfo>,
-    type_names: &[String],
+/// Collects candidates from all three passes in one sequential scan, then
+/// dispatches a single `par_iter()` call over the unified list — eliminating
+/// two Rayon work-stealing barriers compared to the original three separate
+/// `par_iter()` calls.
+///
+/// Returns `(ctor_defaults_reflected, inherited_reflected, vt_target_reflected)`.
+fn enrich_all_constructors_with_reflection(
+    class_map: &mut FxHashMap<String, ClassInfo>,
+    argument_type_names: &[String],
     di_config: &DiConfig,
     magento_root: &Path,
     php_bin: &str,
-) -> usize {
-    let candidates: HashSet<String> = type_names
+) -> (usize, usize, usize) {
+    // kind: 0 = update ctor (allow empty), 1 = update ctor (skip empty), 2 = insert if missing
+    let mut candidates: Vec<(String, u8)> = Vec::new();
+
+    // Pass 1: classes whose existing ctor has constant-reference defaults.
+    for (fqcn, info) in class_map.iter() {
+        let needs = info
+            .constructor
+            .as_ref()
+            .map(|ctor| constructor_defaults_need_constant_reflection(&ctor.params))
+            .unwrap_or(false);
+        if needs {
+            candidates.push((fqcn.clone(), 0));
+        }
+    }
+
+    // Pass 2: argument-universe classes with no ctor that inherit from something
+    // outside our scan scope.
+    for fqcn in argument_type_names {
+        if let Some(info) = class_map.get(fqcn) {
+            if info.constructor.is_none() && !info.is_abstract && info.extends.is_some() {
+                candidates.push((fqcn.clone(), 1));
+            }
+        }
+    }
+
+    // Pass 3: concrete targets of virtual types that are absent from class_map
+    // (e.g. Monolog\Logger or other third-party classes).
+    let vt_targets: FxHashSet<String> = argument_type_names
         .iter()
         .filter_map(|name| {
             let vt_name = name.trim_start_matches('\\');
@@ -2048,26 +1975,44 @@ fn enrich_virtual_target_constructors_with_reflection(
             Some(target)
         })
         .collect();
-
-    if candidates.is_empty() {
-        return 0;
+    for target in vt_targets {
+        candidates.push((target, 2));
     }
 
-    let reflected: HashMap<String, Vec<ConstructorParam>> = candidates
+    if candidates.is_empty() {
+        return (0, 0, 0);
+    }
+
+    // Single par_iter over all candidates — one Rayon barrier instead of three.
+    let reflected: Vec<(String, Vec<ConstructorParam>, u8)> = candidates
         .par_iter()
-        .filter_map(|fqcn| {
+        .filter_map(|(fqcn, kind)| {
             let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
-            Some((fqcn.clone(), params))
+            if *kind == 1 && params.is_empty() {
+                return None; // inherited no-arg ctor is not useful
+            }
+            Some((fqcn.clone(), params, *kind))
         })
         .collect();
 
-    for (fqcn, params) in &reflected {
-        class_map
-            .entry(fqcn.clone())
-            .or_insert_with(|| synthetic_reflected_class_info(fqcn, params.clone()));
+    let (mut count0, mut count1, mut count2) = (0usize, 0usize, 0usize);
+    for (fqcn, params, kind) in reflected {
+        if kind == 2 {
+            class_map
+                .entry(fqcn.clone())
+                .or_insert_with(|| synthetic_reflected_class_info(&fqcn, params));
+            count2 += 1;
+        } else if let Some(info) = class_map.get_mut(&fqcn) {
+            info.constructor = Some(Constructor { params });
+            if kind == 0 {
+                count0 += 1;
+            } else {
+                count1 += 1;
+            }
+        }
     }
 
-    reflected.len()
+    (count0, count1, count2)
 }
 
 fn synthetic_reflected_class_info(fqcn: &str, params: Vec<ConstructorParam>) -> ClassInfo {
@@ -2102,9 +2047,9 @@ fn constructor_defaults_need_constant_reflection(params: &[ConstructorParam]) ->
     })
 }
 
-fn extract_generated_class_map(code_root: &Path) -> HashMap<String, ClassInfo> {
+fn extract_generated_class_map(code_root: &Path) -> FxHashMap<String, ClassInfo> {
     if !code_root.is_dir() {
-        return HashMap::new();
+        return FxHashMap::default();
     }
     let files = walk_php_files(&[code_root.to_path_buf()]);
     let extracted: Vec<(String, ClassInfo)> = files
@@ -2115,7 +2060,8 @@ fn extract_generated_class_map(code_root: &Path) -> HashMap<String, ClassInfo> {
         })
         .collect();
 
-    let mut map = HashMap::with_capacity(extracted.len());
+    let mut map = FxHashMap::default();
+    map.reserve(extracted.len());
     for (fqcn, info) in extracted {
         map.insert(fqcn, info);
     }
@@ -2123,9 +2069,9 @@ fn extract_generated_class_map(code_root: &Path) -> HashMap<String, ClassInfo> {
 }
 
 fn merged_class_map(
-    base: &HashMap<String, ClassInfo>,
-    extra: &HashMap<String, ClassInfo>,
-) -> HashMap<String, ClassInfo> {
+    base: &FxHashMap<String, ClassInfo>,
+    extra: &FxHashMap<String, ClassInfo>,
+) -> FxHashMap<String, ClassInfo> {
     let mut out = base.clone();
     for (fqcn, info) in extra {
         out.insert(fqcn.clone(), info.clone());
@@ -2134,8 +2080,8 @@ fn merged_class_map(
 }
 
 fn build_argument_type_names(
-    base_class_map: &HashMap<String, ClassInfo>,
-    _generated_class_map: &HashMap<String, ClassInfo>,
+    base_class_map: &FxHashMap<String, ClassInfo>,
+    _generated_class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
     interceptors: &[di_resolver::InterceptorSpec],
     factories: &[di_resolver::FactorySpec],
@@ -2144,7 +2090,7 @@ fn build_argument_type_names(
     proxy_deferred: &[ProxyDeferredSpec],
     extension_specs: &[ExtensionSpec],
 ) -> Vec<String> {
-    let mut names: HashSet<String> = HashSet::new();
+    let mut names: FxHashSet<String> = FxHashSet::default();
 
     // Include all scanned source classes (abstract and concrete). Intercepted classes
     // are included so class-level NULL owner entries can be emitted when appropriate.
@@ -2194,8 +2140,8 @@ fn build_argument_type_names(
 }
 
 fn build_interception_type_names(
-    base_class_map: &HashMap<String, ClassInfo>,
-    generated_class_map: &HashMap<String, ClassInfo>,
+    base_class_map: &FxHashMap<String, ClassInfo>,
+    generated_class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
     interceptors: &[di_resolver::InterceptorSpec],
     factories: &[di_resolver::FactorySpec],
@@ -2210,7 +2156,7 @@ fn build_interception_type_names(
             || di_config.virtual_types.contains_key(name)
     };
 
-    let mut names: HashSet<String> = build_argument_type_names(
+    let mut names: FxHashSet<String> = build_argument_type_names(
         base_class_map,
         generated_class_map,
         di_config,
@@ -2251,8 +2197,8 @@ fn build_interception_type_names(
 
 fn build_direct_interception_map(
     interceptors: &[di_resolver::InterceptorSpec],
-) -> HashMap<String, String> {
-    let mut map: HashMap<String, String> = interceptors
+) -> FxHashMap<String, String> {
+    let mut map: FxHashMap<String, String> = interceptors
         .iter()
         .map(|spec| {
             let fqcn = spec.fqcn.trim_start_matches('\\').to_string();
@@ -2277,11 +2223,11 @@ fn build_direct_interception_map(
 
 fn build_interception_preference_overrides(
     di_config: &DiConfig,
-    direct_interceptors: &HashMap<String, String>,
-) -> HashMap<String, String> {
+    direct_interceptors: &FxHashMap<String, String>,
+) -> FxHashMap<String, String> {
     // Step 1 (PHP PreferencesResolving): recursively resolve each preference
     // value through the existing preference graph.
-    let mut resolved_preferences: HashMap<String, String> = HashMap::new();
+    let mut resolved_preferences: FxHashMap<String, String> = FxHashMap::default();
     for (from, to) in &di_config.preferences {
         let from_norm = normalize_fqcn(from);
         if di_config.virtual_types.contains_key(&from_norm) {
@@ -2310,7 +2256,7 @@ fn build_interception_preference_overrides(
     }
 
     // Only emit overrides that change/add values compared to raw di.xml prefs.
-    let mut overrides = HashMap::new();
+    let mut overrides = FxHashMap::default();
     for (from, to) in merged {
         match di_config.preferences.get(from.as_str()) {
             Some(existing) if normalize_fqcn(existing) == normalize_fqcn(&to) => {}
@@ -2323,8 +2269,8 @@ fn build_interception_preference_overrides(
     overrides
 }
 
-fn resolve_preference_recursive(start: &str, prefs: &HashMap<String, String>) -> String {
-    let mut visited = HashSet::new();
+fn resolve_preference_recursive(start: &str, prefs: &FxHashMap<String, String>) -> String {
+    let mut visited = FxHashSet::default();
     let mut current = normalize_fqcn(start);
     loop {
         if !visited.insert(current.clone()) {
@@ -2351,9 +2297,9 @@ fn build_interception_registry(
     proxies: &[di_resolver::ProxySpec],
     proxy_deferred: &[ProxyDeferredSpec],
     di_config: &DiConfig,
-    class_map: &HashMap<String, ClassInfo>,
-) -> HashMap<String, bool> {
-    let mut intercepted_targets: HashSet<String> = interceptors
+    class_map: &FxHashMap<String, ClassInfo>,
+) -> FxHashMap<String, bool> {
+    let mut intercepted_targets: FxHashSet<String> = interceptors
         .iter()
         .map(|spec| spec.fqcn.trim_start_matches('\\').to_string())
         .collect();
@@ -2402,21 +2348,24 @@ fn build_interception_registry(
     // PHP marks a class as intercepted whenever any interface it implements (transitively)
     // has plugins — e.g. Magento\Framework\App\ActionInterface with CustomerNotification
     // propagates to Magento\Backend\App\Action (which implements ActionInterface).
-    // We perform a fixed-point expansion: collect all classes that implement any currently
-    // intercepted type (via their implements list), then repeat until stable.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (fqcn, info) in class_map {
-            if intercepted_targets.contains(fqcn.as_str()) {
-                continue;
-            }
-            let is_intercepted_via_iface = info
-                .implements
-                .iter()
-                .any(|iface| intercepted_targets.contains(iface.trim_start_matches('\\')));
-            if is_intercepted_via_iface && intercepted_targets.insert(fqcn.clone()) {
-                changed = true;
+    //
+    // Build a reverse-index (interface → implementors) once, then BFS from each newly
+    // intercepted seed. O(n + edges) single pass vs. the old O(n × depth) fixed-point loop.
+    let mut implementors: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
+    for (fqcn, info) in class_map.iter() {
+        for iface in &info.implements {
+            implementors
+                .entry(iface.trim_start_matches('\\'))
+                .or_default()
+                .push(fqcn.as_str());
+        }
+    }
+    let mut queue: std::collections::VecDeque<String> =
+        intercepted_targets.iter().cloned().collect();
+    while let Some(intercepted) = queue.pop_front() {
+        for &implementor in implementors.get(intercepted.as_str()).into_iter().flatten() {
+            if intercepted_targets.insert(implementor.to_string()) {
+                queue.push_back(implementor.to_string());
             }
         }
     }
@@ -2450,8 +2399,8 @@ fn print_summary(
     interceptors: &[di_resolver::InterceptorSpec],
     factories: &[di_resolver::FactorySpec],
     proxies: &[di_resolver::ProxySpec],
-    args_map: &HashMap<String, Vec<di_resolver::ResolvedArg>>,
-    all_fqcns: &HashMap<String, bool>,
+    args_map: &FxHashMap<String, Vec<di_resolver::ResolvedArg>>,
+    all_fqcns: &FxHashMap<String, bool>,
 ) {
     println!("Dry run summary:");
     println!("  Interceptors:   {}", interceptors.len());
@@ -2562,31 +2511,41 @@ fn write_comparable_metadata_reports(
     let comparable_dir = report_dir.join("comparable_metadata");
     std::fs::create_dir_all(&comparable_dir)?;
 
+    // Parallelize: each file requires two `php -r` subprocess spawns (archive + output).
+    // Sequential execution was responsible for ~16s of archive-compare runtime; par_iter
+    // reduces this to ceil(N/threads) × per-file cost.
+    let manifest_lines: Vec<std::io::Result<String>> = common
+        .par_iter()
+        .map(|rel| {
+            let archive_src = archive_metadata_dir.join(rel);
+            let output_src = output_metadata_dir.join(rel);
+            let stem = comparable_metadata_stem(rel);
+            let archive_dst = comparable_dir.join(format!("{stem}.archive.json"));
+            let output_dst = comparable_dir.join(format!("{stem}.output.json"));
+            let archive_json = normalize_metadata_to_json_bytes(&archive_src, php_bin)?;
+            let output_json = normalize_metadata_to_json_bytes(&output_src, php_bin)?;
+            std::fs::write(&archive_dst, &archive_json)?;
+            std::fs::write(&output_dst, &output_json)?;
+
+            let report = build_comparable_metadata_report(rel, &archive_json, &output_json)?;
+            let report_json = serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|_| "{\"error\":\"serialize\"}".to_string());
+            let report_dst = comparable_dir.join(format!("{stem}_report.json"));
+            std::fs::write(&report_dst, report_json)?;
+            let text_report = render_comparable_metadata_report_text(&report);
+            let text_report_dst = comparable_dir.join(format!("{stem}_report.txt"));
+            std::fs::write(&text_report_dst, text_report)?;
+
+            Ok(format!(
+                "{rel}\t{stem}\t{stem}.archive.json\t{stem}.output.json\t{stem}_report.json\t{stem}_report.txt\n"
+            ))
+        })
+        .collect();
+
+    // Preserve original sorted order in the manifest; collect errors.
     let mut manifest = String::new();
-    for rel in common {
-        let archive_src = archive_metadata_dir.join(&rel);
-        let output_src = output_metadata_dir.join(&rel);
-        let stem = comparable_metadata_stem(&rel);
-        let archive_dst = comparable_dir.join(format!("{stem}.archive.json"));
-        let output_dst = comparable_dir.join(format!("{stem}.output.json"));
-        let archive_json = normalize_metadata_to_json_bytes(&archive_src, php_bin)?;
-        let output_json = normalize_metadata_to_json_bytes(&output_src, php_bin)?;
-        std::fs::write(&archive_dst, &archive_json)?;
-        std::fs::write(&output_dst, &output_json)?;
-
-        let report = build_comparable_metadata_report(&rel, &archive_json, &output_json)?;
-        let report_json = serde_json::to_string_pretty(&report)
-            .unwrap_or_else(|_| "{\"error\":\"serialize\"}".to_string());
-        let report_dst = comparable_dir.join(format!("{stem}_report.json"));
-        std::fs::write(&report_dst, report_json)?;
-        let text_report = render_comparable_metadata_report_text(&report);
-        let text_report_dst = comparable_dir.join(format!("{stem}_report.txt"));
-        std::fs::write(&text_report_dst, text_report)?;
-
-        manifest.push_str(&format!(
-            "{rel}\t{stem}\t{}.archive.json\t{}.output.json\t{}_report.json\t{}_report.txt\n",
-            stem, stem, stem, stem
-        ));
+    for line in manifest_lines {
+        manifest.push_str(&line?);
     }
     std::fs::write(comparable_dir.join("manifest.txt"), manifest)?;
 
@@ -2698,8 +2657,8 @@ struct ComparableValueMismatchSample {
 #[derive(Default)]
 struct ComparableReportAccumulator {
     summary: ComparableReportSummary,
-    sections: HashMap<String, ComparableReportSummary>,
-    type_mismatches_by_pair: HashMap<String, usize>,
+    sections: FxHashMap<String, ComparableReportSummary>,
+    type_mismatches_by_pair: FxHashMap<String, usize>,
     high_risk_mismatches_sample: Vec<ComparableTypeMismatchSample>,
     missing_paths_sample: Vec<String>,
     extra_paths_sample: Vec<String>,
@@ -3123,8 +3082,8 @@ fn diff_relative_files(archive_dir: &Path, output_dir: &Path) -> std::io::Result
     })
 }
 
-fn collect_relative_files(root: &Path) -> std::io::Result<HashSet<String>> {
-    let mut out = HashSet::new();
+fn collect_relative_files(root: &Path) -> std::io::Result<FxHashSet<String>> {
+    let mut out = FxHashSet::default();
     if !root.exists() {
         return Ok(out);
     }
@@ -3252,13 +3211,13 @@ struct ProxyDeferredSpec {
 }
 
 fn detect_search_results_specs(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
     factories: &[FactorySpec],
     composer_index: Option<&ComposerAutoloadIndex>,
 ) -> Vec<SearchResultsSpec> {
     let mut specs = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
 
     let mut emit = |result_fqcn: String| {
         let normalized = result_fqcn.trim().trim_start_matches('\\').to_string();
@@ -3298,12 +3257,12 @@ fn detect_search_results_specs(
 }
 
 fn detect_proxy_deferred_specs(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     factories: &[FactorySpec],
     composer_index: Option<&ComposerAutoloadIndex>,
 ) -> Vec<ProxyDeferredSpec> {
     let mut specs = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
 
     for spec in factories {
         let normalized = spec.target_fqcn.trim().trim_start_matches('\\').to_string();
@@ -3331,7 +3290,7 @@ fn detect_proxy_deferred_specs(
 }
 
 fn class_exists_in_scan_or_composer(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     composer_index: Option<&ComposerAutoloadIndex>,
     fqcn: &str,
 ) -> bool {
@@ -3347,8 +3306,8 @@ fn class_exists_in_scan_or_composer(
 fn merge_plugins_for_interception(
     global_configs: &[DiConfig],
     area_configs: &[DiConfig],
-) -> HashMap<String, Vec<Plugin>> {
-    let mut merged: HashMap<String, HashMap<String, Plugin>> = HashMap::new();
+) -> FxHashMap<String, Vec<Plugin>> {
+    let mut merged: FxHashMap<String, FxHashMap<String, Plugin>> = FxHashMap::default();
 
     // Phase 1: global di.xml files — later wins (including disabled overrides).
     for cfg in global_configs {
@@ -3404,7 +3363,7 @@ fn merge_plugins_for_interception(
         }
     }
 
-    let mut out = HashMap::new();
+    let mut out = FxHashMap::default();
     for (owner, by_name) in merged {
         let mut plugins: Vec<Plugin> = by_name.into_values().collect();
         plugins.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.name.cmp(&b.name)));
@@ -3414,7 +3373,7 @@ fn merge_plugins_for_interception(
 }
 
 fn augment_with_composer_plugin_owner_classes(
-    class_map: &mut HashMap<String, ClassInfo>,
+    class_map: &mut FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
     composer_index: Option<&ComposerAutoloadIndex>,
 ) {
@@ -3422,7 +3381,7 @@ fn augment_with_composer_plugin_owner_classes(
         return;
     };
 
-    let mut candidates: HashSet<String> = HashSet::new();
+    let mut candidates: FxHashSet<String> = FxHashSet::default();
     for owner in di_config.plugins.keys() {
         let owner = owner.trim_start_matches('\\').to_string();
         if !class_map.contains_key(&owner) {
@@ -3461,7 +3420,7 @@ fn augment_with_composer_plugin_owner_classes(
 
 fn interceptor_target_info_with_inherited_constructor(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> Option<ClassInfo> {
     let normalized = fqcn.trim_start_matches('\\');
     let mut info = class_map.get(normalized)?.clone();
@@ -3469,7 +3428,7 @@ fn interceptor_target_info_with_inherited_constructor(
         return Some(info);
     }
 
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
     let mut cursor = info.extends.clone();
     while let Some(parent) = cursor {
         if !seen.insert(parent.clone()) {
@@ -3490,7 +3449,7 @@ fn interceptor_target_info_with_inherited_constructor(
 
 fn target_info_with_inherited_public_methods(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> Option<ClassInfo> {
     let normalized = fqcn.trim_start_matches('\\');
     let mut info = class_map.get(normalized)?.clone();
@@ -3500,11 +3459,11 @@ fn target_info_with_inherited_public_methods(
 
 fn collect_public_methods_with_inheritance(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> Vec<MethodSignature> {
     let mut methods = Vec::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
-    let mut seen_types: HashSet<String> = HashSet::new();
+    let mut seen_names: FxHashSet<String> = FxHashSet::default();
+    let mut seen_types: FxHashSet<String> = FxHashSet::default();
     let mut stack = vec![fqcn.to_string()];
 
     while let Some(current) = stack.pop() {
@@ -3534,7 +3493,7 @@ fn collect_public_methods_with_inheritance(
 
 fn enrich_interceptor_specs_with_reflection(
     specs: &mut [di_resolver::InterceptorSpec],
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
     magento_root: &Path,
     php_bin: &str,
@@ -3544,7 +3503,7 @@ fn enrich_interceptor_specs_with_reflection(
     // then reflect them all in parallel to build a plugin-method lookup
     // table.  Replaces the old sequential plugin_method_cache loop.
     // -----------------------------------------------------------------
-    let plugin_fqcns_to_reflect: HashSet<String> = specs
+    let plugin_fqcns_to_reflect: FxHashSet<String> = specs
         .iter()
         .flat_map(|spec| {
             spec.plugins.iter().flat_map(|p| {
@@ -3559,11 +3518,11 @@ fn enrich_interceptor_specs_with_reflection(
         .filter(|fqcn| !fqcn.is_empty() && !class_map.contains_key(fqcn))
         .collect();
 
-    let plugin_method_map: HashMap<String, HashSet<String>> = plugin_fqcns_to_reflect
+    let plugin_method_map: FxHashMap<String, FxHashSet<String>> = plugin_fqcns_to_reflect
         .par_iter()
         .filter_map(|fqcn| {
             let methods = reflect_interceptable_methods(fqcn, magento_root, php_bin)?;
-            let names: HashSet<String> = methods
+            let names: FxHashSet<String> = methods
                 .iter()
                 .filter_map(|m| plugin_method_to_intercepted(&m.name))
                 .collect();
@@ -3580,13 +3539,13 @@ fn enrich_interceptor_specs_with_reflection(
     // then reflect them all in parallel.  Replaces the old sequential
     // reflection_cache loop.
     // -----------------------------------------------------------------
-    let specs_needing_reflection: HashSet<String> = specs
+    let specs_needing_reflection: FxHashSet<String> = specs
         .iter()
         .filter(|spec| spec_needs_reflection(spec, class_map, di_config, &plugin_method_map))
         .map(|spec| spec.fqcn.clone())
         .collect();
 
-    let spec_reflection_map: HashMap<String, Vec<MethodSignature>> = specs_needing_reflection
+    let spec_reflection_map: FxHashMap<String, Vec<MethodSignature>> = specs_needing_reflection
         .par_iter()
         .filter_map(|fqcn| {
             let mut methods = reflect_interceptable_methods(fqcn, magento_root, php_bin)?;
@@ -3612,7 +3571,7 @@ fn enrich_interceptor_specs_with_reflection(
     for spec in specs.iter_mut() {
         let needs_sig = interceptor_methods_need_reflection_normalization(&spec.public_methods);
         let expected = if spec.plugins.is_empty() {
-            HashSet::new()
+            FxHashSet::default()
         } else {
             compute_expected_method_names(&spec.plugins, class_map, di_config, &plugin_method_map)
         };
@@ -3624,7 +3583,7 @@ fn enrich_interceptor_specs_with_reflection(
             continue;
         }
 
-        let current: HashSet<String> = spec.public_methods.iter().map(|m| m.name.clone()).collect();
+        let current: FxHashSet<String> = spec.public_methods.iter().map(|m| m.name.clone()).collect();
         let missing_expected = !spec.plugins.is_empty() && !expected.is_subset(&current);
         if !missing_expected && !needs_sig {
             continue;
@@ -3634,7 +3593,7 @@ fn enrich_interceptor_specs_with_reflection(
             continue;
         };
 
-        let reflected_by_name: HashMap<&str, &MethodSignature> = reflected_methods
+        let reflected_by_name: FxHashMap<&str, &MethodSignature> = reflected_methods
             .iter()
             .map(|m| (m.name.as_str(), m))
             .collect();
@@ -3671,9 +3630,9 @@ fn enrich_interceptor_specs_with_reflection(
 /// it has plugin registrations whose expected intercepted methods are not present.
 fn spec_needs_reflection(
     spec: &di_resolver::InterceptorSpec,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
-    plugin_method_map: &HashMap<String, HashSet<String>>,
+    plugin_method_map: &FxHashMap<String, FxHashSet<String>>,
 ) -> bool {
     if interceptor_methods_need_reflection_normalization(&spec.public_methods) {
         return true;
@@ -3686,7 +3645,7 @@ fn spec_needs_reflection(
     if expected.is_empty() {
         return false;
     }
-    let current: HashSet<&str> = spec
+    let current: FxHashSet<&str> = spec
         .public_methods
         .iter()
         .map(|m| m.name.as_str())
@@ -3699,11 +3658,11 @@ fn spec_needs_reflection(
 /// Pure computation — no I/O.
 fn compute_expected_method_names(
     plugins: &[di_resolver::PluginRef],
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
-    plugin_method_map: &HashMap<String, HashSet<String>>,
-) -> HashSet<String> {
-    let mut names = HashSet::new();
+    plugin_method_map: &FxHashMap<String, FxHashSet<String>>,
+) -> FxHashSet<String> {
+    let mut names = FxHashSet::default();
     for plugin in plugins {
         let resolved = di_config
             .get_instance_type(&plugin.type_name)
@@ -3761,7 +3720,7 @@ fn interceptor_methods_need_reflection_normalization(methods: &[MethodSignature]
 fn normalize_reflected_method_signature(
     method: &mut MethodSignature,
     target_fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) {
     if let Some(rt) = method.return_type.as_mut() {
         *rt = normalize_reflected_type_hint(rt, target_fqcn, class_map);
@@ -3776,7 +3735,7 @@ fn normalize_reflected_method_signature(
 fn normalize_reflected_method_signature_for_proxy(
     method: &mut MethodSignature,
     target_fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) {
     if let Some(rt) = method.return_type.as_mut() {
         *rt = normalize_reflected_type_hint_for_proxy(rt, target_fqcn, class_map);
@@ -3791,7 +3750,7 @@ fn normalize_reflected_method_signature_for_proxy(
 fn normalize_reflected_type_hint(
     raw: &str,
     target_fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> String {
     const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
         ("bool", 1),
@@ -3858,7 +3817,7 @@ fn normalize_reflected_type_hint(
 fn normalize_reflected_type_hint_for_proxy(
     raw: &str,
     target_fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> String {
     const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
         ("bool", 1),
@@ -3925,10 +3884,11 @@ fn normalize_reflected_type_hint_for_proxy(
 }
 
 fn canonicalize_instance_reference_case(
-    args_map: &mut HashMap<String, Vec<di_resolver::ResolvedArg>>,
-    class_map: &HashMap<String, ClassInfo>,
+    args_map: &mut FxHashMap<String, Vec<di_resolver::ResolvedArg>>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) {
-    let mut case_index: HashMap<String, (String, u8)> = HashMap::with_capacity(class_map.len());
+    let mut case_index: FxHashMap<String, (String, u8)> = FxHashMap::default();
+    case_index.reserve(class_map.len());
     for (fqcn, info) in class_map {
         let key = fqcn.to_ascii_lowercase();
         // Prefer real source classes over synthetic/generated entries when
@@ -3946,7 +3906,7 @@ fn canonicalize_instance_reference_case(
             }
         }
     }
-    let case_index: HashMap<String, String> =
+    let case_index: FxHashMap<String, String> =
         case_index.into_iter().map(|(k, (v, _))| (k, v)).collect();
 
     for args in args_map.values_mut() {
@@ -3958,7 +3918,7 @@ fn canonicalize_instance_reference_case(
 
 fn canonicalize_resolved_arg_value_case(
     value: &mut di_resolver::ResolvedArgValue,
-    case_index: &HashMap<String, String>,
+    case_index: &FxHashMap<String, String>,
 ) {
     use di_resolver::{ResolvedArgValue, ResolvedArrayValue, ResolvedScalar};
 
@@ -3989,7 +3949,7 @@ fn canonicalize_resolved_arg_value_case(
 
 fn canonicalize_plain_array_case(
     items: &mut Vec<di_resolver::ResolvedArrayItem>,
-    case_index: &HashMap<String, String>,
+    case_index: &FxHashMap<String, String>,
 ) {
     use di_resolver::{ResolvedArrayValue, ResolvedScalar};
 
@@ -4005,7 +3965,7 @@ fn canonicalize_plain_array_case(
     }
 }
 
-fn canonicalize_fqcn_case(value: &mut String, case_index: &HashMap<String, String>) {
+fn canonicalize_fqcn_case(value: &mut String, case_index: &FxHashMap<String, String>) {
     let lookup = value.trim_start_matches('\\').to_ascii_lowercase();
     if let Some(canonical) = case_index.get(&lookup) {
         *value = canonical.clone();
@@ -4317,7 +4277,7 @@ fn find_extension_attributes_files(magento_root: &Path, module_paths: &[PathBuf]
     ordered_files.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
     let mut files = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for (_, _, file) in ordered_files {
         if seen.insert(file.clone()) {
             files.push(file);
@@ -4339,7 +4299,7 @@ fn find_extension_attributes_files(magento_root: &Path, module_paths: &[PathBuf]
 /// This function runs `php -r` once at startup with `get_defined_constants(true)`
 /// and collects all scalar constants as a baseline. Source-scan constants added
 /// later override these builtins on name collision.
-fn bootstrap_php_constants(php_bin: &str, magento_root: &Path) -> HashMap<String, String> {
+fn bootstrap_php_constants(php_bin: &str, magento_root: &Path) -> FxHashMap<String, String> {
     // Include vendor/autoload.php so that Composer-autoloaded constants (e.g. MCRYPT_BLOWFISH
     // defined by phpseclib/mcrypt_compat) are present before we call get_defined_constants().
     let autoloader = magento_root.join("vendor/autoload.php");
@@ -4366,16 +4326,16 @@ fn bootstrap_php_constants(php_bin: &str, magento_root: &Path) -> HashMap<String
         .args(["-r", &script])
         .output();
     let Ok(out) = output else {
-        return HashMap::new();
+        return FxHashMap::default();
     };
     if !out.status.success() {
-        return HashMap::new();
+        return FxHashMap::default();
     }
     serde_json::from_slice(&out.stdout).unwrap_or_default()
 }
 
-fn load_module_order_from_config_php(magento_root: &Path) -> HashMap<String, usize> {
-    let mut out = HashMap::new();
+fn load_module_order_from_config_php(magento_root: &Path) -> FxHashMap<String, usize> {
+    let mut out = FxHashMap::default();
     let config_php = magento_root.join("app/etc/config.php");
     let Ok(content) = std::fs::read_to_string(config_php) else {
         return out;
@@ -4470,7 +4430,7 @@ const EXCLUDED_PACKAGES: &[&str] = &["magento2-functional-testing-framework", "m
 /// Files at `app/etc/di.xml` (no vendor module root) are always kept.
 fn filter_enabled_di_xml(
     files: Vec<PathBuf>,
-    enabled_modules: &HashMap<String, usize>,
+    enabled_modules: &FxHashMap<String, usize>,
     magento_root: &Path,
 ) -> Vec<PathBuf> {
     files
@@ -4548,8 +4508,8 @@ fn read_module_name_from_module_xml(module_root: &Path) -> Option<String> {
 
 fn parse_extension_attributes_files(
     files: &[PathBuf],
-) -> HashMap<String, Vec<ExtensionAttributeSpec>> {
-    let mut out: HashMap<String, Vec<ExtensionAttributeSpec>> = HashMap::new();
+) -> FxHashMap<String, Vec<ExtensionAttributeSpec>> {
+    let mut out: FxHashMap<String, Vec<ExtensionAttributeSpec>> = FxHashMap::default();
     for file in files {
         let Ok(content) = std::fs::read_to_string(file) else {
             continue;
@@ -4598,7 +4558,7 @@ fn parse_extension_attributes_files(
 fn maybe_collect_extension_attribute(
     e: &quick_xml::events::BytesStart<'_>,
     current_for: Option<&str>,
-    out: &mut HashMap<String, Vec<ExtensionAttributeSpec>>,
+    out: &mut FxHashMap<String, Vec<ExtensionAttributeSpec>>,
 ) {
     let Some(source_interface) = current_for else {
         return;
@@ -4621,7 +4581,7 @@ fn maybe_collect_extension_attribute(
 }
 
 fn dedupe_attributes_keep_last(attrs: Vec<ExtensionAttributeSpec>) -> Vec<ExtensionAttributeSpec> {
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut out = Vec::new();
     for attr in attrs.into_iter().rev() {
         if seen.insert(attr.code.clone()) {
@@ -4652,10 +4612,10 @@ fn local_name(name: &[u8]) -> &str {
 }
 
 fn collect_extension_specs(
-    class_map: &HashMap<String, ClassInfo>,
-    xml_attrs: &HashMap<String, Vec<ExtensionAttributeSpec>>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    xml_attrs: &FxHashMap<String, Vec<ExtensionAttributeSpec>>,
 ) -> Vec<ExtensionSpec> {
-    let mut specs_by_interface: HashMap<String, ExtensionSpec> = HashMap::new();
+    let mut specs_by_interface: FxHashMap<String, ExtensionSpec> = FxHashMap::default();
 
     // Path 1: extension_attributes.xml declarations.
     let mut xml_keys: Vec<&String> = xml_attrs.keys().collect();
@@ -4921,8 +4881,8 @@ fn push_autoload_map(
     }
 }
 
-fn collect_proxy_targets_from_di_configs(di_configs: &[DiConfig]) -> HashSet<String> {
-    let mut targets = HashSet::new();
+fn collect_proxy_targets_from_di_configs(di_configs: &[DiConfig]) -> FxHashSet<String> {
+    let mut targets = FxHashSet::default();
     for cfg in di_configs {
         for proxy_fqcn in cfg.preferences.values() {
             maybe_push_proxy_target(proxy_fqcn, &mut targets);
@@ -4937,7 +4897,7 @@ fn collect_proxy_targets_from_di_configs(di_configs: &[DiConfig]) -> HashSet<Str
     targets
 }
 
-fn collect_proxy_targets_from_args(args: &[Argument], out: &mut HashSet<String>) {
+fn collect_proxy_targets_from_args(args: &[Argument], out: &mut FxHashSet<String>) {
     for arg in args {
         match arg {
             Argument::Object { value, .. } => maybe_push_proxy_target(value, out),
@@ -4947,7 +4907,7 @@ fn collect_proxy_targets_from_args(args: &[Argument], out: &mut HashSet<String>)
     }
 }
 
-fn maybe_push_proxy_target(candidate: &str, out: &mut HashSet<String>) {
+fn maybe_push_proxy_target(candidate: &str, out: &mut FxHashSet<String>) {
     let candidate = candidate.trim().trim_start_matches('\\');
     if let Some(target) = candidate.strip_suffix("\\Proxy") {
         if !target.is_empty() {
@@ -4961,20 +4921,39 @@ mod tests {
     use super::{
         apply_setup_di_compile_runtime_overrides, build_argument_type_names,
         build_interception_registry, build_interception_type_names,
-        canonicalize_instance_reference_case, infer_comparable_fix_categories,
-        render_comparable_metadata_report_text, ComparableMetadataReport, ComparableReportSummary,
-        ComparableTypeMismatchSample, ComparableValueMismatchSample,
+        canonicalize_instance_reference_case, enrich_all_constructors_with_reflection,
+        infer_comparable_fix_categories, render_comparable_metadata_report_text,
+        ComparableMetadataReport, ComparableReportSummary, ComparableTypeMismatchSample,
+        ComparableValueMismatchSample, IncrementalCache,
     };
     use di_resolver::{
         ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
     };
     use di_xml_reader::{Argument, DiConfig, VirtualType};
     use php_extractor::types::{ClassInfo, ClassKind};
+    use rustc_hash::FxHashMap;
     use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn class_info(fqcn: &str, extends: Option<&str>, is_abstract: bool) -> ClassInfo {
+        class_info_impl(fqcn, extends, is_abstract, vec![])
+    }
+
+    fn class_info_with_implements(
+        fqcn: &str,
+        extends: Option<&str>,
+        implements: Vec<&str>,
+    ) -> ClassInfo {
+        class_info_impl(fqcn, extends, false, implements.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn class_info_impl(
+        fqcn: &str,
+        extends: Option<&str>,
+        is_abstract: bool,
+        implements: Vec<String>,
+    ) -> ClassInfo {
         let (namespace, name) = fqcn
             .rsplit_once('\\')
             .map(|(ns, class)| (ns.to_string(), class.to_string()))
@@ -4990,7 +4969,7 @@ mod tests {
                 ClassKind::Class
             },
             extends: extends.map(str::to_string),
-            implements: vec![],
+            implements,
             constructor: None,
             is_abstract,
             is_final: false,
@@ -5000,12 +4979,12 @@ mod tests {
 
     #[test]
     fn argument_type_names_include_vt_when_direct_type_is_intercepted() {
-        let mut base_class_map = HashMap::new();
+        let mut base_class_map = FxHashMap::default();
         base_class_map.insert(
             "Vendor\\Payment\\Adapter".to_string(),
             class_info("Vendor\\Payment\\Adapter", None, false),
         );
-        let generated_class_map: HashMap<String, ClassInfo> = HashMap::new();
+        let generated_class_map: FxHashMap<String, ClassInfo> = FxHashMap::default();
 
         let mut di_config = DiConfig::default();
         di_config.virtual_types.insert(
@@ -5048,12 +5027,12 @@ mod tests {
 
     #[test]
     fn interception_type_names_filter_unknown_preference_types() {
-        let mut base_class_map = HashMap::new();
+        let mut base_class_map = FxHashMap::default();
         base_class_map.insert(
             "Known\\Concrete".to_string(),
             class_info("Known\\Concrete", None, false),
         );
-        let generated_class_map: HashMap<String, ClassInfo> = HashMap::new();
+        let generated_class_map: FxHashMap<String, ClassInfo> = FxHashMap::default();
 
         let mut di_config = DiConfig::default();
         di_config.virtual_types.insert(
@@ -5104,7 +5083,7 @@ mod tests {
 
     #[test]
     fn interception_registry_marks_virtual_types_and_ancestors_true() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Vendor\\AbstractParent".to_string(),
             class_info("Vendor\\AbstractParent", None, true),
@@ -5291,7 +5270,7 @@ mod tests {
             .iter()
             .find(|arg| matches!(arg, Argument::Array { name, .. } if name == "excludePatterns"))
             .expect("excludePatterns argument");
-        let groups: HashMap<_, _> = match exclude_patterns {
+        let groups: FxHashMap<_, _> = match exclude_patterns {
             Argument::Array { items, .. } => items
                 .iter()
                 .map(|item| match item {
@@ -5373,7 +5352,7 @@ mod tests {
 
     #[test]
     fn canonicalize_instance_reference_case_updates_instances_in_nested_values() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Magento\\Framework\\Filesystem\\Directory\\ReadFactory".to_string(),
             class_info(
@@ -5383,7 +5362,7 @@ mod tests {
             ),
         );
 
-        let mut args_map: HashMap<String, Vec<ResolvedArg>> = HashMap::new();
+        let mut args_map: FxHashMap<String, Vec<ResolvedArg>> = FxHashMap::default();
         args_map.insert(
             "Foo\\Type".to_string(),
             vec![
@@ -5422,5 +5401,471 @@ mod tests {
                     if v == "Magento\\Framework\\Filesystem\\Directory\\ReadFactory"
                 )
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // build_interception_registry: interface-propagation tests
+    // -----------------------------------------------------------------
+
+    /// Helper: build a minimal registry call with no VTs, proxies, or proxy_deferred.
+    fn registry(
+        type_names: &[&str],
+        interceptors: &[&str],
+        class_map: &FxHashMap<String, ClassInfo>,
+    ) -> FxHashMap<String, bool> {
+        let specs: Vec<di_resolver::InterceptorSpec> = interceptors
+            .iter()
+            .map(|fqcn| di_resolver::InterceptorSpec {
+                fqcn: fqcn.to_string(),
+                plugins: vec![],
+                public_methods: vec![],
+            })
+            .collect();
+        let names: Vec<String> = type_names.iter().map(|s| s.to_string()).collect();
+        build_interception_registry(
+            &names,
+            &specs,
+            &[],
+            &[],
+            &DiConfig::default(),
+            class_map,
+        )
+    }
+
+    #[test]
+    fn interface_propagation_marks_implementor_intercepted() {
+        // ActionInterface is directly intercepted (plugin owner).
+        // ConcreteAction implements ActionInterface → must be marked true.
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Magento\\Framework\\App\\ActionInterface".to_string(),
+            class_info("Magento\\Framework\\App\\ActionInterface", None, false),
+        );
+        class_map.insert(
+            "Magento\\Framework\\App\\Action\\AbstractAction".to_string(),
+            class_info_with_implements(
+                "Magento\\Framework\\App\\Action\\AbstractAction",
+                None,
+                vec!["Magento\\Framework\\App\\ActionInterface"],
+            ),
+        );
+
+        let type_names = [
+            "Magento\\Framework\\App\\ActionInterface",
+            "Magento\\Framework\\App\\Action\\AbstractAction",
+        ];
+        let map = registry(&type_names, &["Magento\\Framework\\App\\ActionInterface"], &class_map);
+
+        assert_eq!(map.get("Magento\\Framework\\App\\ActionInterface"), Some(&true));
+        assert_eq!(
+            map.get("Magento\\Framework\\App\\Action\\AbstractAction"),
+            Some(&true),
+            "implementor of intercepted interface must be marked intercepted"
+        );
+    }
+
+    #[test]
+    fn interface_propagation_two_levels_deep() {
+        // A implements IFace, B implements A (not typical but tests transitivity via the
+        // implements list). Also covers the real Magento pattern where classes implement
+        // interfaces that implement other interfaces (multi-level interface chains).
+        //
+        // Plugin on IFace → A (implements IFace) → B (implements A) both intercepted.
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Vendor\\IFace".to_string(),
+            class_info("Vendor\\IFace", None, false),
+        );
+        class_map.insert(
+            "Vendor\\A".to_string(),
+            class_info_with_implements("Vendor\\A", None, vec!["Vendor\\IFace"]),
+        );
+        class_map.insert(
+            "Vendor\\B".to_string(),
+            class_info_with_implements("Vendor\\B", None, vec!["Vendor\\A"]),
+        );
+        class_map.insert(
+            "Vendor\\Unrelated".to_string(),
+            class_info("Vendor\\Unrelated", None, false),
+        );
+
+        let type_names = [
+            "Vendor\\IFace",
+            "Vendor\\A",
+            "Vendor\\B",
+            "Vendor\\Unrelated",
+        ];
+        let map = registry(&type_names, &["Vendor\\IFace"], &class_map);
+
+        assert_eq!(map.get("Vendor\\IFace"), Some(&true));
+        assert_eq!(map.get("Vendor\\A"), Some(&true));
+        assert_eq!(map.get("Vendor\\B"), Some(&true), "transitive via implements chain");
+        assert_eq!(map.get("Vendor\\Unrelated"), Some(&false));
+    }
+
+    #[test]
+    fn interface_propagation_does_not_affect_unrelated_classes() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Vendor\\Intercepted".to_string(),
+            class_info("Vendor\\Intercepted", None, false),
+        );
+        class_map.insert(
+            "Vendor\\Unrelated".to_string(),
+            class_info("Vendor\\Unrelated", None, false),
+        );
+        class_map.insert(
+            "Vendor\\AlsoUnrelated".to_string(),
+            class_info_with_implements(
+                "Vendor\\AlsoUnrelated",
+                None,
+                vec!["Vendor\\SomeOtherInterface"],
+            ),
+        );
+
+        let type_names = [
+            "Vendor\\Intercepted",
+            "Vendor\\Unrelated",
+            "Vendor\\AlsoUnrelated",
+        ];
+        let map = registry(&type_names, &["Vendor\\Intercepted"], &class_map);
+
+        assert_eq!(map.get("Vendor\\Intercepted"), Some(&true));
+        assert_eq!(map.get("Vendor\\Unrelated"), Some(&false));
+        assert_eq!(
+            map.get("Vendor\\AlsoUnrelated"),
+            Some(&false),
+            "implementing an unrelated interface must not cause interception"
+        );
+    }
+
+    #[test]
+    fn interface_propagation_with_leading_backslash_in_implements() {
+        // PHP class files often declare implements with a leading backslash.
+        // The registry must normalize these when matching against intercepted_targets.
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Vendor\\ActionInterface".to_string(),
+            class_info("Vendor\\ActionInterface", None, false),
+        );
+        class_map.insert(
+            "Vendor\\ConcreteAction".to_string(),
+            class_info_with_implements(
+                "Vendor\\ConcreteAction",
+                None,
+                vec!["\\Vendor\\ActionInterface"], // leading backslash
+            ),
+        );
+
+        let type_names = ["Vendor\\ActionInterface", "Vendor\\ConcreteAction"];
+        let map = registry(&type_names, &["Vendor\\ActionInterface"], &class_map);
+
+        assert_eq!(
+            map.get("Vendor\\ConcreteAction"),
+            Some(&true),
+            "leading backslash in implements list must be normalized"
+        );
+    }
+
+    #[test]
+    fn interface_propagation_class_implementing_multiple_interfaces_one_intercepted() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Vendor\\InterceptedInterface".to_string(),
+            class_info("Vendor\\InterceptedInterface", None, false),
+        );
+        class_map.insert(
+            "Vendor\\OtherInterface".to_string(),
+            class_info("Vendor\\OtherInterface", None, false),
+        );
+        class_map.insert(
+            "Vendor\\MultiImpl".to_string(),
+            class_info_with_implements(
+                "Vendor\\MultiImpl",
+                None,
+                vec!["Vendor\\OtherInterface", "Vendor\\InterceptedInterface"],
+            ),
+        );
+
+        let type_names = [
+            "Vendor\\InterceptedInterface",
+            "Vendor\\OtherInterface",
+            "Vendor\\MultiImpl",
+        ];
+        let map = registry(&type_names, &["Vendor\\InterceptedInterface"], &class_map);
+
+        assert_eq!(map.get("Vendor\\MultiImpl"), Some(&true));
+        assert_eq!(map.get("Vendor\\OtherInterface"), Some(&false));
+    }
+
+    // =========================================================================
+    // IncrementalCache tests
+    // =========================================================================
+
+    #[test]
+    fn incremental_cache_hash_of_nonexistent_file_returns_none() {
+        assert!(
+            super::IncrementalCache::hash_of(std::path::Path::new(
+                "/nonexistent/__no_such_file__.php"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn incremental_cache_hash_of_existing_file_is_stable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a.php");
+        std::fs::write(&path, b"<?php echo 1;").unwrap();
+        let h1 = super::IncrementalCache::hash_of(&path).unwrap();
+        let h2 = super::IncrementalCache::hash_of(&path).unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn incremental_cache_hash_changes_when_file_content_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("b.php");
+        std::fs::write(&path, b"<?php $a = 1;").unwrap();
+        let h1 = super::IncrementalCache::hash_of(&path).unwrap();
+        std::fs::write(&path, b"<?php $a = 2;").unwrap();
+        let h2 = super::IncrementalCache::hash_of(&path).unwrap();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn incremental_cache_record_updates_on_file_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("c.php");
+        std::fs::write(&path, b"<?php $a = 1;").unwrap();
+        let mut cache = super::IncrementalCache::default();
+        cache.record(&path);
+        let key = path.to_string_lossy().to_string();
+        let hash_before = cache.files[&key].clone();
+
+        std::fs::write(&path, b"<?php $a = 2;").unwrap();
+        cache.record(&path);
+        let hash_after = cache.files[&key].clone();
+
+        assert_ne!(hash_before, hash_after);
+    }
+
+    #[test]
+    fn incremental_cache_save_and_load_round_trip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("d.php");
+        std::fs::write(&file_path, b"<?php // test").unwrap();
+
+        let mut cache = super::IncrementalCache::default();
+        cache.record(&file_path);
+
+        let cache_path = tmp.path().join("cache.json");
+        cache.save(&cache_path);
+
+        let loaded = super::IncrementalCache::load(&cache_path);
+        let key = file_path.to_string_lossy().to_string();
+        assert!(loaded.files.contains_key(&key));
+        assert_eq!(loaded.files[&key], cache.files[&key]);
+    }
+
+    #[test]
+    fn incremental_cache_load_returns_empty_for_missing_file() {
+        let cache =
+            super::IncrementalCache::load(std::path::Path::new("/no/such/cache.json"));
+        assert!(cache.files.is_empty());
+    }
+
+    // =========================================================================
+    // enrich_all_constructors_with_reflection tests
+    //
+    // PHP_WORKER_POOL is not initialized in tests, so reflect_constructor_params
+    // always returns None. All tests verify candidate-selection logic and that
+    // the function handles gracefully, returning correct zero counts.
+    // =========================================================================
+
+    use php_extractor::types::{Constructor, ConstructorParam};
+
+    fn ctor_with_const_default() -> Constructor {
+        Constructor {
+            params: vec![ConstructorParam {
+                name: "x".to_string(),
+                type_hint: None,
+                is_optional: true,
+                default_value: Some("Magento\\Module\\Model::SOME_CONST".to_string()),
+                is_primitive: false,
+                is_variadic: false,
+                is_promoted: false,
+            }],
+        }
+    }
+
+    fn ctor_plain() -> Constructor {
+        Constructor {
+            params: vec![ConstructorParam {
+                name: "y".to_string(),
+                type_hint: Some("string".to_string()),
+                is_optional: false,
+                default_value: None,
+                is_primitive: true,
+                is_variadic: false,
+                is_promoted: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn enrich_all_constructors_empty_class_map_returns_zeros() {
+        let mut class_map: FxHashMap<String, ClassInfo> = FxHashMap::default();
+        let (c0, c1, c2) = super::enrich_all_constructors_with_reflection(
+            &mut class_map,
+            &[],
+            &DiConfig::default(),
+            std::path::Path::new("/nonexistent"),
+            "nonexistent_php_binary",
+        );
+        assert_eq!((c0, c1, c2), (0, 0, 0));
+    }
+
+    #[test]
+    fn enrich_all_constructors_class_without_const_default_is_not_kind0_candidate() {
+        // A class with a plain (non-constant) constructor is NOT a kind-0 candidate.
+        // Verify function returns (0,0,0) and does not panic.
+        let mut plain = class_info("Foo\\Plain", None, false);
+        plain.constructor = Some(ctor_plain()); // no "::" in any default
+
+        let mut class_map = FxHashMap::default();
+        class_map.insert("Foo\\Plain".to_string(), plain);
+
+        let (c0, c1, c2) = super::enrich_all_constructors_with_reflection(
+            &mut class_map,
+            &[],
+            &DiConfig::default(),
+            std::path::Path::new("/nonexistent"),
+            "nonexistent_php_binary",
+        );
+        assert_eq!((c0, c1, c2), (0, 0, 0));
+        // Constructor left unchanged — reflection was never triggered
+        assert!(class_map["Foo\\Plain"].constructor.is_some());
+    }
+
+    #[test]
+    fn enrich_all_constructors_kind0_candidate_has_const_default() {
+        // Class with "::" in a default value IS a kind-0 candidate.
+        // PHP pool not running → reflection returns None → count stays 0, no panic.
+        let mut with_const = class_info("Foo\\WithConst", None, false);
+        with_const.constructor = Some(ctor_with_const_default());
+
+        let mut class_map = FxHashMap::default();
+        class_map.insert("Foo\\WithConst".to_string(), with_const);
+
+        let (c0, c1, c2) = super::enrich_all_constructors_with_reflection(
+            &mut class_map,
+            &[],
+            &DiConfig::default(),
+            std::path::Path::new("/nonexistent"),
+            "nonexistent_php_binary",
+        );
+        // Candidate found but PHP unavailable → reflection fails → 0 reflected
+        assert_eq!((c0, c1, c2), (0, 0, 0));
+    }
+
+    #[test]
+    fn enrich_all_constructors_kind1_requires_no_ctor_and_extends() {
+        // kind-1 candidates: no constructor, non-abstract, extends something.
+        // Classes that DON'T qualify should not trigger reflection.
+        let no_extends = class_info("Foo\\NoExtends", None, false); // no extends → NOT candidate
+        let has_ctor = {
+            let mut c = class_info("Foo\\HasCtor", Some("Base"), false);
+            c.constructor = Some(ctor_plain()); // already has ctor → NOT candidate
+            c
+        };
+        let is_abstract = class_info_impl("Foo\\Abstract", Some("Base"), true, vec![]); // abstract → NOT
+
+        let with_extends = class_info("Foo\\WithExtends", Some("Base"), false); // qualifies
+
+        let mut class_map = FxHashMap::default();
+        class_map.insert("Foo\\NoExtends".to_string(), no_extends);
+        class_map.insert("Foo\\HasCtor".to_string(), has_ctor);
+        class_map.insert("Foo\\Abstract".to_string(), is_abstract);
+        class_map.insert("Foo\\WithExtends".to_string(), with_extends);
+
+        let type_names = vec![
+            "Foo\\NoExtends".to_string(),
+            "Foo\\HasCtor".to_string(),
+            "Foo\\Abstract".to_string(),
+            "Foo\\WithExtends".to_string(),
+        ];
+
+        let (c0, c1, c2) = super::enrich_all_constructors_with_reflection(
+            &mut class_map,
+            &type_names,
+            &DiConfig::default(),
+            std::path::Path::new("/nonexistent"),
+            "nonexistent_php_binary",
+        );
+        assert_eq!((c0, c1, c2), (0, 0, 0));
+        // Only "Foo\\WithExtends" would have been a candidate; constructor remains None
+        assert!(class_map["Foo\\WithExtends"].constructor.is_none());
+    }
+
+    #[test]
+    fn enrich_all_constructors_kind2_requires_vt_target_absent_from_class_map() {
+        // kind-2: VT target that doesn't exist in class_map.
+        // "Third\\Party\\Lib" is the concrete target of "VendorVt" but is NOT in class_map.
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "VendorVt".to_string(),
+            VirtualType {
+                name: "VendorVt".to_string(),
+                type_name: "Third\\Party\\Lib".to_string(),
+            },
+        );
+
+        let mut class_map: FxHashMap<String, ClassInfo> = FxHashMap::default();
+        // "Third\\Party\\Lib" intentionally absent
+
+        let type_names = vec!["VendorVt".to_string()];
+
+        let (c0, c1, c2) = super::enrich_all_constructors_with_reflection(
+            &mut class_map,
+            &type_names,
+            &di_config,
+            std::path::Path::new("/nonexistent"),
+            "nonexistent_php_binary",
+        );
+        // Candidate exists but PHP unavailable → 0 reflected
+        assert_eq!((c0, c1, c2), (0, 0, 0));
+        // class_map not mutated (insertion only happens on successful reflection)
+        assert!(!class_map.contains_key("Third\\Party\\Lib"));
+    }
+
+    #[test]
+    fn enrich_all_constructors_vt_target_in_class_map_is_not_kind2_candidate() {
+        // If the VT target already exists in class_map, it is NOT a kind-2 candidate.
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "VendorVt".to_string(),
+            VirtualType {
+                name: "VendorVt".to_string(),
+                type_name: "Vendor\\ConcreteClass".to_string(),
+            },
+        );
+
+        let mut class_map: FxHashMap<String, ClassInfo> = FxHashMap::default();
+        class_map.insert(
+            "Vendor\\ConcreteClass".to_string(),
+            class_info("Vendor\\ConcreteClass", None, false),
+        );
+
+        let type_names = vec!["VendorVt".to_string()];
+        let (c0, c1, c2) = super::enrich_all_constructors_with_reflection(
+            &mut class_map,
+            &type_names,
+            &di_config,
+            std::path::Path::new("/nonexistent"),
+            "nonexistent_php_binary",
+        );
+        // No kind-2 candidate — class_map already has the target
+        assert_eq!((c0, c1, c2), (0, 0, 0));
     }
 }

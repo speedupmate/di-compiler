@@ -254,6 +254,7 @@ dependencies = [
  "insta",
  "log",
  "php-extractor",
+ "rustc-hash",
  "serde_json",
  "thiserror",
 ]
@@ -265,6 +266,7 @@ dependencies = [
  "insta",
  "log",
  "quick-xml",
+ "rustc-hash",
  "tempfile",
  "thiserror",
 ]
@@ -335,8 +337,10 @@ dependencies = [
  "php-extractor",
  "quick-xml",
  "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "validator",
 ]
@@ -578,6 +582,7 @@ dependencies = [
  "log",
  "memmap2",
  "rayon",
+ "rustc-hash",
  "tempfile",
  "thiserror",
  "tree-sitter",

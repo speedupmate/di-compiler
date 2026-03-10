@@ -1,6 +1,7 @@
 //! TKT-033: app_action_list.php generation.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 
 use php_extractor::ClassInfo;
 
@@ -9,12 +10,12 @@ use crate::metadata::escape_php;
 /// Build and serialize Magento's `app_action_list.php` metadata map.
 ///
 /// Keys are lower-cased FQCNs for classes in a `\Controller\` namespace segment.
-pub fn generate_app_action_list_php(class_map: &HashMap<String, ClassInfo>) -> String {
+pub fn generate_app_action_list_php(class_map: &FxHashMap<String, ClassInfo>) -> String {
     let entries = collect_action_entries(class_map);
     serialize_app_action_list_php(&entries)
 }
 
-fn collect_action_entries(class_map: &HashMap<String, ClassInfo>) -> BTreeMap<String, String> {
+fn collect_action_entries(class_map: &FxHashMap<String, ClassInfo>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for info in class_map.values() {
         let fqcn = &info.fqcn;
@@ -89,7 +90,7 @@ mod tests {
 
     #[test]
     fn test_collects_only_controller_namespaces() {
-        let mut classes = HashMap::new();
+        let mut classes = FxHashMap::default();
         classes.insert(
             "Magento\\Backend\\Controller\\Adminhtml\\Cache\\Index".to_string(),
             class_info(

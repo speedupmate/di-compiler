@@ -193,8 +193,8 @@ fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
 ///
 /// Uses text-based parsing on the raw source so that tree-sitter node-name
 /// differences across versions do not affect correctness.
-fn collect_use_map(_root: &Node, src: &[u8]) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
+fn collect_use_map(_root: &Node, src: &[u8]) -> rustc_hash::FxHashMap<String, String> {
+    let mut map = rustc_hash::FxHashMap::default();
     let text = match std::str::from_utf8(src) {
         Ok(s) => s,
         Err(_) => return map,
@@ -253,7 +253,7 @@ fn find_class_body_brace_offset(text: &str) -> Option<usize> {
 }
 
 /// Parse a use statement body (without leading `use ` and without trailing `;`).
-fn parse_use_stmt(stmt: &str, map: &mut std::collections::HashMap<String, String>) {
+fn parse_use_stmt(stmt: &str, map: &mut rustc_hash::FxHashMap<String, String>) {
     let stmt = stmt.trim();
     // Grouped: Foo\Bar\{Baz, Qux as Q}
     if stmt.contains('{') {
@@ -284,7 +284,7 @@ fn parse_use_stmt(stmt: &str, map: &mut std::collections::HashMap<String, String
 }
 
 /// Parse a grouped use statement like `use Foo\Bar\{Baz, Qux as Q};`
-fn parse_grouped_use(text: &str, map: &mut std::collections::HashMap<String, String>) {
+fn parse_grouped_use(text: &str, map: &mut rustc_hash::FxHashMap<String, String>) {
     // Extract prefix (before '{') and items (inside '{}')
     let text = text.trim_start_matches("use ").trim_end_matches(';').trim();
     let Some(brace_start) = text.find('{') else {
@@ -320,7 +320,7 @@ fn parse_grouped_use(text: &str, map: &mut std::collections::HashMap<String, Str
 fn resolve_type_hint(
     raw: &str,
     namespace: &str,
-    use_map: &std::collections::HashMap<String, String>,
+    use_map: &rustc_hash::FxHashMap<String, String>,
 ) -> String {
     if raw.is_empty() {
         return raw.to_string();
@@ -427,7 +427,7 @@ fn parse_constructor(
     method: Node,
     src: &[u8],
     namespace: &str,
-    use_map: &std::collections::HashMap<String, String>,
+    use_map: &rustc_hash::FxHashMap<String, String>,
 ) -> Constructor {
     let params = if let Some(params_node) = method.child_by_field_name("parameters") {
         parse_ctor_params_ts(params_node, src, namespace, use_map)
@@ -441,7 +441,7 @@ fn parse_ctor_params_ts(
     params_node: Node,
     src: &[u8],
     namespace: &str,
-    use_map: &std::collections::HashMap<String, String>,
+    use_map: &rustc_hash::FxHashMap<String, String>,
 ) -> Vec<ConstructorParam> {
     let mut params = Vec::new();
     for child in iter_children(params_node) {
@@ -495,7 +495,7 @@ fn parse_method_params_ts(
     method: Node,
     src: &[u8],
     namespace: &str,
-    use_map: &std::collections::HashMap<String, String>,
+    use_map: &rustc_hash::FxHashMap<String, String>,
 ) -> Vec<MethodParam> {
     let mut params = Vec::new();
     if let Some(params_node) = method.child_by_field_name("parameters") {
@@ -539,7 +539,7 @@ fn parse_method_params_ts(
 fn resolve_type_in_hint(
     raw: &str,
     namespace: &str,
-    use_map: &std::collections::HashMap<String, String>,
+    use_map: &rustc_hash::FxHashMap<String, String>,
 ) -> String {
     if raw.is_empty() {
         return raw.to_string();

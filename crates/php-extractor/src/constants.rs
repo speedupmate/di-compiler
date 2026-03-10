@@ -8,16 +8,16 @@
 //! Used to resolve `xsi:type="init_parameter"` references in di.xml that
 //! contain PHP constant expressions like `ClassName::CONST_NAME`.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 /// Extract all string-literal class constants from a PHP source file.
 /// Returns a map of `CONST_NAME → resolved_string_value`.
-pub fn extract_string_constants(path: &Path) -> HashMap<String, String> {
+pub fn extract_string_constants(path: &Path) -> FxHashMap<String, String> {
     let Ok(bytes) = std::fs::read(path) else {
-        return HashMap::new();
+        return FxHashMap::default();
     };
-    let mut result = HashMap::new();
+    let mut result = FxHashMap::default();
     let mut s = ConstScanner::new(&bytes);
     s.scan(&mut result);
     result
@@ -220,7 +220,7 @@ impl<'a> ConstScanner<'a> {
         String::from_utf8(out).ok()
     }
 
-    fn scan(&mut self, result: &mut HashMap<String, String>) {
+    fn scan(&mut self, result: &mut FxHashMap<String, String>) {
         while !self.is_eof() {
             match self.peek() {
                 b'\'' => {
@@ -258,7 +258,7 @@ impl<'a> ConstScanner<'a> {
         }
     }
 
-    fn try_read_const(&mut self, _start: usize, result: &mut HashMap<String, String>) {
+    fn try_read_const(&mut self, _start: usize, result: &mut FxHashMap<String, String>) {
         // Skip whitespace after `const`
         self.skip_ws();
         // Read constant name
@@ -297,8 +297,8 @@ impl<'a> ConstScanner<'a> {
 mod tests {
     use super::*;
 
-    fn scan(src: &str) -> HashMap<String, String> {
-        let mut out = HashMap::new();
+    fn scan(src: &str) -> FxHashMap<String, String> {
+        let mut out = FxHashMap::default();
         let mut scanner = ConstScanner::new(src.as_bytes());
         scanner.scan(&mut out);
         out

@@ -3,7 +3,8 @@
 //! Generates Magento-style compiled plugin list metadata files:
 //! `primary|global|...|plugin-list.php`
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use di_xml_reader::{DiConfig, Plugin as DiPlugin};
 use php_extractor::types::ClassKind;
@@ -69,13 +70,13 @@ pub struct PluginListMetadata {
 /// section 0 => pluginData, section 1 => inherited, section 2 => processed.
 pub fn compile_plugin_list(
     di_config: &DiConfig,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     class_definitions: &[String],
 ) -> PluginListMetadata {
     let plugin_data = collect_plugin_data(di_config);
-    let mut inherited: HashMap<String, Option<Vec<PluginConfig>>> = HashMap::new();
-    let mut processed: HashMap<String, ProcessedMethod> = HashMap::new();
-    let mut plugin_methods_cache: HashMap<String, HashMap<String, u8>> = HashMap::new();
+    let mut inherited: FxHashMap<String, Option<Vec<PluginConfig>>> = FxHashMap::default();
+    let mut processed: FxHashMap<String, ProcessedMethod> = FxHashMap::default();
+    let mut plugin_methods_cache: FxHashMap<String, FxHashMap<String, u8>> = FxHashMap::default();
 
     // 1) Virtual types from merged scope config.
     let mut virtual_types: Vec<&String> = di_config.virtual_types.keys().collect();
@@ -150,7 +151,7 @@ pub fn compile_plugin_list(
 /// Generate final PHP metadata source for one plugin-list file.
 pub fn generate_plugin_list_php(
     di_config: &DiConfig,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     class_definitions: &[String],
 ) -> String {
     let metadata = compile_plugin_list(di_config, class_map, class_definitions);
@@ -265,10 +266,10 @@ fn inherit_plugins(
     type_name: &str,
     plugin_data: &BTreeMap<String, Vec<PluginConfig>>,
     di_config: &DiConfig,
-    class_map: &HashMap<String, ClassInfo>,
-    inherited: &mut HashMap<String, Option<Vec<PluginConfig>>>,
-    processed: &mut HashMap<String, ProcessedMethod>,
-    plugin_methods_cache: &mut HashMap<String, HashMap<String, u8>>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    inherited: &mut FxHashMap<String, Option<Vec<PluginConfig>>>,
+    processed: &mut FxHashMap<String, ProcessedMethod>,
+    plugin_methods_cache: &mut FxHashMap<String, FxHashMap<String, u8>>,
 ) -> Option<Vec<PluginConfig>> {
     let type_name = normalize(type_name);
     if let Some(existing) = inherited.get(&type_name) {
@@ -337,7 +338,7 @@ fn inherit_plugins(
 
         inherited.insert(type_name.clone(), Some(sorted_plugins.clone()));
 
-        let mut last_per_method: HashMap<String, String> = HashMap::new();
+        let mut last_per_method: FxHashMap<String, String> = FxHashMap::default();
         for plugin in &sorted_plugins {
             if plugin.disabled {
                 continue;
@@ -376,7 +377,7 @@ fn inherit_plugins(
     inherited.get(&type_name).cloned().unwrap_or(None)
 }
 
-fn get_parents(type_name: &str, class_map: &HashMap<String, ClassInfo>) -> Vec<String> {
+fn get_parents(type_name: &str, class_map: &FxHashMap<String, ClassInfo>) -> Vec<String> {
     let Some(info) = class_map.get(type_name) else {
         return Vec::new();
     };
@@ -418,15 +419,15 @@ fn from_di_plugin(plugin: &DiPlugin) -> PluginConfig {
 
 fn plugin_method_types(
     plugin_type: &str,
-    class_map: &HashMap<String, ClassInfo>,
-    cache: &mut HashMap<String, HashMap<String, u8>>,
-) -> HashMap<String, u8> {
+    class_map: &FxHashMap<String, ClassInfo>,
+    cache: &mut FxHashMap<String, FxHashMap<String, u8>>,
+) -> FxHashMap<String, u8> {
     if let Some(cached) = cache.get(plugin_type) {
         return cached.clone();
     }
 
     let methods = collect_public_methods_with_inheritance(plugin_type, class_map);
-    let mut result: HashMap<String, u8> = HashMap::new();
+    let mut result: FxHashMap<String, u8> = FxHashMap::default();
     for method in methods {
         if let Some((intercepted, listener)) = parse_plugin_listener(&method) {
             result
@@ -442,11 +443,11 @@ fn plugin_method_types(
 
 fn collect_public_methods_with_inheritance(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> Vec<String> {
     let mut methods = Vec::new();
-    let mut seen_methods = HashSet::new();
-    let mut visited_types = HashSet::new();
+    let mut seen_methods = FxHashSet::default();
+    let mut visited_types = FxHashSet::default();
     let mut current = Some(normalize(fqcn));
 
     while let Some(type_name) = current {
@@ -572,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_disabled_plugin_stays_in_inherited_but_not_processed() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Target".to_string(),
             class_info("Foo\\Target", None, &[], &["run"]),
@@ -602,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_around_chain_current_key_progression() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Target".to_string(),
             class_info("Foo\\Target", None, &[], &["run"]),
@@ -643,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_parent_plugins_inherit_into_child() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Parent".to_string(),
             class_info("Foo\\Parent", None, &[], &["run"]),
@@ -677,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_php_serialization_sections() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Target".to_string(),
             class_info("Foo\\Target", None, &[], &["run"]),

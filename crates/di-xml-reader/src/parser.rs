@@ -1,5 +1,5 @@
 //! TKT-010: quick-xml SAX parser for a single di.xml file.
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 use quick_xml::events::Event;
@@ -425,8 +425,8 @@ fn local_name(name: &[u8]) -> String {
     }
 }
 
-fn parse_attrs(e: &quick_xml::events::BytesStart) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+fn parse_attrs(e: &quick_xml::events::BytesStart) -> FxHashMap<String, String> {
+    let mut map = FxHashMap::default();
     for attr in e.attributes().flatten() {
         let key = std::str::from_utf8(attr.key.as_ref())
             .unwrap_or("")

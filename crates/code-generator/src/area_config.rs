@@ -5,7 +5,7 @@
 //!   - `preferences` — interface → implementation map (from DiConfig)
 //!   - `instanceTypes` — virtualType name → concrete type map
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use di_resolver::{ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue};
 use di_xml_reader::DiConfig;
@@ -17,18 +17,18 @@ use crate::metadata::{escape_php, render_scalar, render_untyped_default};
 /// `args_map`: FQCN → constructor args (from arguments resolver).
 /// `di_config`: merged DI configuration for the area.
 pub fn generate_area_config(
-    args_map: &HashMap<String, Vec<ResolvedArg>>,
+    args_map: &FxHashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
 ) -> String {
-    generate_area_config_with_overrides(args_map, di_config, &HashMap::new(), &HashMap::new())
+    generate_area_config_with_overrides(args_map, di_config, &FxHashMap::default(), &FxHashMap::default())
 }
 
 /// Generate area config while injecting additional preferences that should
 /// appear in metadata output (for example interception preferences).
 pub fn generate_area_config_with_extra_preferences(
-    args_map: &HashMap<String, Vec<ResolvedArg>>,
+    args_map: &FxHashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
-    extra_preferences: &HashMap<String, String>,
+    extra_preferences: &FxHashMap<String, String>,
 ) -> String {
     generate_area_config_with_overrides(args_map, di_config, extra_preferences, extra_preferences)
 }
@@ -37,10 +37,10 @@ pub fn generate_area_config_with_extra_preferences(
 /// - `preference_overrides` are applied to the preferences section.
 /// - `instance_type_overrides` are applied only to resolved instanceTypes targets.
 pub fn generate_area_config_with_overrides(
-    args_map: &HashMap<String, Vec<ResolvedArg>>,
+    args_map: &FxHashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
-    preference_overrides: &HashMap<String, String>,
-    instance_type_overrides: &HashMap<String, String>,
+    preference_overrides: &FxHashMap<String, String>,
+    instance_type_overrides: &FxHashMap<String, String>,
 ) -> String {
     let mut out = String::from("<?php return array (\n");
 
@@ -283,11 +283,11 @@ mod tests {
     use super::*;
     use di_resolver::{ResolvedArg, ResolvedArgValue, ResolvedScalar};
     use di_xml_reader::DiConfig;
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     #[test]
     fn test_empty_area_config() {
-        let out = generate_area_config(&HashMap::new(), &DiConfig::default());
+        let out = generate_area_config(&FxHashMap::default(), &DiConfig::default());
         assert!(out.starts_with("<?php return array (\n"));
         assert!(out.contains("'arguments'"));
         assert!(out.contains("'preferences'"));
@@ -301,13 +301,13 @@ mod tests {
         di_config
             .preferences
             .insert("Foo\\Interface".to_string(), "Foo\\Impl".to_string());
-        let out = generate_area_config(&HashMap::new(), &di_config);
+        let out = generate_area_config(&FxHashMap::default(), &di_config);
         assert!(out.contains("'Foo\\\\Interface' => 'Foo\\\\Impl'"));
     }
 
     #[test]
     fn test_nested_configured_arrays_are_flat_in_vac() {
-        let mut args = HashMap::new();
+        let mut args = FxHashMap::default();
         args.insert(
             "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
             vec![ResolvedArg {
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_global_arg_ref_always_emits_default_key() {
-        let mut args = HashMap::new();
+        let mut args = FxHashMap::default();
         args.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_nested_global_arg_ref_always_emits_default_key() {
-        let mut args = HashMap::new();
+        let mut args = FxHashMap::default();
         args.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {

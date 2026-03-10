@@ -37,7 +37,22 @@ Drive hot-path optimizations that materially reduce wall-clock compile time with
 | Feature | Deps |
 |---------|------|
 | [34-php-reflection-worker-pool](../.features/34-php-reflection-worker-pool.md) | 21, 23 |
+| [38-low-level-performance-hardening](../.features/38-low-level-performance-hardening.md) | 34, 23, 24 |
 
 ## Tickets In This Phase
 
-TKT-035 through TKT-037, TKT-042
+TKT-035 through TKT-037, TKT-042, TKT-056 through TKT-060
+
+## Round 2 Status (2026-03-10)
+
+TKT-056 through TKT-060 landed in one batch:
+
+| Ticket | Change | Status |
+|--------|--------|--------|
+| TKT-056 | FxHashMap/FxHashSet across all crates | Done |
+| TKT-057 | Lock-free class extraction + Arc\<DiConfig\> area loop | Done |
+| TKT-058 | Merged reflection passes + BFS interface propagation | Done |
+| TKT-059 | Incremental di.xml cache correctness fix | Done |
+| TKT-060 | Archive compare parallelization | Done |
+
+Test count: 197 (up from 176). Build clean, zero warnings.

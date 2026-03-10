@@ -9,7 +9,7 @@
 //!   - proxy class does not already exist
 //!   - target class/interface (proxy minus `\Proxy`) exists
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use php_extractor::{types::ClassKind, ClassInfo};
 
@@ -18,7 +18,7 @@ use di_xml_reader::{Argument, DiConfig};
 
 /// Detect proxy classes to generate.
 pub fn detect_proxies(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
 ) -> Vec<ProxySpec> {
     detect_proxies_from_configs(class_map, std::slice::from_ref(di_config))
@@ -27,23 +27,23 @@ pub fn detect_proxies(
 /// Detect proxy classes using raw per-file DI configs for XmlScanner-style
 /// candidate coverage (preserves candidates that are overridden during merge).
 pub fn detect_proxies_from_configs(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     scanner_di_configs: &[DiConfig],
 ) -> Vec<ProxySpec> {
-    let extra_existing_types = HashSet::new();
+    let extra_existing_types = FxHashSet::default();
     detect_proxies_from_configs_with_existing(class_map, scanner_di_configs, &extra_existing_types)
 }
 
 /// Detect proxies with an explicit set of additional loadable class/interface
 /// names that are not present in `class_map` (e.g. Composer-only libraries).
 pub fn detect_proxies_from_configs_with_existing(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     scanner_di_configs: &[DiConfig],
-    extra_existing_types: &HashSet<String>,
+    extra_existing_types: &FxHashSet<String>,
 ) -> Vec<ProxySpec> {
     let mut specs: Vec<ProxySpec> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let virtual_type_names: HashSet<&str> = scanner_di_configs
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let virtual_type_names: FxHashSet<&str> = scanner_di_configs
         .iter()
         .flat_map(|cfg| cfg.virtual_types.keys().map(String::as_str))
         .collect();
@@ -113,8 +113,8 @@ fn collect_proxy_candidates_from_args(args: &[Argument], out: &mut Vec<String>) 
 }
 
 fn class_or_interface_exists(
-    class_map: &HashMap<String, ClassInfo>,
-    extra_existing_types: &HashSet<String>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    extra_existing_types: &FxHashSet<String>,
     fqcn: &str,
 ) -> bool {
     if extra_existing_types.contains(fqcn) {
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_proxy_from_preference_type() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Baz".to_string(),
             make_class("Foo\\Baz", ClassKind::Class),
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_proxy_from_di_xml_argument() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Heavy".to_string(),
             make_class("Foo\\Heavy", ClassKind::Class),
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_proxy_skips_existing() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Baz".to_string(),
             make_class("Foo\\Baz", ClassKind::Class),
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_proxy_requires_existing_target_class_or_interface() {
-        let class_map = HashMap::new();
+        let class_map = FxHashMap::default();
         let di_config = DiConfig::default();
         let specs = detect_proxies(&class_map, &di_config);
         assert!(specs.is_empty());
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_proxy_from_virtual_type_parent() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Baz\\Api".to_string(),
             make_class("Foo\\Baz\\Api", ClassKind::Interface),
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_proxy_from_nested_di_xml_item_argument() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Heavy".to_string(),
             make_class("Foo\\Heavy", ClassKind::Class),
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_proxy_scanner_preserves_preference_candidates_across_file_overrides() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\One\\Target".to_string(),
             make_class("Foo\\One\\Target", ClassKind::Class),
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_proxy_virtual_type_name_is_skipped() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Target".to_string(),
             make_class("Foo\\Target", ClassKind::Class),
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_proxy_target_can_be_resolved_from_extra_existing_types() {
-        let class_map = HashMap::new();
+        let class_map = FxHashMap::default();
         let mut di_config = DiConfig::default();
         di_config.type_configs.insert(
             "Foo\\Service".to_string(),
@@ -352,7 +352,7 @@ mod tests {
             },
         );
 
-        let mut extra = HashSet::new();
+        let mut extra = FxHashSet::default();
         extra.insert("Psr\\Log\\LoggerInterface".to_string());
 
         let specs = detect_proxies_from_configs_with_existing(&class_map, &[di_config], &extra);

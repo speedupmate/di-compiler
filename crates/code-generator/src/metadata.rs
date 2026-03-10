@@ -19,7 +19,7 @@
 //!   Array             → `['_vac_' => [...]]`
 //!   Global arg ref    → `['_a_'   => 'name', '_d_' => default]`
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use di_resolver::{
     ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
@@ -28,7 +28,7 @@ use di_resolver::{
 /// Serialize a `<?php return array (...);` arguments map.
 ///
 /// `args_map`: FQCN → Vec<ResolvedArg>
-pub fn serialize_arguments_php(args_map: &HashMap<String, Vec<ResolvedArg>>) -> String {
+pub fn serialize_arguments_php(args_map: &FxHashMap<String, Vec<ResolvedArg>>) -> String {
     let mut out = String::from("<?php return array (\n");
 
     let mut sorted_keys: Vec<&String> = args_map.keys().collect();
@@ -51,7 +51,7 @@ pub fn serialize_arguments_php(args_map: &HashMap<String, Vec<ResolvedArg>>) -> 
 }
 
 /// Serialize the interception.php file: FQCN → bool (true = intercepted).
-pub fn serialize_interception_php(all_fqcns: &HashMap<String, bool>) -> String {
+pub fn serialize_interception_php(all_fqcns: &FxHashMap<String, bool>) -> String {
     let mut out = String::from("<?php return array (\n");
 
     let mut sorted: Vec<(&String, bool)> = all_fqcns.iter().map(|(k, &v)| (k, v)).collect();
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_interception_php_format() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert("Foo\\Bar".to_string(), false);
         map.insert("Foo\\Intercepted".to_string(), true);
         let out = serialize_interception_php(&map);
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_shared_instance() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_null_arg() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn test_arg_closes_with_comma_not_dot() {
         // Regression: array arg closing must be `),` not `).`
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_scalar_string_numeric_stays_quoted() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_scalar_number_renders_unquoted_when_safe() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_scalar_number_with_leading_zero_is_quoted() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_scalar_bool_renders_unquoted() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_configured_array_nested_entries_are_flat_inside_vac() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "Magento\\Framework\\App\\Config\\ConfigSourceAggregated".to_string(),
             vec![ResolvedArg {
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_global_arg_ref_always_emits_default_key() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_configured_array_global_arg_ref_emits_default_key() {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::default();
         map.insert(
             "App\\Service".to_string(),
             vec![ResolvedArg {

@@ -9,7 +9,7 @@
 //! all concrete subclasses are also intercepted so the plugin system fires correctly
 //! when those subclasses are instantiated via the DI container.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use php_extractor::{ClassInfo, MethodSignature};
 
@@ -18,14 +18,14 @@ use di_xml_reader::DiConfig;
 
 /// Build the list of classes that need interceptors.
 pub fn detect_interceptors(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
 ) -> Vec<InterceptorSpec> {
     // -----------------------------------------------------------------------
     // Phase 1: Classes with direct plugin registrations in di.xml
     // -----------------------------------------------------------------------
     let mut specs: Vec<InterceptorSpec> = Vec::new();
-    let mut directly_intercepted: HashSet<String> = HashSet::new();
+    let mut directly_intercepted: FxHashSet<String> = FxHashSet::default();
 
     for (owner_name, plugins) in &di_config.plugins {
         let active: Vec<&di_xml_reader::Plugin> = plugins.iter().filter(|p| !p.disabled).collect();
@@ -133,11 +133,11 @@ pub fn detect_interceptors(
     // NOT already intercepted, walk its `extends` chain. If any ancestor is in
     // the intercepted set, this class also needs an interceptor.
     // -----------------------------------------------------------------------
-    let intercepted_set: HashSet<&str> = directly_intercepted.iter().map(|s| s.as_str()).collect();
+    let intercepted_set: FxHashSet<&str> = directly_intercepted.iter().map(|s| s.as_str()).collect();
 
     // Build a cache to avoid repeated ancestor walks.
     // `ancestor_intercepted` memoizes: fqcn → bool
-    let mut ancestor_cache: HashMap<&str, bool> = HashMap::new();
+    let mut ancestor_cache: FxHashMap<&str, bool> = FxHashMap::default();
 
     for (fqcn, info) in class_map {
         // Already directly intercepted — skip.
@@ -194,8 +194,8 @@ pub fn detect_interceptors(
 
 fn select_interceptor_methods(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
-    intercepted_method_names: Option<&HashSet<String>>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    intercepted_method_names: Option<&FxHashSet<String>>,
     include_inherited: bool,
 ) -> Vec<MethodSignature> {
     let methods = if include_inherited {
@@ -218,7 +218,7 @@ fn select_interceptor_methods(
 
 fn collect_public_methods_declared_only(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> Vec<MethodSignature> {
     class_map
         .get(fqcn)
@@ -228,10 +228,10 @@ fn collect_public_methods_declared_only(
 
 fn collect_public_methods_with_inheritance(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
 ) -> Vec<MethodSignature> {
     let mut result = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut cursor = Some(fqcn.to_string());
 
     while let Some(current) = cursor {
@@ -251,10 +251,10 @@ fn collect_public_methods_with_inheritance(
 
 fn derive_intercepted_methods_from_plugins(
     plugins: &[PluginRef],
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
-) -> HashSet<String> {
-    let mut methods = HashSet::new();
+) -> FxHashSet<String> {
+    let mut methods = FxHashSet::default();
 
     for plugin in plugins {
         let resolved_plugin_type = di_config.get_instance_type(&plugin.type_name);
@@ -277,11 +277,11 @@ fn derive_intercepted_methods_from_plugins(
 
 fn derive_intercepted_methods_from_ancestor_plugins(
     fqcn: &str,
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
-) -> HashSet<String> {
-    let mut methods = HashSet::new();
-    let mut seen = HashSet::new();
+) -> FxHashSet<String> {
+    let mut methods = FxHashSet::default();
+    let mut seen = FxHashSet::default();
     let mut stack = vec![fqcn.to_string()];
 
     while let Some(current) = stack.pop() {
@@ -358,9 +358,9 @@ fn is_interceptable_method(method: &MethodSignature) -> bool {
 /// Uses `cache` to memoize results.
 fn has_intercepted_ancestor<'a>(
     fqcn: &'a str,
-    class_map: &'a HashMap<String, ClassInfo>,
-    intercepted_set: &HashSet<&str>,
-    cache: &mut HashMap<&'a str, bool>,
+    class_map: &'a FxHashMap<String, ClassInfo>,
+    intercepted_set: &FxHashSet<&str>,
+    cache: &mut FxHashMap<&'a str, bool>,
 ) -> bool {
     if let Some(&cached) = cache.get(fqcn) {
         return cached;
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_detects_class_with_plugin() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Bar".to_string(), make_class("Foo\\Bar", false));
         let mut di_config = DiConfig::default();
         di_config.plugins.insert(
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_skips_final_class() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Final".to_string(), make_class("Foo\\Final", true));
         let mut di_config = DiConfig::default();
         di_config.plugins.insert(
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_skips_disabled_plugins() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Bar".to_string(), make_class("Foo\\Bar", false));
         let mut di_config = DiConfig::default();
         di_config.plugins.insert(
@@ -495,7 +495,7 @@ mod tests {
         parent.extends = None;
         let mut child = make_class("Foo\\Child", false);
         child.extends = Some("Foo\\Parent".to_string());
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Parent".to_string(), parent);
         class_map.insert("Foo\\Child".to_string(), child);
 
@@ -517,7 +517,7 @@ mod tests {
         parent.extends = None;
         let mut child = make_class("Foo\\Child", true); // is_final = true
         child.extends = Some("Foo\\Parent".to_string());
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Parent".to_string(), parent);
         class_map.insert("Foo\\Child".to_string(), child);
 
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_plugin_sort_order() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Bar".to_string(), make_class("Foo\\Bar", false));
         let mut di_config = DiConfig::default();
         di_config.plugins.insert(
@@ -567,7 +567,7 @@ mod tests {
             make_method("beforeStaticMethod", false),
         ];
 
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Bar".to_string(), target);
         class_map.insert("Foo\\Plugin".to_string(), plugin);
 
@@ -596,7 +596,7 @@ mod tests {
         target.extends = Some("Foo\\Base".to_string());
         target.public_methods = vec![make_method("run", false)];
 
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Base".to_string(), base);
         class_map.insert("Foo\\Bar".to_string(), target);
 
@@ -631,7 +631,7 @@ mod tests {
         let mut plugin = make_class("Foo\\Plugin", false);
         plugin.public_methods = vec![make_method("afterGetForm", false)];
 
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert("Foo\\Parent".to_string(), parent);
         class_map.insert("Foo\\Child".to_string(), child);
         class_map.insert("Foo\\Plugin".to_string(), plugin);

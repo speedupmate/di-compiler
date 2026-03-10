@@ -18,8 +18,12 @@ blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 quick-xml.workspace = true
+rustc-hash.workspace = true
 php-extractor = { path = "../php-extractor" }
 di-xml-reader = { path = "../di-xml-reader" }
 di-resolver = { path = "../di-resolver" }
 code-generator = { path = "../code-generator" }
 validator = { path = "../validator" }
+
+[dev-dependencies]
+tempfile.workspace = true

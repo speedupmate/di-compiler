@@ -534,4 +534,88 @@ mod tests {
         assert_eq!(plugin.type_name, "Foo\\Plugin\\Override");
         assert!(plugin.disabled);
     }
+
+    // =========================================================================
+    // C1 regression: merge_configs must include ALL input configs
+    //
+    // The original incremental-cache bug in the CLI dropped unchanged di.xml
+    // files before they reached merge_configs, producing an incomplete DiConfig.
+    // This test ensures that merge_configs always includes every passed config,
+    // so that if anyone re-introduces a pre-merge filter they get a failing test.
+    // =========================================================================
+
+    #[test]
+    fn merge_configs_includes_preferences_from_all_inputs() {
+        let mut c1 = DiConfig::default();
+        c1.preferences.insert("Iface\\A".into(), "Impl\\A".into());
+
+        let mut c2 = DiConfig::default();
+        c2.preferences.insert("Iface\\B".into(), "Impl\\B".into());
+
+        let mut c3 = DiConfig::default();
+        c3.preferences.insert("Iface\\C".into(), "Impl\\C".into());
+
+        let merged = merge_configs(vec![c1, c2, c3]);
+
+        assert_eq!(
+            merged.preferences.get("Iface\\A").map(|s| s.as_str()),
+            Some("Impl\\A"),
+            "c1 preference must be present"
+        );
+        assert_eq!(
+            merged.preferences.get("Iface\\B").map(|s| s.as_str()),
+            Some("Impl\\B"),
+            "c2 preference must be present"
+        );
+        assert_eq!(
+            merged.preferences.get("Iface\\C").map(|s| s.as_str()),
+            Some("Impl\\C"),
+            "c3 preference must be present"
+        );
+    }
+
+    #[test]
+    fn merge_configs_includes_plugins_from_all_inputs() {
+        let make_plugin = |name: &str, type_name: &str| Plugin {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            sort_order: 0,
+            disabled: false,
+        };
+
+        let mut c1 = DiConfig::default();
+        c1.plugins
+            .insert("Owner\\A".into(), vec![make_plugin("p1", "Type\\P1")]);
+
+        let mut c2 = DiConfig::default();
+        c2.plugins
+            .insert("Owner\\B".into(), vec![make_plugin("p2", "Type\\P2")]);
+
+        let mut c3 = DiConfig::default();
+        c3.plugins
+            .insert("Owner\\C".into(), vec![make_plugin("p3", "Type\\P3")]);
+
+        let merged = merge_configs(vec![c1, c2, c3]);
+
+        assert!(
+            merged.plugins.contains_key("Owner\\A"),
+            "c1 plugins must be present"
+        );
+        assert!(
+            merged.plugins.contains_key("Owner\\B"),
+            "c2 plugins must be present"
+        );
+        assert!(
+            merged.plugins.contains_key("Owner\\C"),
+            "c3 plugins must be present"
+        );
+    }
+
+    #[test]
+    fn merge_configs_empty_input_produces_empty_config() {
+        let merged = merge_configs(vec![]);
+        assert!(merged.preferences.is_empty());
+        assert!(merged.plugins.is_empty());
+        assert!(merged.virtual_types.is_empty());
+    }
 }

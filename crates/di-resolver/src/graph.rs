@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use php_extractor::MethodSignature;
 
@@ -9,9 +9,9 @@ pub struct ResolvedGraph {
     pub classes_needing_factory: Vec<FactorySpec>,
     pub classes_needing_proxy: Vec<ProxySpec>,
     /// FQCN → resolved constructor args (for metadata generation)
-    pub constructor_map: HashMap<String, Vec<ResolvedArg>>,
+    pub constructor_map: FxHashMap<String, Vec<ResolvedArg>>,
     /// All FQCNs encountered during scan (for interception.php)
-    pub all_fqcns: HashMap<String, bool>,
+    pub all_fqcns: FxHashMap<String, bool>,
 }
 
 #[derive(Debug, Clone)]

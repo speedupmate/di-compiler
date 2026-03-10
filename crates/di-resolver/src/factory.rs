@@ -5,7 +5,7 @@
 //!
 //! This module handles factory detection; proxy detection is in proxy.rs.
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use php_extractor::ClassInfo;
 
@@ -17,7 +17,7 @@ use di_xml_reader::{Argument, DiConfig};
 /// Scans constructor params of all extracted classes for type hints ending with `Factory`.
 /// If the factory class does not already exist in class_map, emit a FactorySpec.
 pub fn detect_factories(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
 ) -> Vec<FactorySpec> {
     detect_factories_from_configs(
@@ -31,18 +31,18 @@ pub fn detect_factories(
 /// Detect factory classes using merged DI for preference resolution and
 /// raw per-file DI configs for XmlScanner-style candidate coverage.
 pub fn detect_factories_from_configs(
-    class_map: &HashMap<String, ClassInfo>,
+    class_map: &FxHashMap<String, ClassInfo>,
     merged_di_config: &DiConfig,
     scanner_di_configs: &[DiConfig],
     global_di_config: &DiConfig,
 ) -> Vec<FactorySpec> {
     let mut specs: Vec<FactorySpec> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let virtual_type_names: std::collections::HashSet<&str> = scanner_di_configs
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let virtual_type_names: FxHashSet<&str> = scanner_di_configs
         .iter()
         .flat_map(|cfg| cfg.virtual_types.keys().map(String::as_str))
         .collect();
-    let global_virtual_type_names: std::collections::HashSet<&str> = global_di_config
+    let global_virtual_type_names: FxHashSet<&str> = global_di_config
         .virtual_types
         .keys()
         .map(String::as_str)
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_detects_factory() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Bar".to_string(),
             make_class_with_ctor("Foo\\Bar", "Foo\\Baz\\WidgetFactory"),
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_skips_existing_factory() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Bar".to_string(),
             make_class_with_ctor("Foo\\Bar", "Foo\\Baz\\WidgetFactory"),
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_nullable_factory_type_hint_normalized() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Bar".to_string(),
             make_class_with_ctor("Foo\\Bar", "?Foo\\Baz\\WidgetFactory"),
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_union_factory_type_hint_uses_first_non_null_arm() {
-        let mut class_map = HashMap::new();
+        let mut class_map = FxHashMap::default();
         class_map.insert(
             "Foo\\Bar".to_string(),
             make_class_with_ctor("Foo\\Bar", "null|Foo\\Baz\\WidgetFactory"),
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_factory_from_xml_argument_object() {
-        let class_map = HashMap::new();
+        let class_map = FxHashMap::default();
         let mut di_config = DiConfig::default();
         di_config.type_configs.insert(
             "Foo\\Service".to_string(),
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_factory_virtual_type_name_is_skipped() {
-        let class_map = HashMap::new();
+        let class_map = FxHashMap::default();
         let mut di_config = DiConfig::default();
         di_config.virtual_types.insert(
             "Foo\\Baz\\WidgetFactory".to_string(),
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_factory_scanner_preserves_candidates_across_file_overrides() {
-        let class_map = HashMap::new();
+        let class_map = FxHashMap::default();
 
         let mut cfg1 = DiConfig::default();
         cfg1.type_configs.insert(
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_factory_virtual_type_name_from_area_only_is_not_skipped() {
-        let class_map = HashMap::new();
+        let class_map = FxHashMap::default();
 
         let mut area_cfg = DiConfig::default();
         area_cfg.virtual_types.insert(
