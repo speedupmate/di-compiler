@@ -9,12 +9,18 @@ use crate::model::{Argument, DiConfig, TypeConfig};
 pub fn merge_configs(configs: Vec<DiConfig>) -> DiConfig {
     let mut result = DiConfig::default();
     for config in configs {
-        merge_into(&mut result, config);
+        merge_into_impl(&mut result, config);
     }
+    result.refresh_lookup_indexes();
     result
 }
 
 pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
+    merge_into_impl(dst, src);
+    dst.refresh_lookup_indexes();
+}
+
+fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
     // Preferences: last wins
     for (k, v) in src.preferences {
         dst.preferences.insert(k, v);
@@ -38,8 +44,24 @@ pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
         let dst_plugins = dst.plugins.entry(owner).or_default();
         for src_plugin in src_plugins {
             if let Some(existing) = dst_plugins.iter_mut().find(|p| p.name == src_plugin.name) {
-                *existing = src_plugin;
-            } else {
+                if src_plugin.type_name.is_empty() {
+                    // Disabled-only override (no type attribute): preserve original type_name.
+                    existing.disabled = src_plugin.disabled;
+                    if src_plugin.sort_order != 0 {
+                        existing.sort_order = src_plugin.sort_order;
+                    }
+                } else {
+                    let was_disabled = existing.disabled;
+                    *existing = src_plugin;
+                    // PHP "sticky disabled": once disabled by an explicit override, the plugin
+                    // stays disabled even if a later module re-declares it as active.
+                    if was_disabled {
+                        existing.disabled = true;
+                    }
+                }
+            } else if !src_plugin.type_name.is_empty() {
+                // Only add a new plugin if it has a type; disabled-only entries with no prior
+                // declaration are no-ops.
                 dst_plugins.push(src_plugin);
             }
         }
@@ -49,6 +71,83 @@ pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
     for (type_name, src_tc) in src.type_configs {
         let dst_tc = dst.type_configs.entry(type_name).or_default();
         merge_type_config(dst_tc, src_tc);
+    }
+}
+
+/// Apply a merged module-level config on top of a primary (`app/etc/di.xml`) config.
+///
+/// Preferences, virtual types, and plugins follow the same merge rules as `merge_into`.
+/// For type configs, argument values are replaced **at the argument-name level** (shallow),
+/// replicating PHP's `Config::_mergeConfiguration` which uses `array_replace` at the
+/// arguments level — not a recursive item-level deep merge.
+///
+/// This is the correct two-phase merge:
+///   Phase 1: deep-merge all module di.xml files together (use `merge_configs`)
+///   Phase 2: apply the merged module result onto `app/etc/di.xml` (use this fn)
+pub fn apply_module_config_on_primary(mut primary: DiConfig, module: DiConfig) -> DiConfig {
+    // Preferences: last wins
+    for (k, v) in module.preferences {
+        primary.preferences.insert(k, v);
+    }
+
+    // Virtual types: same logic as merge_into
+    for (k, v) in module.virtual_types {
+        if let Some(existing) = primary.virtual_types.get_mut(&k) {
+            if !v.type_name.trim().is_empty() {
+                existing.type_name = v.type_name;
+            }
+        } else {
+            primary.virtual_types.insert(k, v);
+        }
+    }
+
+    // Plugins: same logic as merge_into
+    for (owner, src_plugins) in module.plugins {
+        let dst_plugins = primary.plugins.entry(owner).or_default();
+        for src_plugin in src_plugins {
+            if let Some(existing) = dst_plugins.iter_mut().find(|p| p.name == src_plugin.name) {
+                if src_plugin.type_name.is_empty() {
+                    existing.disabled = src_plugin.disabled;
+                    if src_plugin.sort_order != 0 {
+                        existing.sort_order = src_plugin.sort_order;
+                    }
+                } else {
+                    let was_disabled = existing.disabled;
+                    *existing = src_plugin;
+                    if was_disabled {
+                        existing.disabled = true;
+                    }
+                }
+            } else if !src_plugin.type_name.is_empty() {
+                dst_plugins.push(src_plugin);
+            }
+        }
+    }
+
+    // TypeConfigs: SHALLOW replacement — module arg replaces primary arg by name.
+    // PHP's array_replace($existing_args, $module_args) replaces the whole value
+    // for matching argument names rather than merging array items recursively.
+    for (type_name, src_tc) in module.type_configs {
+        let dst_tc = primary.type_configs.entry(type_name).or_default();
+        apply_type_config_shallow(dst_tc, src_tc);
+    }
+
+    primary.refresh_lookup_indexes();
+    primary
+}
+
+fn apply_type_config_shallow(dst: &mut TypeConfig, src: TypeConfig) {
+    if src.shared.is_some() {
+        dst.shared = src.shared;
+    }
+    // Replace whole argument value by name (not item-level deep merge)
+    for src_arg in src.arguments {
+        let name = arg_name(&src_arg).to_string();
+        if let Some(pos) = dst.arguments.iter().position(|a| arg_name(a) == name) {
+            dst.arguments[pos] = src_arg; // REPLACE whole value
+        } else {
+            dst.arguments.push(src_arg); // NEW arg: append
+        }
     }
 }
 
@@ -100,7 +199,7 @@ fn arg_name(arg: &Argument) -> &str {
         Argument::String { name, .. } => name,
         Argument::Boolean { name, .. } => name,
         Argument::Number { name, .. } => name,
-        Argument::Null { name } => name,
+        Argument::Null { name, .. } => name,
         Argument::Array { name, .. } => name,
         Argument::Init { name, .. } => name,
         Argument::Const { name, .. } => name,
@@ -194,7 +293,9 @@ mod tests {
                     items: vec![Argument::Array {
                         name: "js".into(),
                         items: vec![],
+                        sort_order: 0,
                     }],
+                    sort_order: 0,
                 }],
             },
         );
@@ -217,7 +318,9 @@ mod tests {
                     items: vec![Argument::Array {
                         name: "json".into(),
                         items: vec![],
+                        sort_order: 0,
                     }],
+                    sort_order: 0,
                 }],
             },
         );

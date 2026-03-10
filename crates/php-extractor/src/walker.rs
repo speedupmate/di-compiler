@@ -128,7 +128,15 @@ fn discover_module_roots_from_registration(package_root: &Path) -> Vec<PathBuf> 
 fn should_skip_scan_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | "node_modules" | "Test" | "Tests" | "test" | "tests" | "dev"
+        ".git"
+            | "node_modules"
+            | "Test"
+            | "Tests"
+            | "test"
+            | "tests"
+            | "dev"
+            | "TestFramework"
+            | "magento2-functional-testing-framework"
     )
 }
 
@@ -143,10 +151,18 @@ pub fn walk_php_files(module_paths: &[PathBuf]) -> Vec<PathBuf> {
 
     let mut builder = WalkBuilder::new("/dev/null"); // dummy; we override below
     builder.types(php_types);
-    // Exclude Test/tests directories
+    // Exclude test directories and test framework packages that PHP's DI compiler also skips.
     builder.filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
-        !(name == "Test" || name == "tests" || name == "Tests" || name == "test")
+        !matches!(
+            name.as_ref(),
+            "Test"
+                | "tests"
+                | "Tests"
+                | "test"
+                | "TestFramework"
+                | "magento2-functional-testing-framework"
+        )
     });
 
     // Build a fresh walker for each module path and collect results
@@ -161,7 +177,15 @@ pub fn walk_php_files(module_paths: &[PathBuf]) -> Vec<PathBuf> {
             b.types(php_types2);
             b.filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                !(name == "Test" || name == "tests" || name == "Tests" || name == "test")
+                !matches!(
+                    name.as_ref(),
+                    "Test"
+                        | "tests"
+                        | "Tests"
+                        | "test"
+                        | "TestFramework"
+                        | "magento2-functional-testing-framework"
+                )
             });
             b.build()
                 .filter_map(|entry| {

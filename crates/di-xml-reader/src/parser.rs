@@ -69,7 +69,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                                     type_name,
                                 },
                             );
-                            config.type_configs.entry(name).or_default();
+                            let entry = config.type_configs.entry(name).or_default();
+                            if let Some(shared_str) = attrs.get("shared") {
+                                entry.shared = Some(shared_str != "false");
+                            }
                         }
                     }
                     "plugin" if !in_arguments => {
@@ -84,7 +87,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                                 .unwrap_or(0);
                             let disabled =
                                 attrs.get("disabled").map(|s| s == "true").unwrap_or(false);
-                            if !name.is_empty() && !plugin_type.is_empty() {
+                            if !name.is_empty() && (!plugin_type.is_empty() || disabled) {
                                 config.plugins.entry(owner).or_default().push(Plugin {
                                     name,
                                     type_name: plugin_type,
@@ -107,6 +110,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                             name: arg_name,
                             xsi_type,
                             shared,
+                            sort_order: 0,
                             text: String::new(),
                             items: Vec::new(),
                         };
@@ -130,16 +134,21 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                             .or_else(|| attrs.get("type"))
                             .cloned()
                             .unwrap_or_default();
+                        let sort_order: i32 = attrs
+                            .get("sortOrder")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
                         let ctx = ArgContext {
                             name: arg_name,
                             xsi_type,
                             shared: None,
+                            sort_order,
                             text: String::new(),
                             items: Vec::new(),
                         };
                         if let Some(child_arg) = ctx_to_argument(ctx) {
                             if let Some(parent) = arg_stack.last_mut() {
-                                parent.items.push(child_arg);
+                                parent.items.push((sort_order, child_arg));
                             }
                         }
                     }
@@ -165,7 +174,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         if !name.is_empty() {
                             current_type = Some(name.clone());
                             current_virtual = None;
-                            config.type_configs.entry(name).or_default();
+                            let entry = config.type_configs.entry(name).or_default();
+                            if let Some(shared_str) = attrs.get("shared") {
+                                entry.shared = Some(shared_str != "false");
+                            }
                         }
                     }
                     "virtualType" => {
@@ -181,7 +193,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                                     type_name,
                                 },
                             );
-                            config.type_configs.entry(name).or_default();
+                            let entry = config.type_configs.entry(name).or_default();
+                            if let Some(shared_str) = attrs.get("shared") {
+                                entry.shared = Some(shared_str != "false");
+                            }
                         }
                     }
                     "plugin" if !in_arguments => {
@@ -196,7 +211,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                                 .unwrap_or(0);
                             let disabled =
                                 attrs.get("disabled").map(|s| s == "true").unwrap_or(false);
-                            if !name.is_empty() && !plugin_type.is_empty() {
+                            if !name.is_empty() && (!plugin_type.is_empty() || disabled) {
                                 config.plugins.entry(owner).or_default().push(Plugin {
                                     name,
                                     type_name: plugin_type,
@@ -221,6 +236,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                             name: arg_name,
                             xsi_type,
                             shared,
+                            sort_order: 0,
                             text: String::new(),
                             items: Vec::new(),
                         });
@@ -232,10 +248,15 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                             .or_else(|| attrs.get("type"))
                             .cloned()
                             .unwrap_or_default();
+                        let sort_order: i32 = attrs
+                            .get("sortOrder")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
                         arg_stack.push(ArgContext {
                             name: arg_name,
                             xsi_type,
                             shared: None,
+                            sort_order,
                             text: String::new(),
                             items: Vec::new(),
                         });
@@ -247,6 +268,15 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
             }
             Ok(Event::Text(ref t)) => {
                 let text = t.unescape().unwrap_or_default().trim().to_string();
+                if !text.is_empty() {
+                    if let Some(ctx) = arg_stack.last_mut() {
+                        ctx.text = text;
+                    }
+                }
+                buf.clear();
+            }
+            Ok(Event::CData(ref t)) => {
+                let text = String::from_utf8_lossy(t.as_ref()).trim().to_string();
                 if !text.is_empty() {
                     if let Some(ctx) = arg_stack.last_mut() {
                         ctx.text = text;
@@ -284,9 +314,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                     }
                     "item" if arg_stack.len() >= 2 => {
                         if let Some(child_ctx) = arg_stack.pop() {
+                            let child_sort_order = child_ctx.sort_order;
                             if let Some(child_arg) = ctx_to_argument(child_ctx) {
                                 if let Some(parent) = arg_stack.last_mut() {
-                                    parent.items.push(child_arg);
+                                    parent.items.push((child_sort_order, child_arg));
                                 }
                             }
                         }
@@ -303,6 +334,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
         }
     }
 
+    config.refresh_lookup_indexes();
     Ok(config)
 }
 
@@ -314,8 +346,11 @@ struct ArgContext {
     name: String,
     xsi_type: String,
     shared: Option<bool>,
+    /// sortOrder attribute on this item element (0 if not specified).
+    sort_order: i32,
     text: String,
-    items: Vec<Argument>,
+    /// (sort_order, Argument) pairs for child items — used to stable-sort by sortOrder.
+    items: Vec<(i32, Argument)>,
 }
 
 fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
@@ -323,19 +358,23 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
     if name.is_empty() {
         return None;
     }
+    let so = ctx.sort_order;
     let arg = match ctx.xsi_type.as_str() {
         "object" => Argument::Object {
             name,
             value: normalize(&ctx.text),
             shared: ctx.shared,
+            sort_order: so,
         },
         "string" => Argument::String {
             name,
             value: ctx.text,
+            sort_order: so,
         },
         "boolean" => Argument::Boolean {
             name,
             value: ctx.text == "true" || ctx.text == "1",
+            sort_order: so,
         },
         // PHP's Number::evaluate() returns the raw XML string (not cast to int/float).
         // var_export() then quotes it as a string in metadata. Use Argument::String so
@@ -343,23 +382,35 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
         "number" => Argument::String {
             name,
             value: ctx.text,
+            sort_order: so,
         },
-        "null" => Argument::Null { name },
-        "array" => Argument::Array {
+        "null" => Argument::Null {
             name,
-            items: ctx.items,
+            sort_order: so,
         },
+        "array" => {
+            // Items carry their individual sort_order on the Argument struct.
+            // Sorting happens at resolution time (after cross-file merge) in arguments.rs.
+            Argument::Array {
+                name,
+                items: ctx.items.into_iter().map(|(_, arg)| arg).collect(),
+                sort_order: so,
+            }
+        }
         "init_parameter" => Argument::Init {
             name,
             value: ctx.text,
+            sort_order: so,
         },
         "const" => Argument::Const {
             name,
             value: ctx.text,
+            sort_order: so,
         },
         _ => Argument::String {
             name,
             value: ctx.text,
+            sort_order: so,
         },
     };
     Some(arg)
@@ -506,6 +557,24 @@ mod tests {
         } else {
             panic!("Expected array argument");
         }
+    }
+
+    #[test]
+    fn test_parse_cdata_string_argument() {
+        let xml = br#"<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <type name="Foo\Bar">
+        <arguments>
+            <argument name="clientIdRegex" xsi:type="string"><![CDATA[/[^a-z_\-0-9]/i]]></argument>
+        </arguments>
+    </type>
+</config>"#;
+        let config = parse_di_xml_bytes(xml).unwrap();
+        let tc = config.type_configs.get("Foo\\Bar").unwrap();
+        assert_eq!(tc.arguments.len(), 1);
+        assert!(
+            matches!(&tc.arguments[0], Argument::String { name, value } if name == "clientIdRegex" && value == "/[^a-z_\\-0-9]/i")
+        );
     }
 
     #[test]

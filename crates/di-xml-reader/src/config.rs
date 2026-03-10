@@ -18,7 +18,7 @@ impl DiConfig {
                 return current;
             }
             visited.insert(current.clone());
-            match self.preferences.get(&current) {
+            match preference_value_case_insensitive(self, &current) {
                 Some(next) => {
                     let next = normalize(next);
                     if next == current {
@@ -60,8 +60,7 @@ impl DiConfig {
     /// Return the configured `<argument>` list for a type.
     pub fn get_arguments(&self, type_name: &str) -> Vec<&Argument> {
         let name = normalize(type_name);
-        self.type_configs
-            .get(&name)
+        type_config_case_insensitive(self, &name)
             .map(|tc| tc.arguments.iter().collect())
             .unwrap_or_default()
     }
@@ -69,8 +68,7 @@ impl DiConfig {
     /// Whether the type is shared (singleton). Defaults to `true`.
     pub fn is_shared(&self, fqcn: &str) -> bool {
         let name = normalize(fqcn);
-        self.type_configs
-            .get(&name)
+        type_config_case_insensitive(self, &name)
             .and_then(|c| c.shared)
             .unwrap_or(true)
     }
@@ -95,14 +93,14 @@ impl DiConfig {
 
     /// Walk all di.xml files for a Magento install in correct merge order.
     ///
-    /// Order: vendor/magento → vendor/* (non-magento) → app/etc → app/code
+    /// Order: app/etc (primary) → vendor/magento → vendor/* (non-magento) → app/code
     pub fn load_from_magento_root(
         magento_root: &std::path::Path,
     ) -> Result<DiConfig, crate::Error> {
         use crate::parser::parse_di_xml_impl;
 
         let mut configs = Vec::new();
-        let di_xml_paths = find_di_xml_files(magento_root);
+        let di_xml_paths = find_di_xml_files(magento_root, &std::collections::HashMap::new());
         for path in di_xml_paths {
             match parse_di_xml_impl(&path) {
                 Ok(c) => configs.push(c),
@@ -115,12 +113,40 @@ impl DiConfig {
     }
 }
 
+fn preference_value_case_insensitive<'a>(config: &'a DiConfig, key: &str) -> Option<&'a String> {
+    config.preferences.get(key).or_else(|| {
+        let key_lower = key.to_ascii_lowercase();
+        config
+            .preference_keys_lc
+            .get(&key_lower)
+            .and_then(|canonical| config.preferences.get(canonical))
+    })
+}
+
+fn type_config_case_insensitive<'a>(
+    config: &'a DiConfig,
+    key: &str,
+) -> Option<&'a crate::model::TypeConfig> {
+    config.type_configs.get(key).or_else(|| {
+        let key_lower = key.to_ascii_lowercase();
+        config
+            .type_config_keys_lc
+            .get(&key_lower)
+            .and_then(|canonical| config.type_configs.get(canonical))
+    })
+}
+
 /// Collect **global-only** di.xml files in Magento merge order.
 ///
 /// Only includes `etc/di.xml` files (not area-specific `etc/{area}/di.xml`).
-/// Merge order: vendor/magento/* → vendor/*/* → app/etc → app/code/*/*
-pub fn find_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    collect_di_xml_files(magento_root, None)
+/// Merge order: app/etc (primary) → vendor/magento/* → vendor/*/* → app/code/*/*
+/// Within each priority tier, files are ordered by Magento module load order
+/// from `app/etc/config.php` (the `module_order` map), then by path.
+pub fn find_di_xml_files(
+    magento_root: &std::path::Path,
+    module_order: &std::collections::HashMap<String, usize>,
+) -> Vec<std::path::PathBuf> {
+    collect_di_xml_files(magento_root, None, module_order)
 }
 
 /// Collect di.xml files for a specific area in Magento merge order.
@@ -131,8 +157,9 @@ pub fn find_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathB
 pub fn find_di_xml_files_for_area(
     magento_root: &std::path::Path,
     area: &str,
+    module_order: &std::collections::HashMap<String, usize>,
 ) -> Vec<std::path::PathBuf> {
-    collect_di_xml_files(magento_root, Some(area))
+    collect_di_xml_files(magento_root, Some(area), module_order)
 }
 
 /// Collect ALL di.xml files from all areas (global + every area).
@@ -140,7 +167,10 @@ pub fn find_di_xml_files_for_area(
 /// Used when detecting which classes need interceptors/factories/proxies.
 /// Magento determines interception requirements by considering plugin
 /// registrations across ALL areas, not just the global scope.
-pub fn find_all_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub fn find_all_di_xml_files(
+    magento_root: &std::path::Path,
+    module_order: &std::collections::HashMap<String, usize>,
+) -> Vec<std::path::PathBuf> {
     const AREAS: &[&str] = &[
         "global",
         "frontend",
@@ -153,14 +183,14 @@ pub fn find_all_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::P
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     // Global first
-    for p in collect_di_xml_files(magento_root, None) {
+    for p in collect_di_xml_files(magento_root, None, module_order) {
         if seen.insert(p.clone()) {
             result.push(p);
         }
     }
     // Then each area overlay
     for area in AREAS {
-        for p in collect_di_xml_files(magento_root, Some(area)) {
+        for p in collect_di_xml_files(magento_root, Some(area), module_order) {
             if seen.insert(p.clone()) {
                 result.push(p);
             }
@@ -171,27 +201,31 @@ pub fn find_all_di_xml_files(magento_root: &std::path::Path) -> Vec<std::path::P
 
 /// Internal: collect di.xml files with optional area overlay.
 ///
-/// Each entry is `(priority, path)` where priority controls merge order.
+/// Each entry is `(priority, module_idx, path)` where priority controls the
+/// broad merge tier and module_idx is the Magento module load order index from
+/// `app/etc/config.php`, providing deterministic tie-breaking within each tier.
 fn collect_di_xml_files(
     magento_root: &std::path::Path,
     area: Option<&str>,
+    module_order: &std::collections::HashMap<String, usize>,
 ) -> Vec<std::path::PathBuf> {
-    let mut paths: Vec<(u8, std::path::PathBuf)> = Vec::new();
+    let mut paths: Vec<(u8, usize, std::path::PathBuf)> = Vec::new();
 
     fn push_module_di_paths(
         module_root: &std::path::Path,
         priority: u8,
+        module_idx: usize,
         area: Option<&str>,
-        out: &mut Vec<(u8, std::path::PathBuf)>,
+        out: &mut Vec<(u8, usize, std::path::PathBuf)>,
     ) {
         let global = module_root.join("etc/di.xml");
         if global.exists() {
-            out.push((priority, global));
+            out.push((priority, module_idx, global));
         }
         if let Some(a) = area {
             let area_di = module_root.join(format!("etc/{}/di.xml", a));
             if area_di.exists() {
-                out.push((priority, area_di));
+                out.push((priority, module_idx, area_di));
             }
         }
     }
@@ -251,7 +285,8 @@ fn collect_di_xml_files(
         base: &std::path::Path,
         priority: u8,
         area: Option<&str>,
-        out: &mut Vec<(u8, std::path::PathBuf)>,
+        module_order: &std::collections::HashMap<String, usize>,
+        out: &mut Vec<(u8, usize, std::path::PathBuf)>,
         discover_nested_modules: bool,
     ) {
         if !base.is_dir() {
@@ -262,12 +297,18 @@ fn collect_di_xml_files(
                 let p = entry.path();
                 if p.is_dir() {
                     // Direct module root (classic vendor/{vendor}/{module} layout)
-                    push_module_di_paths(&p, priority, area, out);
+                    let module_idx = cached_module_name(&p)
+                        .and_then(|n| module_order.get(&n).copied())
+                        .unwrap_or(usize::MAX);
+                    push_module_di_paths(&p, priority, module_idx, area, out);
 
                     // Nested module roots, e.g. package/src/<module>/registration.php
                     if discover_nested_modules {
                         for module_root in cached_discover_module_roots(&p) {
-                            push_module_di_paths(&module_root, priority, area, out);
+                            let nested_idx = cached_module_name(&module_root)
+                                .and_then(|n| module_order.get(&n).copied())
+                                .unwrap_or(usize::MAX);
+                            push_module_di_paths(&module_root, priority, nested_idx, area, out);
                         }
                     }
                 }
@@ -301,11 +342,18 @@ fn collect_di_xml_files(
         roots
     }
 
+    // Priority 0: app/etc/di.xml (primary scope)
+    let app_etc_di = magento_root.join("app/etc/di.xml");
+    if app_etc_di.exists() {
+        paths.push((0, 0, app_etc_di));
+    }
+
     // Priority 1: vendor/magento/*
     collect_vendor(
         &magento_root.join("vendor/magento"),
         1,
         area,
+        module_order,
         &mut paths,
         false,
     );
@@ -321,29 +369,26 @@ fn collect_di_xml_files(
             {
                 continue;
             }
-            collect_vendor(&vendor.path(), 2, area, &mut paths, true);
+            collect_vendor(&vendor.path(), 2, area, module_order, &mut paths, true);
         }
     }
 
-    // Priority 3: app/etc/di.xml (global only; no area override here)
-    let app_etc_di = magento_root.join("app/etc/di.xml");
-    if app_etc_di.exists() {
-        paths.push((3, app_etc_di));
-    }
-
-    // Priority 4: app/code/*/*/etc/di.xml
+    // Priority 3: app/code/*/*/etc/di.xml
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("app/code")) {
         for vendor in vendors.flatten() {
             if let Ok(modules) = std::fs::read_dir(vendor.path()) {
                 for module in modules.flatten() {
+                    let module_idx = cached_module_name(&module.path())
+                        .and_then(|n| module_order.get(&n).copied())
+                        .unwrap_or(usize::MAX);
                     let global = module.path().join("etc/di.xml");
                     if global.exists() {
-                        paths.push((4, global));
+                        paths.push((3, module_idx, global));
                     }
                     if let Some(a) = area {
                         let area_di = module.path().join(format!("etc/{}/di.xml", a));
                         if area_di.exists() {
-                            paths.push((4, area_di));
+                            paths.push((3, module_idx, area_di));
                         }
                     }
                 }
@@ -351,13 +396,52 @@ fn collect_di_xml_files(
         }
     }
 
-    // Sort by priority then path for deterministic ordering
-    paths.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    paths.into_iter().map(|(_, p)| p).collect()
+    // Sort by (priority, module_idx, path) for deterministic Magento-order merging
+    paths.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    paths.into_iter().map(|(_, _, p)| p).collect()
 }
 
 fn normalize(s: &str) -> String {
     s.trim().trim_start_matches('\\').to_string()
+}
+
+/// Read the module name from `etc/module.xml` using a simple string search.
+///
+/// Returns `None` if the file doesn't exist or has no `name="..."` attribute.
+fn module_name_from_module_xml(module_root: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(module_root.join("etc/module.xml")).ok()?;
+    let name_pos = content.find("name=\"")?;
+    let rest = &content[name_pos + 6..];
+    let end_pos = rest.find('"')?;
+    let name = &rest[..end_pos];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Cached wrapper around `module_name_from_module_xml`.
+///
+/// Called for every module root during DI collection — caching avoids
+/// re-reading the same module.xml files on repeated `collect_di_xml_files` calls.
+fn cached_module_name(module_root: &std::path::Path) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, Option<String>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    {
+        let map = cache.lock().unwrap();
+        if let Some(cached) = map.get(module_root) {
+            return cached.clone();
+        }
+    }
+    let name = module_name_from_module_xml(module_root);
+    cache
+        .lock()
+        .unwrap()
+        .insert(module_root.to_path_buf(), name.clone());
+    name
 }
 
 #[cfg(test)]
@@ -466,10 +550,11 @@ mod tests {
         )
         .unwrap();
 
-        let global = super::find_di_xml_files(root);
+        let empty_order = std::collections::HashMap::new();
+        let global = super::find_di_xml_files(root, &empty_order);
         assert!(global.contains(&module_root.join("etc/di.xml")));
 
-        let frontend = super::find_di_xml_files_for_area(root, "frontend");
+        let frontend = super::find_di_xml_files_for_area(root, "frontend", &empty_order);
         assert!(frontend.contains(&module_root.join("etc/frontend/di.xml")));
     }
 }

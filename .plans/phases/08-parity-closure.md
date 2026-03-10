@@ -33,10 +33,11 @@ This phase is correctness-only. No performance-only changes are accepted unless 
 | [30-plugin-list-metadata-generation](../.features/30-plugin-list-metadata-generation.md) | 18, 19 |
 | [31-app-action-list-and-output-layout](../.features/31-app-action-list-and-output-layout.md) | 18, 21 |
 | [32-runtime-map-generator-coverage](../.features/32-runtime-map-generator-coverage.md) | 28, 29 |
+| [36-di-merge-order-and-null-surface](../.features/36-di-merge-order-and-null-surface.md) | 13, 09, 35 |
 
 ## Ticket Pack
 
-TKT-027 through TKT-041, TKT-043 through TKT-046
+TKT-027 through TKT-041, TKT-043 through TKT-054
 
 ## Recommended External Tracker Shape
 

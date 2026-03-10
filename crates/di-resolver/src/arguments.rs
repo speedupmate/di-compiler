@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use php_extractor::ClassInfo;
+use php_extractor::{types::ClassKind, ClassInfo};
 
 use crate::graph::{
     ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
@@ -46,18 +46,55 @@ pub fn resolve_all_arguments(
 /// Unlike `resolve_all_arguments`, this supports names that are not present in
 /// `class_map` (for example virtual types and generated artifacts) by falling
 /// back to their resolved instance type when possible.
+/// `base_class_fqcns` is the set of FQCNs from the source PHP scan (not generated artifacts).
+/// PHP emits NULL only for source concrete classes with empty resolved args, not for
+/// generated classes (interceptors, factories, proxies) or types missing from the scan.
 pub fn resolve_all_arguments_for_named_types(
     type_names: &[String],
     class_map: &HashMap<String, ClassInfo>,
+    base_class_fqcns: &HashSet<String>,
     di_config: &DiConfig,
     const_map: &HashMap<String, String>,
 ) -> HashMap<String, Vec<ResolvedArg>> {
     let mut result = HashMap::new();
     for type_name in type_names {
-        let resolved = resolve_for_type_name(type_name, class_map, di_config, const_map);
-        if !resolved.is_empty() {
-            result.insert(type_name.clone(), resolved);
+        let name = type_name.trim_start_matches('\\');
+        let kind = class_map.get(name).map(|c| c.kind.clone());
+        // PHP never emits argument entries for pure interfaces or abstract classes.
+        if matches!(
+            kind,
+            Some(ClassKind::Interface) | Some(ClassKind::AbstractClass)
+        ) {
+            continue;
         }
+
+        // TKT-052: For types not found by the PHP scanner but present in di.xml <type>
+        // entries, PHP still emits NULL (empty args). Replicate that behaviour here.
+        // Virtual types are not in class_map but have their own resolution path below.
+        if !class_map.contains_key(name) && !di_config.virtual_types.contains_key(name) {
+            let looks_like_interface = name.ends_with("Interface");
+            let is_generated = name.ends_with("Interceptor")
+                || name.ends_with("Factory")
+                || name.ends_with("Proxy");
+            if !looks_like_interface && !is_generated && di_config.type_configs.contains_key(name) {
+                result.insert(type_name.clone(), vec![]);
+            }
+            continue;
+        }
+
+        let resolved = resolve_for_type_name(type_name, class_map, di_config, const_map);
+        if resolved.is_empty() {
+            // PHP emits NULL for source concrete classes, traits, AND virtual types with
+            // no resolved constructor args. It does NOT emit NULL for generated artifacts
+            // (interceptors, factories, proxies) or unknown non-VT types.
+            let is_virtual = di_config.virtual_types.contains_key(name);
+            let is_source_classlike = matches!(kind, Some(ClassKind::Class | ClassKind::Trait))
+                && base_class_fqcns.contains(name);
+            if !is_source_classlike && !is_virtual {
+                continue;
+            }
+        }
+        result.insert(type_name.clone(), resolved);
     }
     result
 }
@@ -109,14 +146,19 @@ pub fn resolve_for_class(
         let value = if param.is_variadic {
             ResolvedArgValue::Null
         } else if param.is_optional {
-            resolve_non_object_default(param.default_value.as_deref())
+            resolve_non_object_default(param.default_value.as_deref(), const_map)
         } else if let Some(type_hint) = param
             .type_hint
             .as_deref()
             .and_then(first_non_null_class_type_hint_arm)
         {
             let concrete = di_config.get_preference(&type_hint);
-            if di_config.is_shared(&concrete) {
+            // PHP's ArgumentsResolver.getInstanceArgument() calls isShared() on the
+            // TYPE HINT as-is (not the resolved concrete). So TransactionManagerInterface
+            // with no shared=false entry → _i_, even if the concrete TransactionManager
+            // has shared=false. Only the hint's own shared config matters on this path.
+            let shared = di_config.is_shared(&type_hint);
+            if shared {
                 ResolvedArgValue::SharedInstance(concrete)
             } else {
                 ResolvedArgValue::NonSharedInstance(concrete)
@@ -142,6 +184,24 @@ fn resolve_for_type_name(
 ) -> Vec<ResolvedArg> {
     let normalized = normalize(type_name);
     let is_virtual = di_config.virtual_types.contains_key(&normalized);
+
+    // Interceptor alias collision handling:
+    // When `Foo\Bar\Interceptor` is the interception alias for `Foo\Bar`,
+    // resolve constructor shape from `Foo\Bar` rather than from any real class
+    // named `Foo\Bar\Interceptor` (for example setup code generator classes).
+    if let Some(base_type) = normalized.strip_suffix("\\Interceptor") {
+        let is_interception_alias = di_config
+            .preferences
+            .get(base_type)
+            .map(|to| normalize(to) == normalized)
+            .unwrap_or(false);
+        if is_interception_alias {
+            if let Some(info) = class_info_with_inherited_constructor(base_type, class_map) {
+                return resolve_for_class(base_type, &info, class_map, di_config, const_map);
+            }
+        }
+    }
+
     if let Some(info) = class_info_with_inherited_constructor(&normalized, class_map) {
         if info.constructor.is_none() && is_virtual {
             let di_args = merged_di_arguments_for_type_name(&normalized, class_map, di_config);
@@ -392,7 +452,21 @@ fn resolve_di_argument(
 ) -> ResolvedArgValue {
     match arg {
         Argument::Object { value, shared, .. } => {
-            let concrete = di_config.get_preference(value);
+            let name = normalize(value);
+            // Virtual types are usually kept as their VT alias in arguments.
+            // However, if DI config declares an explicit preference for that alias
+            // (e.g. adminhtml CsrfRequestValidator -> BackendValidator), PHP resolves
+            // to the preferred concrete type.
+            let is_virtual_type = di_config.virtual_types.contains_key(&name);
+            let has_explicit_preference = di_config.preferences.contains_key(&name)
+                || di_config.preference_keys_lc.contains_key(&name.to_ascii_lowercase());
+            // For real class / interface references, apply the full preference chain
+            // (including interception preferences so intercepted concretes become \Interceptor).
+            let concrete = if is_virtual_type && !has_explicit_preference {
+                name
+            } else {
+                di_config.get_preference(value)
+            };
             let is_shared = shared.unwrap_or_else(|| di_config.is_shared(&concrete));
             if is_shared {
                 ResolvedArgValue::SharedInstance(concrete)
@@ -409,8 +483,23 @@ fn resolve_di_argument(
         }
         Argument::Null { .. } => ResolvedArgValue::Null,
         Argument::Array { items, .. } => {
+            // Sort items by sortOrder (stable: items with equal sortOrder keep their
+            // di.xml merge order). This mirrors PHP's SortItems::sortItems() which is
+            // called after each _collectConfiguration merge step.
+            let has_any_sort_order = items.iter().any(|i| argument_sort_order(i) != 0);
+            let sorted_items: Vec<&Argument> = if has_any_sort_order {
+                let mut indexed: Vec<(usize, &Argument)> = items.iter().enumerate().collect();
+                indexed.sort_by(|(ai, a), (bi, b)| {
+                    argument_sort_order(a)
+                        .cmp(&argument_sort_order(b))
+                        .then(ai.cmp(bi))
+                });
+                indexed.into_iter().map(|(_, a)| a).collect()
+            } else {
+                items.iter().collect()
+            };
             if is_configured_argument_array(items) {
-                let resolved_items: Vec<ResolvedArg> = items
+                let resolved_items: Vec<ResolvedArg> = sorted_items
                     .iter()
                     .map(|item| ResolvedArg {
                         name: argument_name(item).to_string(),
@@ -419,7 +508,7 @@ fn resolve_di_argument(
                     .collect();
                 ResolvedArgValue::Array(resolved_items)
             } else {
-                let values: Vec<ResolvedArrayItem> = items
+                let values: Vec<ResolvedArrayItem> = sorted_items
                     .iter()
                     .map(|item| ResolvedArrayItem {
                         name: argument_name(item).to_string(),
@@ -444,18 +533,7 @@ fn resolve_configured_instance_argument(
     di_config: &DiConfig,
     const_map: &HashMap<String, String>,
 ) -> ResolvedArgValue {
-    match arg {
-        Argument::Object { value, shared, .. } => {
-            let concrete = di_config.get_preference(value);
-            let is_shared = shared.unwrap_or_else(|| di_config.is_shared(&concrete));
-            if is_shared {
-                ResolvedArgValue::SharedInstance(concrete)
-            } else {
-                ResolvedArgValue::NonSharedInstance(concrete)
-            }
-        }
-        _ => resolve_di_argument(arg, di_config, const_map),
-    }
+    resolve_di_argument(arg, di_config, const_map)
 }
 
 fn resolve_configured_non_object_argument(
@@ -465,6 +543,12 @@ fn resolve_configured_non_object_argument(
     const_map: &HashMap<String, String>,
 ) -> ResolvedArgValue {
     match arg {
+        // When constructor param is non-object but di.xml provides xsi:type="object",
+        // PHP serializes it as scalar payload: ['_v_' => ['instance' => 'FQCN']].
+        Argument::Object { value, .. } => ResolvedArgValue::PlainArray(vec![ResolvedArrayItem {
+            name: "instance".to_string(),
+            value: ResolvedArrayValue::Scalar(ResolvedScalar::String(normalize(value))),
+        }]),
         Argument::Init { value, .. } => ResolvedArgValue::GlobalArgRef {
             // _a_: resolve PHP class constant expressions (e.g. ClassName::CONST_NAME → "MAGE_MODE")
             arg_name: resolve_php_constant_expr(value, const_map),
@@ -495,7 +579,10 @@ fn resolve_php_constant_expr(expr: &str, const_map: &HashMap<String, String>) ->
     normalized.to_string()
 }
 
-fn resolve_non_object_default(default_value: Option<&str>) -> ResolvedArgValue {
+fn resolve_non_object_default(
+    default_value: Option<&str>,
+    const_map: &HashMap<String, String>,
+) -> ResolvedArgValue {
     let Some(raw) = default_value else {
         return ResolvedArgValue::Null;
     };
@@ -527,6 +614,12 @@ fn resolve_non_object_default(default_value: Option<&str>) -> ResolvedArgValue {
     }
     if is_numeric_literal(trimmed) {
         return ResolvedArgValue::Scalar(ResolvedScalar::Number(trimmed.to_string()));
+    }
+    // Bare PHP constant (e.g. MCRYPT_BLOWFISH, SORT_REGULAR) — look up in const_map,
+    // which is pre-seeded from PHP's get_defined_constants() at startup.
+    let normalized = trimmed.trim_start_matches('\\');
+    if let Some(resolved) = const_map.get(normalized) {
+        return ResolvedArgValue::Scalar(ResolvedScalar::String(resolved.clone()));
     }
     ResolvedArgValue::Scalar(ResolvedScalar::String(trimmed.to_string()))
 }
@@ -924,10 +1017,23 @@ fn argument_name(arg: &Argument) -> &str {
         | Argument::String { name, .. }
         | Argument::Boolean { name, .. }
         | Argument::Number { name, .. }
-        | Argument::Null { name }
+        | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
         | Argument::Const { name, .. } => name.as_str(),
+    }
+}
+
+fn argument_sort_order(arg: &Argument) -> i32 {
+    match arg {
+        Argument::Object { sort_order, .. }
+        | Argument::String { sort_order, .. }
+        | Argument::Boolean { sort_order, .. }
+        | Argument::Number { sort_order, .. }
+        | Argument::Null { sort_order, .. }
+        | Argument::Array { sort_order, .. }
+        | Argument::Init { sort_order, .. }
+        | Argument::Const { sort_order, .. } => *sort_order,
     }
 }
 
@@ -1186,11 +1292,153 @@ mod tests {
     }
 
     #[test]
+    fn test_non_object_param_with_object_di_value_serializes_as_v_instance_shape() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\Method".to_string(),
+            make_class("App\\Method", vec![("formBlockType", None)]),
+        );
+
+        let mut di_config = DiConfig::default();
+        di_config.type_configs.insert(
+            "App\\Method".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Object {
+                    name: "formBlockType".to_string(),
+                    value: "Magento\\Payment\\Block\\Form".to_string(),
+                    shared: None,
+                }],
+            },
+        );
+
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let args = &map["App\\Method"];
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::PlainArray(items)
+            if items.len() == 1
+                && items[0].name == "instance"
+                && matches!(
+                    &items[0].value,
+                    ResolvedArrayValue::Scalar(ResolvedScalar::String(v))
+                    if v == "Magento\\Payment\\Block\\Form"
+                )
+        ));
+    }
+
+    #[test]
+    fn test_virtual_type_object_item_honors_explicit_preference() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\RequestValidator".to_string(),
+            make_class("App\\RequestValidator", vec![("validators", Some("array"))]),
+        );
+
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "CsrfRequestValidator".to_string(),
+            di_xml_reader::VirtualType {
+                name: "CsrfRequestValidator".to_string(),
+                type_name: "Magento\\Framework\\App\\Request\\CsrfValidator".to_string(),
+            },
+        );
+        di_config.preferences.insert(
+            "CsrfRequestValidator".to_string(),
+            "Magento\\Backend\\App\\Request\\BackendValidator".to_string(),
+        );
+        di_config.type_configs.insert(
+            "App\\RequestValidator".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "validators".to_string(),
+                    items: vec![Argument::Object {
+                        name: "csrf_validator".to_string(),
+                        value: "CsrfRequestValidator".to_string(),
+                        shared: None,
+                    }],
+                }],
+            },
+        );
+        di_config.refresh_lookup_indexes();
+
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let args = &map["App\\RequestValidator"];
+        let validators = args
+            .iter()
+            .find(|a| a.name == "validators")
+            .expect("validators arg");
+        let by_name: HashMap<_, _> = match &validators.resolved {
+            ResolvedArgValue::Array(items) => {
+                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
+            }
+            other => panic!("expected configured array, got {other:?}"),
+        };
+        assert!(matches!(
+            by_name.get("csrf_validator").copied(),
+            Some(ResolvedArgValue::SharedInstance(v))
+            if v == "Magento\\Backend\\App\\Request\\BackendValidator"
+        ));
+    }
+
+    #[test]
+    fn test_virtual_type_object_item_without_explicit_preference_keeps_alias() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "App\\RequestValidator".to_string(),
+            make_class("App\\RequestValidator", vec![("validators", Some("array"))]),
+        );
+
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "CsrfRequestValidator".to_string(),
+            di_xml_reader::VirtualType {
+                name: "CsrfRequestValidator".to_string(),
+                type_name: "Magento\\Framework\\App\\Request\\CsrfValidator".to_string(),
+            },
+        );
+        di_config.type_configs.insert(
+            "App\\RequestValidator".to_string(),
+            TypeConfig {
+                shared: None,
+                arguments: vec![Argument::Array {
+                    name: "validators".to_string(),
+                    items: vec![Argument::Object {
+                        name: "csrf_validator".to_string(),
+                        value: "CsrfRequestValidator".to_string(),
+                        shared: None,
+                    }],
+                }],
+            },
+        );
+
+        let map = resolve_all_arguments(&class_map, &di_config, &HashMap::new());
+        let args = &map["App\\RequestValidator"];
+        let validators = args
+            .iter()
+            .find(|a| a.name == "validators")
+            .expect("validators arg");
+        let by_name: HashMap<_, _> = match &validators.resolved {
+            ResolvedArgValue::Array(items) => {
+                items.iter().map(|i| (i.name.as_str(), &i.resolved)).collect()
+            }
+            other => panic!("expected configured array, got {other:?}"),
+        };
+        assert!(matches!(
+            by_name.get("csrf_validator").copied(),
+            Some(ResolvedArgValue::SharedInstance(v))
+            if v == "CsrfRequestValidator"
+        ));
+    }
+
+    #[test]
     fn test_named_virtual_type_inherits_base_constructor_and_virtual_overrides() {
         let (class_map, di_config) = preprocessor_pool_fixture();
         let map = resolve_all_arguments_for_named_types(
             &["AssetPreProcessorPool".to_string()],
             &class_map,
+            &HashSet::new(),
             &di_config,
             &HashMap::new(),
         );
@@ -1231,6 +1479,7 @@ mod tests {
         let map = resolve_all_arguments_for_named_types(
             &["\\AssetPreProcessorPool".to_string()],
             &class_map,
+            &HashSet::new(),
             &di_config,
             &HashMap::new(),
         );
@@ -1447,6 +1696,7 @@ mod tests {
         let resolved = resolve_all_arguments_for_named_types(
             &["systemConfigSnapshotSourceAggregated".to_string()],
             &class_map,
+            &HashSet::new(),
             &di_config,
             &HashMap::new(),
         );

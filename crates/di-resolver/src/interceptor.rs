@@ -54,20 +54,45 @@ pub fn detect_interceptors(
 
         // Skip non-concrete: abstract classes, interfaces, traits don't get spec files.
         // Also skip classes that don't exist in class_map (not in scanned PHP files).
-        // Also skip NoninterceptableInterface implementors (e.g. generated Proxy classes).
+        // Skip Proxy-suffix NoninterceptableInterface implementors (generated proxy wrappers);
+        // other source classes that implement NoninterceptableInterface (e.g. StructureLazy)
+        // still get interceptors per PHP truth.
         let is_concrete = match info {
             None => false, // class not found on disk → skip
             Some(info) => {
                 use php_extractor::types::ClassKind;
-                !info.is_abstract
-                    && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
-                    && !info.implements.iter().any(|iface| {
+                let short = owner_name
+                    .split('\\')
+                    .next_back()
+                    .unwrap_or(owner_name.as_str());
+                let is_proxy_noninterceptable = short.ends_with("Proxy")
+                    && info.implements.iter().any(|iface| {
                         iface.trim_start_matches('\\')
                             == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
-                    })
+                    });
+                !info.is_abstract
+                    && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
+                    && !is_proxy_noninterceptable
             }
         };
         if !is_concrete {
+            continue;
+        }
+
+        // When the plugin owner is a virtual type, PHP generates the interceptor for
+        // the resolved concrete class, not for the VT name. The VT → Interceptor mapping
+        // is handled via instanceTypes, not via area preferences. Using the concrete
+        // class fqcn ensures we don't emit spurious VtName → VtName\Interceptor entries
+        // in the area config preferences section.
+        let spec_fqcn = if di_config.virtual_types.contains_key(owner_name.as_str()) {
+            concrete.clone()
+        } else {
+            owner_name.clone()
+        };
+
+        // If the concrete fqcn is already directly intercepted (perhaps it has its own
+        // plugins registered separately), skip to avoid duplicate specs.
+        if spec_fqcn != *owner_name && directly_intercepted.contains(spec_fqcn.as_str()) {
             continue;
         }
 
@@ -89,13 +114,13 @@ pub fn detect_interceptors(
         let public_methods = if intercepted_method_names.is_empty() {
             // When plugin class methods cannot be resolved, avoid emitting the full
             // inherited method surface. Fall back to target-declared methods only.
-            select_interceptor_methods(owner_name, class_map, None, false)
+            select_interceptor_methods(&spec_fqcn, class_map, None, false)
         } else {
-            select_interceptor_methods(owner_name, class_map, Some(&intercepted_method_names), true)
+            select_interceptor_methods(&spec_fqcn, class_map, Some(&intercepted_method_names), true)
         };
 
         specs.push(InterceptorSpec {
-            fqcn: owner_name.clone(),
+            fqcn: spec_fqcn,
             plugins: plugin_refs,
             public_methods,
         });
@@ -133,12 +158,17 @@ pub fn detect_interceptors(
                 continue;
             }
         }
-        // Skip classes that implement NoninterceptableInterface — Magento's Proxy
-        // classes and other non-interceptable objects use this marker to opt out.
-        if info.implements.iter().any(|iface| {
-            iface.trim_start_matches('\\')
-                == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
-        }) {
+        // Skip Proxy-suffix classes that implement NoninterceptableInterface — these
+        // are generated Proxy wrappers (Layout\Proxy, Cache\Proxy, LoggerProxy, etc.).
+        // Source classes like StructureLazy that happen to implement NoninterceptableInterface
+        // are NOT skipped; PHP still generates their Interceptor and metadata args.
+        let short_name = fqcn.split('\\').next_back().unwrap_or(fqcn.as_str());
+        if short_name.ends_with("Proxy")
+            && info.implements.iter().any(|iface| {
+                iface.trim_start_matches('\\')
+                    == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
+            })
+        {
             continue;
         }
         // Check inheritance chain.

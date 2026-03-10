@@ -20,7 +20,7 @@ pub fn generate_area_config(
     args_map: &HashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
 ) -> String {
-    generate_area_config_with_extra_preferences(args_map, di_config, &HashMap::new())
+    generate_area_config_with_overrides(args_map, di_config, &HashMap::new(), &HashMap::new())
 }
 
 /// Generate area config while injecting additional preferences that should
@@ -29,6 +29,18 @@ pub fn generate_area_config_with_extra_preferences(
     args_map: &HashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
     extra_preferences: &HashMap<String, String>,
+) -> String {
+    generate_area_config_with_overrides(args_map, di_config, extra_preferences, extra_preferences)
+}
+
+/// Generate area config while injecting separate override maps:
+/// - `preference_overrides` are applied to the preferences section.
+/// - `instance_type_overrides` are applied only to resolved instanceTypes targets.
+pub fn generate_area_config_with_overrides(
+    args_map: &HashMap<String, Vec<ResolvedArg>>,
+    di_config: &DiConfig,
+    preference_overrides: &HashMap<String, String>,
+    instance_type_overrides: &HashMap<String, String>,
 ) -> String {
     let mut out = String::from("<?php return array (\n");
 
@@ -39,6 +51,9 @@ pub fn generate_area_config_with_extra_preferences(
     for fqcn in sorted_fqcns {
         let args = &args_map[fqcn];
         if args.is_empty() {
+            // PHP emits NULL for types in the universe whose constructor args resolve to nothing
+            // (class doesn't exist on disk, has no constructor, or all args are defaults).
+            out.push_str(&format!("    '{}' => NULL,\n", escape_php(fqcn)));
             continue;
         }
         out.push_str(&format!("    '{}' => \n    array (\n", escape_php(fqcn)));
@@ -55,18 +70,12 @@ pub fn generate_area_config_with_extra_preferences(
     // concrete — they get a preference entry pointing to the Interceptor.
     out.push_str("  'preferences' => \n  array (\n");
     let mut merged_preferences = di_config.preferences.clone();
-    for (from, to) in extra_preferences {
+    for (from, to) in preference_overrides {
         merged_preferences.insert(from.clone(), to.clone());
     }
-    // VTs whose direct type_name is an intercepted concrete get a preference entry.
-    for (vt_name, vt) in &di_config.virtual_types {
-        let direct = vt.type_name.trim_start_matches('\\');
-        if let Some(interceptor) = extra_preferences.get(direct) {
-            merged_preferences
-                .entry(vt_name.clone())
-                .or_insert_with(|| interceptor.clone());
-        }
-    }
+    // NOTE: Virtual type names must NOT appear in the preferences section.
+    // PHP only maps concrete class → ClassName\Interceptor in preferences.
+    // VTs are resolved via instanceTypes, not preferences.
     let mut sorted_prefs: Vec<(&String, &String)> = merged_preferences.iter().collect();
     sorted_prefs.sort_by_key(|(k, _)| k.as_str());
     for (from, to) in sorted_prefs {
@@ -95,10 +104,15 @@ pub fn generate_area_config_with_extra_preferences(
                 break;
             } // guard against cycles
         }
+        // If the resolved concrete is intercepted, point to its Interceptor.
+        let resolved = instance_type_overrides
+            .get(concrete.trim_start_matches('\\'))
+            .map(|s| s.as_str())
+            .unwrap_or(concrete);
         out.push_str(&format!(
             "    '{}' => '{}',\n",
             escape_php(name),
-            escape_php(concrete)
+            escape_php(resolved)
         ));
     }
     out.push_str("  ),\n");

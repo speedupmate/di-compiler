@@ -36,8 +36,9 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
     let root = tree.root_node();
     let src = source;
 
-    // Find namespace
+    // Find namespace and collect use-import map for type resolution
     let namespace = find_namespace(&root, src);
+    let use_map = collect_use_map(&root, src);
 
     // Find class/interface/trait/enum declaration
     let class_node = find_class_node(&root);
@@ -134,7 +135,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
                     .unwrap_or_default();
 
                 if method_name == "__construct" {
-                    constructor = Some(parse_constructor(member, src));
+                    constructor = Some(parse_constructor(member, src, &namespace, &use_map));
                 } else {
                     // Check visibility
                     let vis = get_visibility(member, src);
@@ -142,7 +143,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
                     if vis == "public" && !is_final_method {
                         let is_static = has_modifier(member, src, "static");
                         let returns_reference = node_text(member, src).contains("function &");
-                        let params = parse_method_params_ts(member, src);
+                        let params = parse_method_params_ts(member, src, &namespace, &use_map);
                         let return_type = member
                             .child_by_field_name("return_type")
                             .map(|n| node_text(n, src).trim_start_matches(':').trim().to_string());
@@ -186,6 +187,162 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
 
 fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
+}
+
+/// Collect file-level `use` declarations into a lowercase-alias → FQCN map.
+///
+/// Uses text-based parsing on the raw source so that tree-sitter node-name
+/// differences across versions do not affect correctness.
+fn collect_use_map(_root: &Node, src: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let text = match std::str::from_utf8(src) {
+        Ok(s) => s,
+        Err(_) => return map,
+    };
+
+    // Find the class body start to avoid processing trait `use` inside the class.
+    let class_brace = find_class_body_brace_offset(text);
+
+    // Scan for all `use ` occurrences before the class body.
+    let search_region = &text[..class_brace.unwrap_or(text.len())];
+    let mut pos = 0;
+    while pos < search_region.len() {
+        let Some(use_pos) = search_region[pos..].find("use ") else {
+            break;
+        };
+        let abs = pos + use_pos;
+        // Check that `use` is preceded by a statement boundary (newline, ';', or start)
+        let ok = abs == 0
+            || search_region[..abs]
+                .chars()
+                .next_back()
+                .map(|c| c == '\n' || c == ';' || c == '{' || c == '}')
+                .unwrap_or(true);
+        pos = abs + 4;
+        if !ok {
+            continue;
+        }
+        // Read to next semicolon
+        let Some(semi) = search_region[pos..].find(';') else {
+            break;
+        };
+        let stmt = search_region[pos..pos + semi].trim();
+        // Skip `use function` and `use const`
+        if stmt.starts_with("function ") || stmt.starts_with("const ") {
+            pos += semi + 1;
+            continue;
+        }
+        // Parse the statement
+        parse_use_stmt(stmt, &mut map);
+        pos += semi + 1;
+    }
+    map
+}
+
+/// Find the byte offset of the opening brace of the first class/trait/interface body.
+fn find_class_body_brace_offset(text: &str) -> Option<usize> {
+    // Simple heuristic: find `class `, `trait `, or `interface ` then the first `{`
+    for kw in &["class ", "trait ", "interface "] {
+        if let Some(kw_pos) = text.find(kw) {
+            if let Some(brace) = text[kw_pos..].find('{') {
+                return Some(kw_pos + brace);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a use statement body (without leading `use ` and without trailing `;`).
+fn parse_use_stmt(stmt: &str, map: &mut std::collections::HashMap<String, String>) {
+    let stmt = stmt.trim();
+    // Grouped: Foo\Bar\{Baz, Qux as Q}
+    if stmt.contains('{') {
+        parse_grouped_use(&format!("use {stmt}"), map);
+        return;
+    }
+    // Multiple: use Foo, Bar\Baz (rare in PHP but handle it)
+    for part in stmt.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (fqcn_raw, alias) = if let Some((fqcn_part, alias_part)) = part.split_once(" as ") {
+            (fqcn_part.trim(), alias_part.trim().to_ascii_lowercase())
+        } else {
+            let seg = part
+                .rsplit('\\')
+                .next()
+                .unwrap_or(part)
+                .to_ascii_lowercase();
+            (part, seg)
+        };
+        let fqcn = normalize_fqn(fqcn_raw.trim_start_matches('\\'));
+        if !fqcn.is_empty() && !alias.is_empty() {
+            map.insert(alias, fqcn);
+        }
+    }
+}
+
+/// Parse a grouped use statement like `use Foo\Bar\{Baz, Qux as Q};`
+fn parse_grouped_use(text: &str, map: &mut std::collections::HashMap<String, String>) {
+    // Extract prefix (before '{') and items (inside '{}')
+    let text = text.trim_start_matches("use ").trim_end_matches(';').trim();
+    let Some(brace_start) = text.find('{') else {
+        return;
+    };
+    let Some(brace_end) = text.rfind('}') else {
+        return;
+    };
+    let prefix = text[..brace_start].trim_end_matches('\\').trim();
+    let items = &text[brace_start + 1..brace_end];
+    for item in items.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (class_part, alias) = if let Some((c, a)) = item.split_once(" as ") {
+            (c.trim(), a.trim().to_ascii_lowercase())
+        } else {
+            let seg = item
+                .rsplit('\\')
+                .next()
+                .unwrap_or(item)
+                .to_ascii_lowercase();
+            (item, seg)
+        };
+        let fqcn = format!("{}\\{}", prefix, class_part);
+        let fqcn = normalize_fqn(&fqcn);
+        map.insert(alias, fqcn);
+    }
+}
+
+/// Resolve a type hint using the namespace and use-import map.
+fn resolve_type_hint(
+    raw: &str,
+    namespace: &str,
+    use_map: &std::collections::HashMap<String, String>,
+) -> String {
+    if raw.is_empty() {
+        return raw.to_string();
+    }
+    // Already fully-qualified (starts with \)
+    if raw.starts_with('\\') {
+        return normalize_fqn(raw);
+    }
+    let first = raw.split('\\').next().unwrap_or(raw);
+    if let Some(mapped) = use_map.get(&first.to_ascii_lowercase()) {
+        if raw.contains('\\') {
+            let rest = &raw[first.len() + 1..];
+            return format!("{}\\{}", mapped, rest);
+        }
+        return mapped.clone();
+    }
+    // Relative to current namespace
+    if namespace.is_empty() {
+        raw.to_string()
+    } else {
+        format!("{}\\{}", namespace, raw)
+    }
 }
 
 fn find_namespace(root: &Node, src: &[u8]) -> String {
@@ -266,16 +423,26 @@ fn has_modifier(member: Node, src: &[u8], modifier: &str) -> bool {
     false
 }
 
-fn parse_constructor(method: Node, src: &[u8]) -> Constructor {
+fn parse_constructor(
+    method: Node,
+    src: &[u8],
+    namespace: &str,
+    use_map: &std::collections::HashMap<String, String>,
+) -> Constructor {
     let params = if let Some(params_node) = method.child_by_field_name("parameters") {
-        parse_ctor_params_ts(params_node, src)
+        parse_ctor_params_ts(params_node, src, namespace, use_map)
     } else {
         Vec::new()
     };
     Constructor { params }
 }
 
-fn parse_ctor_params_ts(params_node: Node, src: &[u8]) -> Vec<ConstructorParam> {
+fn parse_ctor_params_ts(
+    params_node: Node,
+    src: &[u8],
+    namespace: &str,
+    use_map: &std::collections::HashMap<String, String>,
+) -> Vec<ConstructorParam> {
     let mut params = Vec::new();
     for child in iter_children(params_node) {
         match child.kind() {
@@ -283,9 +450,10 @@ fn parse_ctor_params_ts(params_node: Node, src: &[u8]) -> Vec<ConstructorParam> 
                 let is_promoted = child.kind() == "promoted_parameter";
                 let is_variadic = child.kind() == "variadic_parameter";
 
-                let type_hint = child
-                    .child_by_field_name("type")
-                    .map(|n| extract_type_from_node(n, src));
+                let type_hint = child.child_by_field_name("type").map(|n| {
+                    let raw = extract_type_from_node(n, src);
+                    resolve_type_in_hint(&raw, namespace, use_map)
+                });
 
                 let name = child
                     .child_by_field_name("name")
@@ -323,16 +491,22 @@ fn parse_ctor_params_ts(params_node: Node, src: &[u8]) -> Vec<ConstructorParam> 
     params
 }
 
-fn parse_method_params_ts(method: Node, src: &[u8]) -> Vec<MethodParam> {
+fn parse_method_params_ts(
+    method: Node,
+    src: &[u8],
+    namespace: &str,
+    use_map: &std::collections::HashMap<String, String>,
+) -> Vec<MethodParam> {
     let mut params = Vec::new();
     if let Some(params_node) = method.child_by_field_name("parameters") {
         for child in iter_children(params_node) {
             match child.kind() {
                 "simple_parameter" | "variadic_parameter" | "promoted_parameter" => {
                     let is_variadic = child.kind() == "variadic_parameter";
-                    let type_hint = child
-                        .child_by_field_name("type")
-                        .map(|n| extract_type_from_node(n, src));
+                    let type_hint = child.child_by_field_name("type").map(|n| {
+                        let raw = extract_type_from_node(n, src);
+                        resolve_type_in_hint(&raw, namespace, use_map)
+                    });
                     let name = child
                         .child_by_field_name("name")
                         .map(|n| node_text(n, src).trim().trim_start_matches('$').to_string())
@@ -358,6 +532,43 @@ fn parse_method_params_ts(method: Node, src: &[u8]) -> Vec<MethodParam> {
         }
     }
     params
+}
+
+/// Resolve each segment in a (possibly union) type hint using namespace + use_map.
+/// Primitives and `null` are left as-is. FQCN segments are resolved.
+fn resolve_type_in_hint(
+    raw: &str,
+    namespace: &str,
+    use_map: &std::collections::HashMap<String, String>,
+) -> String {
+    if raw.is_empty() {
+        return raw.to_string();
+    }
+    // Nullable prefix
+    let (prefix, inner) = if let Some(rest) = raw.strip_prefix('?') {
+        ("?", rest)
+    } else {
+        ("", raw)
+    };
+    // Union type (Foo|Bar|null)
+    if inner.contains('|') {
+        let resolved: Vec<String> = inner
+            .split('|')
+            .map(|part| {
+                let p = part.trim();
+                if is_primitive_type(p) || p.eq_ignore_ascii_case("null") {
+                    p.to_string()
+                } else {
+                    resolve_type_hint(p, namespace, use_map)
+                }
+            })
+            .collect();
+        return format!("{}{}", prefix, resolved.join("|"));
+    }
+    if is_primitive_type(inner) {
+        return raw.to_string();
+    }
+    format!("{}{}", prefix, resolve_type_hint(inner, namespace, use_map))
 }
 
 fn extract_type_from_node(type_node: Node, src: &[u8]) -> String {

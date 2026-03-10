@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use di_xml_reader::{DiConfig, Plugin as DiPlugin};
+use php_extractor::types::ClassKind;
 use php_extractor::ClassInfo;
 
 use crate::metadata::escape_php;
@@ -109,6 +110,15 @@ pub fn compile_plugin_list(
     class_names.sort();
     class_names.dedup();
     for class_name in class_names {
+        // TKT-049: PHP excludes pure interfaces from Section 1 unless they are directly
+        // in Section 0 (i.e., have plugins registered on them). Skip them here.
+        let is_pure_interface = class_map
+            .get(class_name.trim_start_matches('\\'))
+            .map(|c| matches!(c.kind, ClassKind::Interface))
+            .unwrap_or(false);
+        if is_pure_interface && !plugin_data.contains_key(class_name.as_str()) {
+            continue;
+        }
         inherit_plugins(
             &class_name,
             &plugin_data,
@@ -315,7 +325,12 @@ fn inherit_plugins(
             .into_iter()
             .filter(|plugin| !plugin.instance.is_empty())
             .collect();
-        sorted_plugins.sort_by(|a, b| a.sort_order.cmp(&b.sort_order));
+        // TKT-050: secondary sort by name for deterministic tiebreak (matches PHP behaviour)
+        sorted_plugins.sort_by(|a, b| {
+            a.sort_order
+                .cmp(&b.sort_order)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         for plugin in &mut sorted_plugins {
             plugin.instance = normalize(&plugin.instance);
         }

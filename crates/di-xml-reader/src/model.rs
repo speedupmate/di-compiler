@@ -11,6 +11,33 @@ pub struct DiConfig {
     pub virtual_types: HashMap<String, VirtualType>,
     /// type @name → TypeConfig
     pub type_configs: HashMap<String, TypeConfig>,
+    /// Lowercased preference key -> canonical key (for fast case-insensitive lookup)
+    pub preference_keys_lc: HashMap<String, String>,
+    /// Lowercased type config key -> canonical key (for fast case-insensitive lookup)
+    pub type_config_keys_lc: HashMap<String, String>,
+}
+
+impl DiConfig {
+    /// Rebuild case-insensitive lookup indexes.
+    pub fn refresh_lookup_indexes(&mut self) {
+        self.preference_keys_lc.clear();
+        self.preference_keys_lc.reserve(self.preferences.len());
+        for key in self.preferences.keys() {
+            let lower = key.to_ascii_lowercase();
+            self.preference_keys_lc
+                .entry(lower)
+                .or_insert_with(|| key.clone());
+        }
+
+        self.type_config_keys_lc.clear();
+        self.type_config_keys_lc.reserve(self.type_configs.len());
+        for key in self.type_configs.keys() {
+            let lower = key.to_ascii_lowercase();
+            self.type_config_keys_lc
+                .entry(lower)
+                .or_insert_with(|| key.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,32 +73,41 @@ pub enum Argument {
         name: String,
         value: String,
         shared: Option<bool>,
+        /// sortOrder attribute from di.xml (for sorting within parent Array)
+        sort_order: i32,
     },
     String {
         name: String,
         value: String,
+        sort_order: i32,
     },
     Boolean {
         name: String,
         value: bool,
+        sort_order: i32,
     },
     Number {
         name: String,
         value: String,
+        sort_order: i32,
     },
     Null {
         name: String,
+        sort_order: i32,
     },
     Array {
         name: String,
         items: Vec<Argument>,
+        sort_order: i32,
     },
     Init {
         name: String,
         value: String,
+        sort_order: i32,
     },
     Const {
         name: String,
         value: String,
+        sort_order: i32,
     },
 }

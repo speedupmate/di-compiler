@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use code_generator::{
     extension_path, factory_path, generate_app_action_list_php,
-    generate_area_config_with_extra_preferences, generate_extension, generate_extension_interface,
+    generate_area_config_with_overrides, generate_extension, generate_extension_interface,
     generate_factory, generate_interceptor, generate_plugin_list_php, generate_proxy,
     generate_proxy_deferred, generate_search_results, interceptor_path, proxy_deferred_path,
     proxy_path, search_results_path, serialize_interception_php, write_if_changed,
@@ -37,8 +37,9 @@ use di_resolver::{
     resolve_all_arguments, resolve_all_arguments_for_named_types, FactorySpec,
 };
 use di_xml_reader::{
-    find_all_di_xml_files, find_di_xml_files, find_di_xml_files_for_area, merge_configs,
-    merge_into, parse_di_xml, Argument, DiConfig, Plugin,
+    apply_module_config_on_primary, find_all_di_xml_files, find_di_xml_files,
+    find_di_xml_files_for_area, merge_configs, merge_into, parse_di_xml, Argument, DiConfig,
+    Plugin,
 };
 use php_extractor::{
     extract_file, extract_string_constants,
@@ -495,11 +496,16 @@ fn main() {
     // -----------------------------------------------------------------------
     let phase_3a_started = Instant::now();
     let enabled_modules = load_module_order_from_config_php(&magento_root);
-    let di_xml_files = filter_enabled_di_xml(find_di_xml_files(&magento_root), &enabled_modules);
+    let di_xml_files = filter_enabled_di_xml(
+        find_di_xml_files(&magento_root, &enabled_modules),
+        &enabled_modules,
+        &magento_root,
+    );
     log::info!("Found {} di.xml files (global)", di_xml_files.len());
 
     let pb = progress_bar(di_xml_files.len() as u64, "Parsing di.xml (global)");
-    let global_di_configs: Vec<_> = di_xml_files
+    // Parse with path retained so we can split primary (app/etc/di.xml) from modules.
+    let global_di_path_configs: Vec<_> = di_xml_files
         .par_iter()
         .filter_map(|path| {
             if args.incremental && cache_ref.is_unchanged(path) {
@@ -509,7 +515,7 @@ fn main() {
             let r = parse_di_xml(path);
             pb.inc(1);
             match r {
-                Ok(cfg) => Some(cfg),
+                Ok(cfg) => Some((path.clone(), cfg)),
                 Err(e) => {
                     log::warn!("di.xml parse error {}: {e}", path.display());
                     None
@@ -519,7 +525,26 @@ fn main() {
         .collect();
     pb.finish_with_message("done");
 
-    let di_config = merge_configs(global_di_configs.clone());
+    // Two-phase merge replicating PHP's Config::_mergeConfiguration behaviour:
+    //   Phase 1: deep-merge all module di.xml files together (items accumulate by name)
+    //   Phase 2: apply merged module result on app/etc/di.xml with shallow arg replacement
+    //            (PHP uses array_replace at argument-name level, not item-level deep merge)
+    let app_etc_di_path = magento_root.join("app/etc/di.xml");
+    let (primary_configs, module_configs): (Vec<_>, Vec<_>) = global_di_path_configs
+        .iter()
+        .partition(|(p, _)| *p == app_etc_di_path);
+    let primary_base = merge_configs(
+        primary_configs
+            .into_iter()
+            .map(|(_, c)| c.clone())
+            .collect(),
+    );
+    let module_merged = merge_configs(module_configs.into_iter().map(|(_, c)| c.clone()).collect());
+    let di_config = apply_module_config_on_primary(primary_base, module_merged);
+
+    // Flat Vec<DiConfig> (without path) for detection purposes (plugins/types, not arg values).
+    let global_di_configs: Vec<DiConfig> =
+        global_di_path_configs.into_iter().map(|(_, c)| c).collect();
     // HashSet for O(1) membership tests — used in Phase 3b and Phase 7 filters.
     let di_xml_files_set: HashSet<&PathBuf> = di_xml_files.iter().collect();
     log_phase_elapsed("Phase 3a", phase_3a_started);
@@ -531,8 +556,11 @@ fn main() {
     // area-specific di.xml files (e.g. etc/adminhtml/di.xml), not just global.
     // -----------------------------------------------------------------------
     let phase_3b_started = Instant::now();
-    let all_di_xml_files =
-        filter_enabled_di_xml(find_all_di_xml_files(&magento_root), &enabled_modules);
+    let all_di_xml_files = filter_enabled_di_xml(
+        find_all_di_xml_files(&magento_root, &enabled_modules),
+        &enabled_modules,
+        &magento_root,
+    );
     log::info!("Found {} di.xml files (all areas)", all_di_xml_files.len());
 
     // Only parse files not already in the global set
@@ -641,7 +669,10 @@ fn main() {
         detect_proxy_deferred_specs(&class_map, &factories, composer_autoload.as_ref());
 
     let mut interception_di_config = full_di_config.clone();
-    interception_di_config.plugins = merge_plugins_for_interception(&scanner_di_configs);
+    interception_di_config.plugins = merge_plugins_for_interception(
+        &scanner_di_configs[..global_di_configs.len()],
+        &scanner_di_configs[global_di_configs.len()..],
+    );
 
     // Interceptors can target generated factory classes (e.g. plugins on
     // Magento\Setup\...\EntityGeneratorFactory). Magento sees those classes
@@ -732,13 +763,17 @@ fn main() {
     // di.xml xsi:type="init_parameter" values contain PHP constant expressions like
     // `Magento\Framework\App\State::PARAM_MODE`. We resolve these by reading the
     // class source file and extracting the actual string constant value.
+    //
+    // TKT-054: Bootstrap with PHP extension constants first (e.g. MCRYPT_BLOWFISH,
+    // MCRYPT_MODE_ECB) that are never defined in any Magento PHP source file.
+    // Source-scan constants added after will override these builtins on collision.
     let const_map: HashMap<String, String> = {
         // Collect unique ClassName::CONST_NAME expressions from all di_config arguments
         let mut init_exprs: HashSet<String> = HashSet::new();
         let mut collect_from_arg = |arg: &Argument| {
             if let Argument::Init { value, .. } = arg {
                 let normalized = value.trim().trim_start_matches('\\');
-                if normalized.contains("::") {
+                if !normalized.is_empty() {
                     init_exprs.insert(normalized.to_string());
                 }
             }
@@ -749,7 +784,11 @@ fn main() {
             }
         }
 
-        let mut map = HashMap::new();
+        // Bootstrap PHP extension/built-in constants as baseline.
+        let mut map = bootstrap_php_constants(&args.fallback_php, &magento_root);
+
+        // Source-scan: resolve ClassName::CONST_NAME expressions from PHP source files.
+        // These override any bootstrap builtins with the same key.
         for expr in &init_exprs {
             let Some((class_name, const_name)) = expr.split_once("::") else {
                 continue;
@@ -1036,10 +1075,22 @@ fn main() {
     let resolved_const_values =
         resolve_php_constants_in_config(&full_di_config, &args.magento_root, &args.fallback_php);
     let mut metadata_base_di_config = di_config.clone();
+    // setup:di:compile mutates ObjectManager config at runtime before metadata
+    // generation. Mirror the relevant overrides so Setup/compiler classes and
+    // scanner exclusions match PHP metadata output.
+    apply_setup_di_compile_runtime_overrides(
+        &mut metadata_base_di_config,
+        &args.magento_root,
+        &module_paths,
+        &args.fallback_php,
+    );
     apply_resolved_constants_to_di_config(&mut metadata_base_di_config, &resolved_const_values);
 
     let generated_class_map = extract_generated_class_map(&code_root);
     let mut metadata_class_map = merged_class_map(&interception_class_map, &generated_class_map);
+    // Source-only FQCNs for null-emission filtering: PHP emits NULL only for scanned
+    // source concrete classes, not for generated artifacts (interceptors, factories, proxies).
+    let base_class_fqcns: HashSet<String> = interception_class_map.keys().cloned().collect();
     let argument_type_names = build_argument_type_names(
         &interception_class_map,
         &generated_class_map,
@@ -1078,21 +1129,36 @@ fn main() {
         &args.magento_root,
         &args.fallback_php,
     );
+    // Virtual types can resolve to third-party classes outside our scanner
+    // scope (for example Monolog\Logger). Reflect those constructor defaults
+    // so VT args include inherited optional defaults (handlers/processors/timezone).
+    let reflected_virtual_target_ctors = enrich_virtual_target_constructors_with_reflection(
+        &mut metadata_class_map,
+        &argument_type_names,
+        &metadata_base_di_config,
+        &args.magento_root,
+        &args.fallback_php,
+    );
     log::info!(
-        "Metadata universe: args {} / interception {} type names (base {}, generated {}, ctor reflections {}, inherited reflections {})",
+        "Metadata universe: args {} / interception {} type names (base {}, generated {}, ctor reflections {}, inherited reflections {}, virtual-target reflections {})",
         argument_type_names.len(),
         interception_type_names.len(),
         interception_class_map.len(),
         generated_class_map.len(),
         reflected_metadata_ctors,
-        reflected_inherited_ctors
+        reflected_inherited_ctors,
+        reflected_virtual_target_ctors
     );
-    let interception_preferences =
-        build_interception_preferences(&interceptors, &metadata_base_di_config);
+    // Build direct interception map once; area-specific preference/instanceTypes
+    // overrides are derived from this and each area's merged DI config.
+    let global_interceptor_map = build_direct_interception_map(&interceptors);
     let all_fqcns = build_interception_registry(
         &interception_type_names,
         &interceptors,
+        &proxies,
+        &proxy_deferred,
         &interception_di_config,
+        &metadata_class_map,
     );
 
     // interception.php
@@ -1107,8 +1173,9 @@ fn main() {
         .par_iter()
         .map(|&area| {
             let area_di_files = filter_enabled_di_xml(
-                find_di_xml_files_for_area(&magento_root, area),
+                find_di_xml_files_for_area(&magento_root, area, &enabled_modules),
                 &enabled_modules,
+                &magento_root,
             );
 
             // Only re-merge if there are area-specific files beyond the global set.
@@ -1124,8 +1191,13 @@ fn main() {
                         .iter()
                         .filter_map(|p| parse_di_xml(p).ok())
                         .collect();
-                    let mut merged_area = metadata_base_di_config.clone();
-                    merge_into(&mut merged_area, merge_configs(extra_configs));
+                    // Area-specific module configs applied via the same two-phase merge as
+                    // global: deep-merge area module configs together, then apply on the
+                    // global base using shallow (array_replace) semantics per PHP behaviour.
+                    let mut merged_area = apply_module_config_on_primary(
+                        metadata_base_di_config.clone(),
+                        merge_configs(extra_configs),
+                    );
                     apply_resolved_constants_to_di_config(&mut merged_area, &resolved_const_values);
                     merged_area
                 }
@@ -1133,27 +1205,89 @@ fn main() {
                 metadata_base_di_config.clone()
             };
 
+            // Build area-specific preference overrides and direct interceptor map.
+            let area_preference_overrides =
+                build_interception_preference_overrides(&area_di_config, &global_interceptor_map);
+            let area_instance_type_overrides = global_interceptor_map.clone();
+
             let mut area_di_config_for_args = area_di_config.clone();
-            for (from, to) in &interception_preferences {
+            for (from, to) in &area_preference_overrides {
+                // Keep VT argument values stable: synthetic interception overrides for
+                // virtual-type names should not participate in argument object resolution.
+                // Explicit DI preferences for VT aliases are already present in
+                // area_di_config.preferences and remain intact.
+                if area_di_config_for_args.virtual_types.contains_key(from.as_str()) {
+                    continue;
+                }
                 area_di_config_for_args
                     .preferences
                     .insert(from.clone(), to.clone());
             }
+            area_di_config_for_args.refresh_lookup_indexes();
 
-            let area_args = resolve_all_arguments_for_named_types(
-                &argument_type_names,
+            // Area-specific di.xml files may define additional virtual types not present
+            // in the global di config. Extend the type universe with those for this area.
+            let area_type_names: Vec<String> = {
+                let base_set: std::collections::HashSet<&str> =
+                    argument_type_names.iter().map(|s| s.as_str()).collect();
+                let extra: Vec<String> = area_di_config_for_args
+                    .virtual_types
+                    .keys()
+                    .filter(|k| !base_set.contains(k.as_str()))
+                    .cloned()
+                    .collect();
+                if extra.is_empty() {
+                    argument_type_names.clone()
+                } else {
+                    let mut v = argument_type_names.clone();
+                    v.extend(extra);
+                    v
+                }
+            };
+            let mut area_args = resolve_all_arguments_for_named_types(
+                &area_type_names,
                 &metadata_class_map,
+                &base_class_fqcns,
                 &area_di_config_for_args,
                 &const_map,
             );
+            canonicalize_instance_reference_case(&mut area_args, &interception_class_map);
             let area_args: HashMap<String, Vec<di_resolver::ResolvedArg>> = area_args
                 .into_iter()
-                .filter(|(fqcn, _)| !interception_preferences.contains_key(fqcn))
+                .filter(|(fqcn, args)| {
+                    // Intercepted concrete classes appear under ClassName\Interceptor, not
+                    // their original name.  However virtual types must still appear even when
+                    // their direct concrete type is intercepted — PHP generates arguments for
+                    // both the VT name and the Interceptor. Exception: when intercepted
+                    // source classes resolve to no constructor args, PHP keeps a class-level
+                    // NULL entry for the original class name.
+                    if !area_instance_type_overrides.contains_key(fqcn) {
+                        return true;
+                    }
+                    if metadata_base_di_config
+                        .virtual_types
+                        .contains_key(fqcn.as_str())
+                    {
+                        return true;
+                    }
+                    if !args.is_empty() {
+                        return false;
+                    }
+                    let normalized = fqcn.trim_start_matches('\\');
+                    if !base_class_fqcns.contains(normalized) {
+                        return false;
+                    }
+                    matches!(
+                        metadata_class_map.get(normalized).map(|info| &info.kind),
+                        Some(ClassKind::Class) | Some(ClassKind::Trait)
+                    )
+                })
                 .collect();
-            let area_content = generate_area_config_with_extra_preferences(
+            let area_content = generate_area_config_with_overrides(
                 &area_args,
                 &area_di_config,
-                &interception_preferences,
+                &area_preference_overrides,
+                &area_instance_type_overrides,
             );
             let area_path = metadata_root.join(format!("{}.php", area));
             let _ = write_if_changed(&area_path, &area_content);
@@ -1399,23 +1533,34 @@ fn apply_resolved_constants_to_arguments(
 ) {
     for arg in arguments.iter_mut() {
         match arg {
-            Argument::Const { name, value } => {
+            Argument::Const {
+                name,
+                value,
+                sort_order,
+            } => {
                 let key = value.trim().trim_start_matches('\\').to_string();
+                let so = *sort_order;
                 if let Some(resolved) = values.get(&key) {
                     *arg = match resolved {
                         ResolvedConstValue::String(v) => Argument::String {
                             name: name.clone(),
                             value: v.clone(),
+                            sort_order: so,
                         },
                         ResolvedConstValue::Number(v) => Argument::Number {
                             name: name.clone(),
                             value: v.clone(),
+                            sort_order: so,
                         },
                         ResolvedConstValue::Bool(v) => Argument::Boolean {
                             name: name.clone(),
                             value: *v,
+                            sort_order: so,
                         },
-                        ResolvedConstValue::Null => Argument::Null { name: name.clone() },
+                        ResolvedConstValue::Null => Argument::Null {
+                            name: name.clone(),
+                            sort_order: so,
+                        },
                     };
                 }
             }
@@ -1423,6 +1568,370 @@ fn apply_resolved_constants_to_arguments(
             _ => {}
         }
     }
+}
+
+fn apply_setup_di_compile_runtime_overrides(
+    di_config: &mut DiConfig,
+    magento_root: &Path,
+    module_paths: &[PathBuf],
+    php_bin: &str,
+) {
+    // configureObjectManager(): ClassesScanner.excludePatterns
+    apply_setup_classes_scanner_exclude_patterns(di_config, magento_root, module_paths, php_bin);
+    // configureObjectManager(): ModificationChain.modificationsList
+    apply_setup_modification_chain_override(di_config);
+    // configureObjectManager(): PluginList.cache -> CompiledConfig (no Proxy)
+    apply_setup_plugin_list_cache_override(di_config);
+    di_config.refresh_lookup_indexes();
+}
+
+fn apply_setup_classes_scanner_exclude_patterns(
+    di_config: &mut DiConfig,
+    magento_root: &Path,
+    module_paths: &[PathBuf],
+    php_bin: &str,
+) {
+    // Prefer PHP runtime registrar paths to mirror setup:di:compile exactly.
+    // Fallback to local discovery if bootstrap lookup fails.
+    let (module_roots, library_paths, setup_root) =
+        if let Some(paths) = load_setup_component_paths_from_php(magento_root, php_bin) {
+            (
+                paths.module_paths,
+                paths.library_paths,
+                PathBuf::from(paths.setup_path),
+            )
+        } else {
+            let setup_root = magento_root.join("setup");
+            let library_paths = discover_framework_library_paths(magento_root);
+            let module_roots: Vec<PathBuf> = module_paths
+                .iter()
+                .filter(|p| !p.starts_with(&setup_root))
+                .filter(|p| !library_paths.iter().any(|lib| *p == lib))
+                .cloned()
+                .collect();
+            (module_roots, library_paths, setup_root)
+        };
+
+    let application_patterns = build_setup_excluded_module_patterns(&module_roots);
+    let framework_patterns = build_setup_excluded_library_patterns(&library_paths);
+    let setup_patterns = vec![format!(
+        "#^(?:{})(/[\\w]+)*/Test#",
+        regex_quote_for_hash(&setup_root.to_string_lossy())
+    )];
+
+    let exclude_patterns = Argument::Array {
+        name: "excludePatterns".to_string(),
+        items: vec![
+            string_list_array_arg("application", &application_patterns),
+            string_list_array_arg("framework", &framework_patterns),
+            string_list_array_arg("setup", &setup_patterns),
+        ],
+        sort_order: 0,
+    };
+
+    upsert_type_argument(
+        di_config,
+        "Magento\\Setup\\Module\\Di\\Code\\Reader\\ClassesScanner",
+        exclude_patterns,
+    );
+}
+
+fn apply_setup_modification_chain_override(di_config: &mut DiConfig) {
+    let modifications_list = Argument::Array {
+        name: "modificationsList".to_string(),
+        items: vec![
+            object_item_arg(
+                "BackslashTrim",
+                "Magento\\Setup\\Module\\Di\\Compiler\\Config\\Chain\\BackslashTrim",
+            ),
+            object_item_arg(
+                "PreferencesResolving",
+                "Magento\\Setup\\Module\\Di\\Compiler\\Config\\Chain\\PreferencesResolving",
+            ),
+            object_item_arg(
+                "InterceptorSubstitution",
+                "Magento\\Setup\\Module\\Di\\Compiler\\Config\\Chain\\InterceptorSubstitution",
+            ),
+            object_item_arg(
+                "InterceptionPreferencesResolving",
+                "Magento\\Setup\\Module\\Di\\Compiler\\Config\\Chain\\PreferencesResolving",
+            ),
+        ],
+        sort_order: 0,
+    };
+
+    upsert_type_argument(
+        di_config,
+        "Magento\\Setup\\Module\\Di\\Compiler\\Config\\ModificationChain",
+        modifications_list,
+    );
+}
+
+fn apply_setup_plugin_list_cache_override(di_config: &mut DiConfig) {
+    upsert_type_argument(
+        di_config,
+        "Magento\\Setup\\Module\\Di\\Code\\Generator\\PluginList",
+        Argument::Object {
+            name: "cache".to_string(),
+            value: "Magento\\Framework\\App\\Interception\\Cache\\CompiledConfig".to_string(),
+            shared: None,
+            sort_order: 0,
+        },
+    );
+}
+
+fn upsert_type_argument(di_config: &mut DiConfig, type_name: &str, argument: Argument) {
+    let tc = di_config
+        .type_configs
+        .entry(type_name.to_string())
+        .or_default();
+    let arg_name = match &argument {
+        Argument::Object { name, .. }
+        | Argument::String { name, .. }
+        | Argument::Boolean { name, .. }
+        | Argument::Number { name, .. }
+        | Argument::Null { name, .. }
+        | Argument::Array { name, .. }
+        | Argument::Init { name, .. }
+        | Argument::Const { name, .. } => name,
+    };
+
+    if let Some(existing) = tc.arguments.iter_mut().find(|a| match a {
+        Argument::Object { name, .. }
+        | Argument::String { name, .. }
+        | Argument::Boolean { name, .. }
+        | Argument::Number { name, .. }
+        | Argument::Null { name, .. }
+        | Argument::Array { name, .. }
+        | Argument::Init { name, .. }
+        | Argument::Const { name, .. } => name == arg_name,
+    }) {
+        *existing = argument;
+    } else {
+        tc.arguments.push(argument);
+    }
+}
+
+fn object_item_arg(name: &str, fqcn: &str) -> Argument {
+    Argument::Object {
+        name: name.to_string(),
+        value: fqcn.to_string(),
+        shared: None,
+        sort_order: 0,
+    }
+}
+
+fn string_list_array_arg(name: &str, values: &[String]) -> Argument {
+    Argument::Array {
+        name: name.to_string(),
+        items: values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| Argument::String {
+                name: idx.to_string(),
+                value: value.clone(),
+                sort_order: 0,
+            })
+            .collect(),
+        sort_order: 0,
+    }
+}
+
+fn build_setup_excluded_module_patterns(module_roots: &[PathBuf]) -> Vec<String> {
+    let mut modules_by_base: Vec<(String, Vec<(String, Vec<String>)>)> = Vec::new();
+
+    for module_root in module_roots {
+        let Some(module_dir) = module_root.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(vendor_path) = module_root.parent() else {
+            continue;
+        };
+        let Some(vendor_dir) = vendor_path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(base_path) = vendor_path.parent() else {
+            continue;
+        };
+
+        let base_key = base_path.to_string_lossy().to_string();
+        let base_idx = modules_by_base
+            .iter()
+            .position(|(base, _)| base == &base_key)
+            .unwrap_or_else(|| {
+                modules_by_base.push((base_key.clone(), Vec::new()));
+                modules_by_base.len() - 1
+            });
+
+        let vendors = &mut modules_by_base[base_idx].1;
+        let vendor_key = vendor_dir.to_string();
+        let vendor_idx = vendors
+            .iter()
+            .position(|(vendor, _)| vendor == &vendor_key)
+            .unwrap_or_else(|| {
+                vendors.push((vendor_key.clone(), Vec::new()));
+                vendors.len() - 1
+            });
+
+        let modules = &mut vendors[vendor_idx].1;
+        let module_name = module_dir.to_string();
+        if !modules.iter().any(|m| m == &module_name) {
+            modules.push(module_name);
+        }
+    }
+
+    if modules_by_base.is_empty() {
+        return Vec::new();
+    }
+
+    let mut base_paths_regexps: Vec<String> = Vec::new();
+    for (base_path, vendor_paths) in modules_by_base {
+        let vendor_paths_regexps: Vec<String> = vendor_paths
+            .into_iter()
+            .filter_map(|(vendor_dir, vendor_modules)| {
+                if vendor_modules.is_empty() {
+                    return None;
+                }
+                Some(format!("{}/(?:{})", vendor_dir, vendor_modules.join("|")))
+            })
+            .collect();
+        if vendor_paths_regexps.is_empty() {
+            continue;
+        }
+
+        base_paths_regexps.push(format!(
+            "{}/(?:{})",
+            regex_quote_for_hash(&base_path),
+            vendor_paths_regexps.join("|")
+        ));
+    }
+    if base_paths_regexps.is_empty() {
+        return Vec::new();
+    }
+
+    vec![
+        format!("#^(?:{})/Test#", base_paths_regexps.join("|")),
+        format!("#^(?:{})/tests#", base_paths_regexps.join("|")),
+    ]
+}
+
+fn build_setup_excluded_library_patterns(library_paths: &[PathBuf]) -> Vec<String> {
+    if library_paths.is_empty() {
+        return Vec::new();
+    }
+    let library_paths = library_paths
+        .iter()
+        .map(|p| regex_quote_for_hash(&p.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join("|");
+    vec![
+        format!("#^(?:{})/([\\w]+/)?Test#", library_paths),
+        format!("#^(?:{})/([\\w]+/)?tests#", library_paths),
+    ]
+}
+
+fn discover_framework_library_paths(magento_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let vendor_magento = magento_root.join("vendor/magento");
+    if let Ok(entries) = std::fs::read_dir(vendor_magento) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            if name == "framework" || name.starts_with("framework-") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupComponentPaths {
+    modules: Vec<String>,
+    libraries: Vec<String>,
+    setup: String,
+}
+
+struct SetupComponentPathsResolved {
+    module_paths: Vec<PathBuf>,
+    library_paths: Vec<PathBuf>,
+    setup_path: String,
+}
+
+fn load_setup_component_paths_from_php(
+    magento_root: &Path,
+    php_bin: &str,
+) -> Option<SetupComponentPathsResolved> {
+    let script = r#"
+$root = rtrim((string)($argv[1] ?? ''), '/');
+if ($root === '' || !is_file($root . '/app/bootstrap.php')) {
+    echo 'null';
+    return;
+}
+require $root . '/app/bootstrap.php';
+$registrar = new \Magento\Framework\Component\ComponentRegistrar();
+$modules = array_values($registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::MODULE));
+$libraries = array_values($registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::LIBRARY));
+$setupPath = (new \Magento\Framework\App\Filesystem\DirectoryList($root))
+    ->getPath(\Magento\Framework\App\Filesystem\DirectoryList::SETUP);
+echo json_encode(
+    ['modules' => $modules, 'libraries' => $libraries, 'setup' => $setupPath],
+    JSON_UNESCAPED_SLASHES
+);
+"#;
+
+    let output = Command::new(php_bin)
+        .arg("-r")
+        .arg(script)
+        .arg(magento_root.as_os_str())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return None;
+    }
+    let json = if trimmed.starts_with('{') {
+        trimmed
+    } else {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        if end < start {
+            return None;
+        }
+        &trimmed[start..=end]
+    };
+    let parsed: SetupComponentPaths = serde_json::from_str(json).ok()?;
+    Some(SetupComponentPathsResolved {
+        module_paths: parsed.modules.into_iter().map(PathBuf::from).collect(),
+        library_paths: parsed.libraries.into_iter().map(PathBuf::from).collect(),
+        setup_path: parsed.setup,
+    })
+}
+
+fn regex_quote_for_hash(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for ch in input.chars() {
+        match ch {
+            '\\' | '.' | '+' | '*' | '?' | '[' | '^' | ']' | '$' | '(' | ')' | '{' | '}' | '='
+            | '!' | '<' | '>' | '|' | ':' | '-' | '#' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn enrich_constructor_defaults_with_reflection(
@@ -1515,6 +2024,72 @@ fn enrich_inherited_constructors_with_reflection(
     reflected.len()
 }
 
+fn enrich_virtual_target_constructors_with_reflection(
+    class_map: &mut HashMap<String, ClassInfo>,
+    type_names: &[String],
+    di_config: &DiConfig,
+    magento_root: &Path,
+    php_bin: &str,
+) -> usize {
+    let candidates: HashSet<String> = type_names
+        .iter()
+        .filter_map(|name| {
+            let vt_name = name.trim_start_matches('\\');
+            if !di_config.virtual_types.contains_key(vt_name) {
+                return None;
+            }
+            let target = di_config.get_instance_type(vt_name);
+            if target == vt_name || class_map.contains_key(&target) {
+                return None;
+            }
+            Some(target)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let reflected: HashMap<String, Vec<ConstructorParam>> = candidates
+        .par_iter()
+        .filter_map(|fqcn| {
+            let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
+            Some((fqcn.clone(), params))
+        })
+        .collect();
+
+    for (fqcn, params) in &reflected {
+        class_map
+            .entry(fqcn.clone())
+            .or_insert_with(|| synthetic_reflected_class_info(fqcn, params.clone()));
+    }
+
+    reflected.len()
+}
+
+fn synthetic_reflected_class_info(fqcn: &str, params: Vec<ConstructorParam>) -> ClassInfo {
+    let normalized = fqcn.trim_start_matches('\\');
+    let (namespace, name) = if let Some((ns, class_name)) = normalized.rsplit_once('\\') {
+        (ns.to_string(), class_name.to_string())
+    } else {
+        (String::new(), normalized.to_string())
+    };
+
+    ClassInfo {
+        path: PathBuf::from("__reflected__/constructor.php"),
+        namespace,
+        name,
+        fqcn: normalized.to_string(),
+        kind: ClassKind::Class,
+        extends: None,
+        implements: vec![],
+        constructor: Some(Constructor { params }),
+        is_abstract: false,
+        is_final: false,
+        public_methods: vec![],
+    }
+}
+
 fn constructor_defaults_need_constant_reflection(params: &[ConstructorParam]) -> bool {
     params.iter().any(|p| {
         p.default_value
@@ -1566,53 +2141,21 @@ fn build_argument_type_names(
     proxy_deferred: &[ProxyDeferredSpec],
     extension_specs: &[ExtensionSpec],
 ) -> Vec<String> {
-    // Intercepted concrete classes must NOT appear in arguments under their own name —
-    // their args are compiled under ClassName\Interceptor instead.
-    let intercepted_fqcns: HashSet<String> = interceptors
-        .iter()
-        .map(|spec| spec.fqcn.trim_start_matches('\\').to_string())
-        .collect();
-
     let mut names: HashSet<String> = HashSet::new();
 
-    // Include all scanned classes (abstract and concrete) except intercepted concretes.
+    // Include all scanned source classes (abstract and concrete). Intercepted classes
+    // are included so class-level NULL owner entries can be emitted when appropriate.
     // PHP's DI compiler includes abstract classes in the arguments universe.
-    // Generated classes (interceptors, factories, proxies) are never abstract.
-    names.extend(
-        base_class_map
-            .iter()
-            .filter(|(fqcn, _)| !intercepted_fqcns.contains(*fqcn))
-            .map(|(fqcn, _)| fqcn.clone()),
-    );
-    names.extend(generated_class_map.keys().cloned());
-    // Virtual types: include only if their DIRECT type is NOT an intercepted concrete.
-    // (VTs whose direct type is a VT pointing to an intercepted concrete ARE included.)
-    for (vt_name, vt) in &di_config.virtual_types {
-        let direct_type = vt.type_name.trim_start_matches('\\');
-        if !intercepted_fqcns.contains(direct_type) {
-            names.insert(vt_name.clone());
-        }
-    }
-    // type_configs: include all except intercepted or VTs-with-intercepted-direct-type.
-    names.extend(
-        di_config
-            .type_configs
-            .keys()
-            .filter(|fqcn| {
-                if intercepted_fqcns.contains(*fqcn) {
-                    return false;
-                }
-                // If this is a VT whose direct type is an intercepted concrete, exclude it.
-                if let Some(vt) = di_config.virtual_types.get(*fqcn) {
-                    let direct_type = vt.type_name.trim_start_matches('\\');
-                    if intercepted_fqcns.contains(direct_type) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .cloned(),
-    );
+    // Pre-existing generated classes (interceptors, factories, proxies) are NOT
+    // added here; only explicitly-detected generated classes (via spec lists below)
+    // are included — adding all generated_class_map keys causes pre-existing
+    // generated artifacts that PHP never re-processes to appear as extras.
+    names.extend(base_class_map.keys().cloned());
+    // Virtual types are part of the argument metadata universe regardless of whether
+    // their direct target type is intercepted.
+    names.extend(di_config.virtual_types.keys().cloned());
+    // type_configs: include all configured names.
+    names.extend(di_config.type_configs.keys().cloned());
 
     for spec in interceptors {
         let target = spec.fqcn.trim_start_matches('\\').to_string();
@@ -1658,6 +2201,12 @@ fn build_interception_type_names(
     proxy_deferred: &[ProxyDeferredSpec],
     extension_specs: &[ExtensionSpec],
 ) -> Vec<String> {
+    let is_known_type = |name: &str| {
+        base_class_map.contains_key(name)
+            || generated_class_map.contains_key(name)
+            || di_config.virtual_types.contains_key(name)
+    };
+
     let mut names: HashSet<String> = build_argument_type_names(
         base_class_map,
         generated_class_map,
@@ -1674,8 +2223,22 @@ fn build_interception_type_names(
 
     names.extend(di_config.plugins.keys().cloned());
     for (from, to) in &di_config.preferences {
-        names.insert(from.clone());
-        names.insert(to.clone());
+        if is_known_type(from) {
+            names.insert(from.clone());
+        }
+        if is_known_type(to) {
+            names.insert(to.clone());
+        }
+    }
+
+    // PHP's interception.php includes the ORIGINAL (non-Interceptor) class name for every
+    // intercepted class — marked true — in addition to ClassName\Interceptor.
+    // build_argument_type_names excluded intercepted concretes (they only appear as
+    // ClassName\Interceptor in arguments), but we must add them back here so that
+    // interception.php has full key coverage of the real class universe.
+    for spec in interceptors {
+        let target = spec.fqcn.trim_start_matches('\\').to_string();
+        names.insert(target);
     }
 
     let mut sorted: Vec<String> = names.into_iter().collect();
@@ -1683,47 +2246,198 @@ fn build_interception_type_names(
     sorted
 }
 
-fn build_interception_preferences(
+fn build_direct_interception_map(
     interceptors: &[di_resolver::InterceptorSpec],
-    di_config: &DiConfig,
 ) -> HashMap<String, String> {
-    // Direct class → class\Interceptor for every intercepted class.
     let mut map: HashMap<String, String> = interceptors
         .iter()
         .map(|spec| {
-            let target = spec.fqcn.trim_start_matches('\\').to_string();
-            (target.clone(), format!("{target}\\Interceptor"))
+            let fqcn = spec.fqcn.trim_start_matches('\\').to_string();
+            (fqcn.clone(), format!("{fqcn}\\Interceptor"))
         })
         .collect();
 
-    // Virtual types whose DIRECT type is an intercepted concrete also get a mapping.
-    // This ensures that when argument resolution calls get_preference(vt_name), it
-    // correctly resolves to the Interceptor (not the bare VT name).
-    for (vt_name, vt) in &di_config.virtual_types {
-        let direct = vt.type_name.trim_start_matches('\\');
-        if let Some(interceptor) = map.get(direct).cloned() {
-            map.entry(vt_name.clone()).or_insert(interceptor);
-        }
+    // setup:di:compile always emits these interception preferences. They are
+    // required for setup/compiler metadata parity, including the naming
+    // collision case where "...\Code\Generator\Interceptor" is both a real
+    // class and the intercepted alias for "...\Code\Generator".
+    for fqcn in [
+        "Magento\\Framework\\Interception",
+        "Magento\\Framework\\Interception\\Code\\Generator",
+        "Magento\\Setup\\Module\\Di\\Code\\Generator",
+    ] {
+        map.insert(fqcn.to_string(), format!("{fqcn}\\Interceptor"));
     }
 
     map
 }
 
+fn build_interception_preference_overrides(
+    di_config: &DiConfig,
+    direct_interceptors: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    // Step 1 (PHP PreferencesResolving): recursively resolve each preference
+    // value through the existing preference graph.
+    let mut resolved_preferences: HashMap<String, String> = HashMap::new();
+    for (from, to) in &di_config.preferences {
+        let from_norm = normalize_fqcn(from);
+        if di_config.virtual_types.contains_key(&from_norm) {
+            continue;
+        }
+        let resolved = resolve_preference_recursive(to, &di_config.preferences);
+        let substituted = direct_interceptors
+            .get(resolved.as_str())
+            .cloned()
+            .unwrap_or(resolved);
+        resolved_preferences.insert(from_norm, substituted);
+    }
+
+    // Step 2 (PHP InterceptorSubstitution): merge direct class->interceptor map,
+    // then let resolved preferences override those entries.
+    let mut merged = direct_interceptors.clone();
+    for (from, to) in resolved_preferences {
+        merged.insert(from, to);
+    }
+
+    // Step 3 (PHP InterceptionPreferencesResolving): run recursive preference
+    // resolution once more on the merged map.
+    let snapshot = merged.clone();
+    for value in merged.values_mut() {
+        *value = resolve_preference_recursive(value, &snapshot);
+    }
+
+    // Only emit overrides that change/add values compared to raw di.xml prefs.
+    let mut overrides = HashMap::new();
+    for (from, to) in merged {
+        match di_config.preferences.get(from.as_str()) {
+            Some(existing) if normalize_fqcn(existing) == normalize_fqcn(&to) => {}
+            _ => {
+                overrides.insert(from, to);
+            }
+        }
+    }
+
+    overrides
+}
+
+fn resolve_preference_recursive(start: &str, prefs: &HashMap<String, String>) -> String {
+    let mut visited = HashSet::new();
+    let mut current = normalize_fqcn(start);
+    loop {
+        if !visited.insert(current.clone()) {
+            return current;
+        }
+        let Some(next) = prefs.get(current.as_str()) else {
+            return current;
+        };
+        let next_norm = normalize_fqcn(next);
+        if next_norm == current {
+            return current;
+        }
+        current = next_norm;
+    }
+}
+
+fn normalize_fqcn(value: &str) -> String {
+    value.trim().trim_start_matches('\\').to_string()
+}
+
 fn build_interception_registry(
     type_names: &[String],
     interceptors: &[di_resolver::InterceptorSpec],
+    proxies: &[di_resolver::ProxySpec],
+    proxy_deferred: &[ProxyDeferredSpec],
     di_config: &DiConfig,
+    class_map: &HashMap<String, ClassInfo>,
 ) -> HashMap<String, bool> {
-    let intercepted_targets: HashSet<String> = interceptors
+    let mut intercepted_targets: HashSet<String> = interceptors
         .iter()
         .map(|spec| spec.fqcn.trim_start_matches('\\').to_string())
         .collect();
 
+    // Active plugin owners are intercepted even when no InterceptorSpec file is emitted
+    // (e.g. abstract classes/interfaces used only as plugin declaration owners).
+    // Normalize the owner name to strip any leading backslash so it matches type_names.
+    intercepted_targets.extend(di_config.plugins.iter().filter_map(|(owner, plugins)| {
+        if plugins.iter().any(|plugin| !plugin.disabled) {
+            Some(owner.trim_start_matches('\\').to_string())
+        } else {
+            None
+        }
+    }));
+
+    // Virtual types whose target is intercepted are intercepted too. Resolve
+    // transitively to cover virtual type chains.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (vt_name, vt) in &di_config.virtual_types {
+            let direct = vt.type_name.trim_start_matches('\\');
+            if intercepted_targets.contains(direct) && intercepted_targets.insert(vt_name.clone()) {
+                changed = true;
+            }
+        }
+    }
+
+    // Proxy classes of intercepted targets are also marked intercepted.
+    // PHP marks SomeClass\Proxy as true when SomeClass is intercepted because
+    // instantiating the proxy would invoke the interceptor chain.
+    for spec in proxies {
+        let target = spec.target_fqcn.trim_start_matches('\\');
+        if intercepted_targets.contains(target) {
+            intercepted_targets.insert(spec.proxy_fqcn.trim_start_matches('\\').to_string());
+        }
+    }
+    for spec in proxy_deferred {
+        let target = spec.target_fqcn.trim_start_matches('\\');
+        if intercepted_targets.contains(target) {
+            intercepted_targets.insert(spec.proxy_fqcn.trim_start_matches('\\').to_string());
+        }
+    }
+
+    // Propagate intercepted status to all classes that implement an intercepted interface.
+    // PHP marks a class as intercepted whenever any interface it implements (transitively)
+    // has plugins — e.g. Magento\Framework\App\ActionInterface with CustomerNotification
+    // propagates to Magento\Backend\App\Action (which implements ActionInterface).
+    // We perform a fixed-point expansion: collect all classes that implement any currently
+    // intercepted type (via their implements list), then repeat until stable.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (fqcn, info) in class_map {
+            if intercepted_targets.contains(fqcn.as_str()) {
+                continue;
+            }
+            let is_intercepted_via_iface = info
+                .implements
+                .iter()
+                .any(|iface| intercepted_targets.contains(iface.trim_start_matches('\\')));
+            if is_intercepted_via_iface && intercepted_targets.insert(fqcn.clone()) {
+                changed = true;
+            }
+        }
+    }
+
+    // Propagate intercepted status up the class inheritance chain.
+    // PHP marks abstract/concrete ancestors as intercepted when a descendant
+    // class is intercepted (e.g. Magento\Backend\App\Action).
+    let intercepted_snapshot: Vec<String> = intercepted_targets.iter().cloned().collect();
+    for fqcn in intercepted_snapshot {
+        let mut cursor = class_map
+            .get(&fqcn)
+            .and_then(|info| info.extends.as_ref())
+            .map(|s| s.trim_start_matches('\\').to_string());
+        while let Some(parent) = cursor {
+            let next = class_map.get(&parent).and_then(|info| info.extends.clone());
+            intercepted_targets.insert(parent.clone());
+            cursor = next;
+        }
+    }
+
     type_names
         .iter()
         .map(|name| {
-            let intercepted = intercepted_targets.contains(name)
-                || !di_config.get_active_plugins(name).is_empty();
+            let intercepted = intercepted_targets.contains(name);
             (name.clone(), intercepted)
         })
         .collect()
@@ -2627,10 +3341,14 @@ fn class_exists_in_scan_or_composer(
         .is_some()
 }
 
-fn merge_plugins_for_interception(di_configs: &[DiConfig]) -> HashMap<String, Vec<Plugin>> {
+fn merge_plugins_for_interception(
+    global_configs: &[DiConfig],
+    area_configs: &[DiConfig],
+) -> HashMap<String, Vec<Plugin>> {
     let mut merged: HashMap<String, HashMap<String, Plugin>> = HashMap::new();
 
-    for cfg in di_configs {
+    // Phase 1: global di.xml files — later wins (including disabled overrides).
+    for cfg in global_configs {
         for (owner, plugins) in &cfg.plugins {
             let owner_plugins = merged.entry(owner.clone()).or_default();
             for plugin in plugins {
@@ -2639,13 +3357,42 @@ fn merge_plugins_for_interception(di_configs: &[DiConfig]) -> HashMap<String, Ve
                         owner_plugins.insert(plugin.name.clone(), plugin.clone());
                     }
                     Some(existing) => {
-                        if existing.disabled && !plugin.disabled {
-                            // Any active declaration across areas should keep interception active.
-                            *existing = plugin.clone();
-                        } else if !existing.disabled && plugin.disabled {
-                            // Keep existing active plugin instead of disabling globally.
+                        if plugin.type_name.is_empty() {
+                            // Disabled-only override: preserve type_name, update disabled flag.
+                            existing.disabled = plugin.disabled;
+                            if plugin.sort_order != 0 {
+                                existing.sort_order = plugin.sort_order;
+                            }
                         } else {
-                            // Same active/disabled state: later config wins.
+                            let was_disabled = existing.disabled;
+                            *existing = plugin.clone();
+                            // PHP sticky-disabled: once disabled, stays disabled.
+                            if was_disabled {
+                                existing.disabled = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 2: area-specific di.xml files — active plugins can add/re-enable; disables ignored.
+    for cfg in area_configs {
+        for (owner, plugins) in &cfg.plugins {
+            let owner_plugins = merged.entry(owner.clone()).or_default();
+            for plugin in plugins {
+                if plugin.disabled {
+                    // Area-specific disables do not remove globally active plugins.
+                    continue;
+                }
+                match owner_plugins.get_mut(&plugin.name) {
+                    None => {
+                        owner_plugins.insert(plugin.name.clone(), plugin.clone());
+                    }
+                    Some(existing) => {
+                        if existing.disabled {
+                            // Plugin disabled globally but active in this area — re-enable.
                             *existing = plugin.clone();
                         }
                     }
@@ -3174,6 +3921,94 @@ fn normalize_reflected_type_hint_for_proxy(
     format!("{}{}", nullable, normalize_single(core))
 }
 
+fn canonicalize_instance_reference_case(
+    args_map: &mut HashMap<String, Vec<di_resolver::ResolvedArg>>,
+    class_map: &HashMap<String, ClassInfo>,
+) {
+    let mut case_index: HashMap<String, (String, u8)> = HashMap::with_capacity(class_map.len());
+    for (fqcn, info) in class_map {
+        let key = fqcn.to_ascii_lowercase();
+        // Prefer real source classes over synthetic/generated entries when
+        // casing variants collide on the same lowercase FQCN.
+        let rank = if info.path.exists() { 0 } else { 1 };
+        match case_index.get_mut(&key) {
+            None => {
+                case_index.insert(key, (fqcn.clone(), rank));
+            }
+            Some((current, current_rank)) => {
+                if rank < *current_rank || (rank == *current_rank && fqcn < current) {
+                    *current = fqcn.clone();
+                    *current_rank = rank;
+                }
+            }
+        }
+    }
+    let case_index: HashMap<String, String> =
+        case_index.into_iter().map(|(k, (v, _))| (k, v)).collect();
+
+    for args in args_map.values_mut() {
+        for arg in args.iter_mut() {
+            canonicalize_resolved_arg_value_case(&mut arg.resolved, &case_index);
+        }
+    }
+}
+
+fn canonicalize_resolved_arg_value_case(
+    value: &mut di_resolver::ResolvedArgValue,
+    case_index: &HashMap<String, String>,
+) {
+    use di_resolver::{ResolvedArgValue, ResolvedArrayValue, ResolvedScalar};
+
+    match value {
+        ResolvedArgValue::SharedInstance(fqcn) | ResolvedArgValue::NonSharedInstance(fqcn) => {
+            canonicalize_fqcn_case(fqcn, case_index);
+        }
+        ResolvedArgValue::Array(items) => {
+            for item in items.iter_mut() {
+                canonicalize_resolved_arg_value_case(&mut item.resolved, case_index);
+            }
+        }
+        ResolvedArgValue::PlainArray(items) => {
+            for item in items.iter_mut() {
+                if item.name == "instance" {
+                    if let ResolvedArrayValue::Scalar(ResolvedScalar::String(v)) = &mut item.value {
+                        canonicalize_fqcn_case(v, case_index);
+                    }
+                }
+                if let ResolvedArrayValue::Array(children) = &mut item.value {
+                    canonicalize_plain_array_case(children, case_index);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_plain_array_case(
+    items: &mut Vec<di_resolver::ResolvedArrayItem>,
+    case_index: &HashMap<String, String>,
+) {
+    use di_resolver::{ResolvedArrayValue, ResolvedScalar};
+
+    for item in items.iter_mut() {
+        if item.name == "instance" {
+            if let ResolvedArrayValue::Scalar(ResolvedScalar::String(v)) = &mut item.value {
+                canonicalize_fqcn_case(v, case_index);
+            }
+        }
+        if let ResolvedArrayValue::Array(children) = &mut item.value {
+            canonicalize_plain_array_case(children, case_index);
+        }
+    }
+}
+
+fn canonicalize_fqcn_case(value: &mut String, case_index: &HashMap<String, String>) {
+    let lookup = value.trim_start_matches('\\').to_ascii_lowercase();
+    if let Some(canonical) = case_index.get(&lookup) {
+        *value = canonical.clone();
+    }
+}
+
 fn plugin_method_to_intercepted(method: &str) -> Option<String> {
     if let Some(rest) = method.strip_prefix("before") {
         return lcfirst_nonempty(rest);
@@ -3492,6 +4327,50 @@ fn find_extension_attributes_files(magento_root: &Path, module_paths: &[PathBuf]
     files
 }
 
+/// TKT-054: Bootstrap PHP extension/built-in constants into the const_map.
+///
+/// PHP extension constants like `MCRYPT_BLOWFISH` or `MCRYPT_MODE_ECB` are
+/// never defined in any Magento PHP source file, so they never enter the
+/// source-scan const_map and get emitted verbatim (causing metadata mismatches).
+///
+/// This function runs `php -r` once at startup with `get_defined_constants(true)`
+/// and collects all scalar constants as a baseline. Source-scan constants added
+/// later override these builtins on name collision.
+fn bootstrap_php_constants(php_bin: &str, magento_root: &Path) -> HashMap<String, String> {
+    // Include vendor/autoload.php so that Composer-autoloaded constants (e.g. MCRYPT_BLOWFISH
+    // defined by phpseclib/mcrypt_compat) are present before we call get_defined_constants().
+    let autoloader = magento_root.join("vendor/autoload.php");
+    let autoload_snippet = if autoloader.exists() {
+        format!(
+            "@require '{}';",
+            autoloader.to_string_lossy().replace('\'', "\\'")
+        )
+    } else {
+        String::new()
+    };
+    let collect = concat!(
+        "$c=get_defined_constants(true);",
+        "$o=[];",
+        "foreach($c as $items){",
+        "  foreach($items as $k=>$v){",
+        "    if(is_scalar($v)) $o[$k]=(string)$v;",
+        "  }",
+        "}",
+        "echo json_encode($o);"
+    );
+    let script = format!("{autoload_snippet}{collect}");
+    let output = std::process::Command::new(php_bin)
+        .args(["-r", &script])
+        .output();
+    let Ok(out) = output else {
+        return HashMap::new();
+    };
+    if !out.status.success() {
+        return HashMap::new();
+    }
+    serde_json::from_slice(&out.stdout).unwrap_or_default()
+}
+
 fn load_module_order_from_config_php(magento_root: &Path) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     let config_php = magento_root.join("app/etc/config.php");
@@ -3529,7 +4408,6 @@ fn load_module_order_from_config_php(magento_root: &Path) -> HashMap<String, usi
         if module.is_empty() || out.contains_key(module) {
             continue;
         }
-        // Only include enabled modules (value != 0).
         // Config line format: 'ModuleName' => 1, or 'ModuleName' => 0,
         let after_key = &rest[end_rel + quote_ch.len_utf8()..];
         let enabled = after_key
@@ -3537,11 +4415,17 @@ fn load_module_order_from_config_php(magento_root: &Path) -> HashMap<String, usi
             .nth(1)
             .map(|v| v.trim().trim_end_matches([',', ' ', '\n']).trim() != "0")
             .unwrap_or(true);
+        // TKT-048: Always increment idx for every module (enabled or disabled) so
+        // that positional indices reflect true config.php insertion order.
+        // Only enabled modules are inserted into the output map, but their index
+        // must account for preceding disabled entries so that when two modules have
+        // equal DI priority the module appearing later in config.php wins.
+        let current_idx = idx;
+        idx += 1;
         if !enabled {
             continue;
         }
-        out.insert(module.to_string(), idx);
-        idx += 1;
+        out.insert(module.to_string(), current_idx);
     }
 
     out
@@ -3562,29 +4446,73 @@ fn module_root_from_di_xml(di_xml: &Path) -> Option<&Path> {
     }
 }
 
+/// Vendor packages that must always be excluded from DI config regardless of
+/// whether they have a `registration.php`. These are test-only or dev-only
+/// frameworks that ship a di.xml but must never contribute to production DI.
+///
+/// TKT-051: explicit denylist prevents accidental inclusion of testing frameworks
+/// that may have a `registration.php` but are not production Magento modules.
+const EXCLUDED_PACKAGES: &[&str] = &["magento2-functional-testing-framework", "mftf"];
+
 /// Filter a list of di.xml paths, dropping files from disabled modules.
 ///
 /// A di.xml is dropped when its module can be identified via `etc/module.xml`
 /// AND that module name is absent from `enabled_modules` (which only contains
 /// enabled modules from `app/etc/config.php`).
 ///
-/// Files whose module cannot be determined (e.g. `app/etc/di.xml`) are kept.
+/// For vendor packages that have neither `etc/module.xml` nor `registration.php`,
+/// the file is dropped — these are utility/testing packages (e.g. functional-testing-framework)
+/// that are not Magento modules and should not contribute to production DI config.
+///
+/// Files at `app/etc/di.xml` (no vendor module root) are always kept.
 fn filter_enabled_di_xml(
     files: Vec<PathBuf>,
     enabled_modules: &HashMap<String, usize>,
+    magento_root: &Path,
 ) -> Vec<PathBuf> {
     files
         .into_iter()
         .filter(|path| {
+            // TKT-051: Always exclude test-only packages by path denylist.
+            let path_str = path.to_string_lossy();
+            if EXCLUDED_PACKAGES.iter().any(|pkg| path_str.contains(pkg)) {
+                return false;
+            }
+
             let Some(module_root) = module_root_from_di_xml(path) else {
-                return true; // can't determine module → keep
+                return true; // can't determine module root → keep (e.g. app/etc/di.xml)
             };
-            let Some(name) = read_module_name_from_module_xml(module_root) else {
-                return true; // no module.xml → keep (e.g. framework library)
-            };
-            enabled_modules.contains_key(&name)
+            // Check if this is a vendor package with module identity.
+            let is_vendor = is_vendor_package_root(module_root, magento_root);
+            if let Some(name) = read_module_name_from_module_xml(module_root) {
+                // Has module.xml — enabled check applies
+                return enabled_modules.contains_key(&name);
+            }
+            if is_vendor {
+                // Vendor package with no module.xml — check for registration.php.
+                // Packages without registration.php are not Magento modules (e.g. testing frameworks).
+                return module_root.join("registration.php").exists();
+            }
+            true // non-vendor path with no module.xml → keep
         })
         .collect()
+}
+
+fn is_vendor_package_root(module_root: &Path, magento_root: &Path) -> bool {
+    // Expected shape: <magento-root>/vendor/<vendor>/<package>
+    if let Ok(rel) = module_root.strip_prefix(magento_root) {
+        let mut comps = rel.components();
+        return comps.next().and_then(|c| c.as_os_str().to_str()) == Some("vendor")
+            && comps.next().is_some()
+            && comps.next().is_some();
+    }
+
+    // Fallback for unexpected path roots.
+    let parts: Vec<&str> = module_root
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    parts.windows(3).any(|w| w[0] == "vendor")
 }
 
 fn read_module_name_from_module_xml(module_root: &Path) -> Option<String> {
@@ -4028,11 +4956,205 @@ fn maybe_push_proxy_target(candidate: &str, out: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
+        build_argument_type_names, build_interception_registry, build_interception_type_names,
         infer_comparable_fix_categories, render_comparable_metadata_report_text,
         ComparableMetadataReport, ComparableReportSummary, ComparableTypeMismatchSample,
         ComparableValueMismatchSample,
     };
-    use std::collections::BTreeMap;
+    use di_xml_reader::{DiConfig, VirtualType};
+    use php_extractor::types::{ClassInfo, ClassKind};
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::PathBuf;
+
+    fn class_info(fqcn: &str, extends: Option<&str>, is_abstract: bool) -> ClassInfo {
+        let (namespace, name) = fqcn
+            .rsplit_once('\\')
+            .map(|(ns, class)| (ns.to_string(), class.to_string()))
+            .unwrap_or_else(|| (String::new(), fqcn.to_string()));
+        ClassInfo {
+            path: PathBuf::from("__test__.php"),
+            namespace,
+            name,
+            fqcn: fqcn.to_string(),
+            kind: if is_abstract {
+                ClassKind::AbstractClass
+            } else {
+                ClassKind::Class
+            },
+            extends: extends.map(str::to_string),
+            implements: vec![],
+            constructor: None,
+            is_abstract,
+            is_final: false,
+            public_methods: vec![],
+        }
+    }
+
+    #[test]
+    fn argument_type_names_include_vt_when_direct_type_is_intercepted() {
+        let mut base_class_map = HashMap::new();
+        base_class_map.insert(
+            "Vendor\\Payment\\Adapter".to_string(),
+            class_info("Vendor\\Payment\\Adapter", None, false),
+        );
+        let generated_class_map: HashMap<String, ClassInfo> = HashMap::new();
+
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "VendorPaymentFacade".to_string(),
+            VirtualType {
+                name: "VendorPaymentFacade".to_string(),
+                type_name: "Vendor\\Payment\\Adapter".to_string(),
+            },
+        );
+        di_config
+            .type_configs
+            .entry("VendorPaymentFacade".to_string())
+            .or_default();
+
+        let interceptors = vec![di_resolver::InterceptorSpec {
+            fqcn: "Vendor\\Payment\\Adapter".to_string(),
+            plugins: vec![],
+            public_methods: vec![],
+        }];
+        let factories: Vec<di_resolver::FactorySpec> = Vec::new();
+        let proxies: Vec<di_resolver::ProxySpec> = Vec::new();
+        let search_results: Vec<super::SearchResultsSpec> = Vec::new();
+        let proxy_deferred: Vec<super::ProxyDeferredSpec> = Vec::new();
+        let extension_specs: Vec<code_generator::ExtensionSpec> = Vec::new();
+
+        let names = build_argument_type_names(
+            &base_class_map,
+            &generated_class_map,
+            &di_config,
+            &interceptors,
+            &factories,
+            &proxies,
+            &search_results,
+            &proxy_deferred,
+            &extension_specs,
+        );
+
+        assert!(names.contains(&"VendorPaymentFacade".to_string()));
+    }
+
+    #[test]
+    fn interception_type_names_filter_unknown_preference_types() {
+        let mut base_class_map = HashMap::new();
+        base_class_map.insert(
+            "Known\\Concrete".to_string(),
+            class_info("Known\\Concrete", None, false),
+        );
+        let generated_class_map: HashMap<String, ClassInfo> = HashMap::new();
+
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "Known\\Virtual".to_string(),
+            VirtualType {
+                name: "Known\\Virtual".to_string(),
+                type_name: "Known\\Concrete".to_string(),
+            },
+        );
+        di_config.preferences.insert(
+            "Unknown\\Interface".to_string(),
+            "Unknown\\Implementation".to_string(),
+        );
+        di_config
+            .preferences
+            .insert("Known\\Virtual".to_string(), "Unknown\\Alias".to_string());
+        di_config.preferences.insert(
+            "Unknown\\External".to_string(),
+            "Known\\Concrete".to_string(),
+        );
+
+        let interceptors: Vec<di_resolver::InterceptorSpec> = Vec::new();
+        let factories: Vec<di_resolver::FactorySpec> = Vec::new();
+        let proxies: Vec<di_resolver::ProxySpec> = Vec::new();
+        let search_results: Vec<super::SearchResultsSpec> = Vec::new();
+        let proxy_deferred: Vec<super::ProxyDeferredSpec> = Vec::new();
+        let extension_specs: Vec<code_generator::ExtensionSpec> = Vec::new();
+
+        let names = build_interception_type_names(
+            &base_class_map,
+            &generated_class_map,
+            &di_config,
+            &interceptors,
+            &factories,
+            &proxies,
+            &search_results,
+            &proxy_deferred,
+            &extension_specs,
+        );
+
+        assert!(names.contains(&"Known\\Concrete".to_string()));
+        assert!(names.contains(&"Known\\Virtual".to_string()));
+        assert!(!names.contains(&"Unknown\\Interface".to_string()));
+        assert!(!names.contains(&"Unknown\\Implementation".to_string()));
+        assert!(!names.contains(&"Unknown\\Alias".to_string()));
+        assert!(!names.contains(&"Unknown\\External".to_string()));
+    }
+
+    #[test]
+    fn interception_registry_marks_virtual_types_and_ancestors_true() {
+        let mut class_map = HashMap::new();
+        class_map.insert(
+            "Vendor\\AbstractParent".to_string(),
+            class_info("Vendor\\AbstractParent", None, true),
+        );
+        class_map.insert(
+            "Vendor\\ConcreteChild".to_string(),
+            class_info(
+                "Vendor\\ConcreteChild",
+                Some("Vendor\\AbstractParent"),
+                false,
+            ),
+        );
+
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "Vendor\\Facade".to_string(),
+            VirtualType {
+                name: "Vendor\\Facade".to_string(),
+                type_name: "Vendor\\ConcreteChild".to_string(),
+            },
+        );
+        di_config.virtual_types.insert(
+            "Vendor\\FacadeAlias".to_string(),
+            VirtualType {
+                name: "Vendor\\FacadeAlias".to_string(),
+                type_name: "Vendor\\Facade".to_string(),
+            },
+        );
+
+        let interceptors = vec![di_resolver::InterceptorSpec {
+            fqcn: "Vendor\\ConcreteChild".to_string(),
+            plugins: vec![],
+            public_methods: vec![],
+        }];
+        let type_names = vec![
+            "Vendor\\AbstractParent".to_string(),
+            "Vendor\\ConcreteChild".to_string(),
+            "Vendor\\Facade".to_string(),
+            "Vendor\\FacadeAlias".to_string(),
+            "Vendor\\Unrelated".to_string(),
+        ];
+
+        let proxies: Vec<di_resolver::ProxySpec> = Vec::new();
+        let proxy_deferred: Vec<super::ProxyDeferredSpec> = Vec::new();
+        let map = build_interception_registry(
+            &type_names,
+            &interceptors,
+            &proxies,
+            &proxy_deferred,
+            &di_config,
+            &class_map,
+        );
+        assert_eq!(map.get("Vendor\\AbstractParent"), Some(&true));
+        assert_eq!(map.get("Vendor\\ConcreteChild"), Some(&true));
+        assert_eq!(map.get("Vendor\\Facade"), Some(&true));
+        assert_eq!(map.get("Vendor\\FacadeAlias"), Some(&true));
+        assert_eq!(map.get("Vendor\\Unrelated"), Some(&false));
+    }
 
     #[test]
     fn infer_categories_identifies_common_parity_buckets() {

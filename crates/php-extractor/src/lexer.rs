@@ -201,7 +201,7 @@ impl<'a> Scanner<'a> {
             return false;
         }
         let w = self.read_word();
-        let eq = w == keyword;
+        let eq = w.eq_ignore_ascii_case(keyword);
         self.pos = saved;
         eq
     }
@@ -922,7 +922,7 @@ impl<'a> Scanner<'a> {
                         is_readonly = true;
                     }
                 }
-                b"readonly" => {
+                word if word.eq_ignore_ascii_case(b"readonly") => {
                     is_readonly = true;
                 }
                 _ => self.pos = saved,
@@ -960,7 +960,7 @@ impl<'a> Scanner<'a> {
         let name = std::str::from_utf8(name_bytes).unwrap_or("").to_string();
 
         self.skip_noise();
-        let mut is_optional = is_nullable;
+        let mut is_optional = false;
         let mut default_value = None;
         if self.peek() == b'=' {
             is_optional = true;
