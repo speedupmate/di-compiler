@@ -188,6 +188,7 @@ mod tests {
                     name: "dep".to_string(),
                     value: "Foo\\Heavy\\Proxy".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );
@@ -263,7 +264,9 @@ mod tests {
                         name: "dep".to_string(),
                         value: "Foo\\Heavy\\Proxy".to_string(),
                         shared: None,
+                        sort_order: 0,
                     }],
+                    sort_order: 0,
                 }],
             },
         );
@@ -324,6 +327,7 @@ mod tests {
                     name: "dep".to_string(),
                     value: "Foo\\Target\\Proxy".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );
@@ -343,6 +347,7 @@ mod tests {
                     name: "dep".to_string(),
                     value: "Psr\\Log\\LoggerInterface\\Proxy".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );

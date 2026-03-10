@@ -931,10 +931,6 @@ impl<'a> Scanner<'a> {
         let _ = is_readonly;
 
         let type_hint = self.try_read_type_hint()?;
-        let is_nullable = type_hint
-            .as_deref()
-            .map(|t| t.starts_with('?'))
-            .unwrap_or(false);
 
         self.skip_noise();
         if type_hint.is_some() && self.peek() == b'&' && self.at(1) != b'$' && self.at(1) != b'&' {

@@ -2135,7 +2135,7 @@ fn merged_class_map(
 
 fn build_argument_type_names(
     base_class_map: &HashMap<String, ClassInfo>,
-    generated_class_map: &HashMap<String, ClassInfo>,
+    _generated_class_map: &HashMap<String, ClassInfo>,
     di_config: &DiConfig,
     interceptors: &[di_resolver::InterceptorSpec],
     factories: &[di_resolver::FactorySpec],

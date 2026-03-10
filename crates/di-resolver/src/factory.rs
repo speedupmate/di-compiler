@@ -248,6 +248,7 @@ mod tests {
                     name: "factory".to_string(),
                     value: "Foo\\Baz\\WidgetFactory".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );
@@ -275,6 +276,7 @@ mod tests {
                     name: "factory".to_string(),
                     value: "Foo\\Baz\\WidgetFactory".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );
@@ -295,6 +297,7 @@ mod tests {
                     name: "factory".to_string(),
                     value: "Foo\\One\\WidgetFactory".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );
@@ -308,6 +311,7 @@ mod tests {
                     name: "factory".to_string(),
                     value: "Foo\\Two\\WidgetFactory".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );
@@ -344,6 +348,7 @@ mod tests {
                     name: "factory".to_string(),
                     value: "Foo\\Baz\\WidgetFactory".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );

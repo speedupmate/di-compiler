@@ -1170,6 +1170,7 @@ mod tests {
                 arguments: vec![Argument::String {
                     name: "defaultPreprocessor".to_string(),
                     value: "Magento\\Framework\\View\\Asset\\PreProcessor\\Passthrough".to_string(),
+                    sort_order: 0,
                 }],
             },
         );
@@ -1182,7 +1183,9 @@ mod tests {
                     items: vec![Argument::String {
                         name: "less".to_string(),
                         value: "custom".to_string(),
+                        sort_order: 0,
                     }],
+                    sort_order: 0,
                 }],
             },
         );
@@ -1221,6 +1224,7 @@ mod tests {
                 arguments: vec![Argument::String {
                     name: "label".to_string(),
                     value: "Hello World".to_string(),
+                    sort_order: 0,
                 }],
             },
         );
@@ -1310,6 +1314,7 @@ mod tests {
                     name: "formBlockType".to_string(),
                     value: "Magento\\Payment\\Block\\Form".to_string(),
                     shared: None,
+                    sort_order: 0,
                 }],
             },
         );
@@ -1359,7 +1364,9 @@ mod tests {
                         name: "csrf_validator".to_string(),
                         value: "CsrfRequestValidator".to_string(),
                         shared: None,
+                        sort_order: 0,
                     }],
+                    sort_order: 0,
                 }],
             },
         );
@@ -1411,7 +1418,9 @@ mod tests {
                         name: "csrf_validator".to_string(),
                         value: "CsrfRequestValidator".to_string(),
                         shared: None,
+                        sort_order: 0,
                     }],
+                    sort_order: 0,
                 }],
             },
         );
@@ -1508,6 +1517,7 @@ mod tests {
                 arguments: vec![Argument::Init {
                     name: "mode".to_string(),
                     value: "App\\State::MODE".to_string(),
+                    sort_order: 0,
                 }],
             },
         );
@@ -1547,13 +1557,16 @@ mod tests {
                             name: "core".to_string(),
                             value: "Vendor\\Core\\Command".to_string(),
                             shared: None,
+                            sort_order: 0,
                         },
                         Argument::Object {
                             name: "override_me".to_string(),
                             value: "Vendor\\Legacy\\Command".to_string(),
                             shared: None,
+                            sort_order: 0,
                         },
                     ],
+                    sort_order: 0,
                 }],
             },
         );
@@ -1568,13 +1581,16 @@ mod tests {
                             name: "local".to_string(),
                             value: "Vendor\\Local\\Command".to_string(),
                             shared: None,
+                            sort_order: 0,
                         },
                         Argument::Object {
                             name: "override_me".to_string(),
                             value: "Vendor\\New\\Command".to_string(),
                             shared: None,
+                            sort_order: 0,
                         },
                     ],
+                    sort_order: 0,
                 }],
             },
         );
@@ -1645,12 +1661,15 @@ mod tests {
                                         "Magento\\Config\\App\\Config\\Source\\ModularConfigSource"
                                             .to_string(),
                                     shared: None,
+                                    sort_order: 0,
                                 },
                                 Argument::String {
                                     name: "sortOrder".to_string(),
                                     value: "10".to_string(),
+                                    sort_order: 0,
                                 },
                             ],
+                            sort_order: 0,
                         },
                         Argument::Array {
                             name: "dynamic".to_string(),
@@ -1661,14 +1680,18 @@ mod tests {
                                         "Magento\\Config\\App\\Config\\Source\\RuntimeConfigSource"
                                             .to_string(),
                                     shared: None,
+                                    sort_order: 0,
                                 },
                                 Argument::String {
                                     name: "sortOrder".to_string(),
                                     value: "100".to_string(),
+                                    sort_order: 0,
                                 },
                             ],
+                            sort_order: 0,
                         },
                     ],
+                    sort_order: 0,
                 }],
             },
         );
@@ -1686,13 +1709,17 @@ mod tests {
                                 value: "Magento\\Config\\App\\Config\\Source\\InitialSnapshotConfigSource"
                                     .to_string(),
                                 shared: None,
+                                sort_order: 0,
                             },
                             Argument::String {
                                 name: "sortOrder".to_string(),
                                 value: "1000".to_string(),
+                                sort_order: 0,
                             },
                         ],
+                        sort_order: 0,
                     }],
+                    sort_order: 0,
                 }],
             },
         );
