@@ -12,6 +12,7 @@
 //!   Array             → `['_vac_' => [...]]`
 //!   Global arg ref    → `['_a_'   => 'name', '_d_' => default]`
 
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use php_extractor::{types::ClassKind, ClassInfo};
@@ -20,6 +21,132 @@ use crate::graph::{
     ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
 };
 use di_xml_reader::{Argument, DiConfig};
+
+/// For each type in `type_names`, compute which di.xml config keys are consulted
+/// during argument resolution, then build two reverse indexes:
+///
+/// - `hierarchy_rev[K]` → type names that access K in type_configs or virtual_types
+/// - `pref_rev[K]`      → type names that have K as a constructor type hint
+///
+/// Used by OPT-DELTA to compute the per-area affected set without running the full
+/// resolver 25K × 7 times.
+pub fn build_dependency_reverse_index(
+    type_names: &[String],
+    class_map: &FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> (
+    FxHashMap<String, Vec<String>>,
+    FxHashMap<String, Vec<String>>,
+) {
+    // Compute per-type (key → owner) pairs in parallel, then merge serially.
+    // All inputs are shared references (Sync) so par_iter is safe.
+    let pairs: Vec<(Vec<(String, String)>, Vec<(String, String)>)> = type_names
+        .par_iter()
+        .map(|type_name| {
+            let owner = normalize(type_name);
+            let (h_keys, p_keys) = config_dependency_keys_for_type(&owner, class_map, di_config);
+            let h_pairs: Vec<(String, String)> =
+                h_keys.into_iter().map(|k| (k, owner.clone())).collect();
+            let p_pairs: Vec<(String, String)> =
+                p_keys.into_iter().map(|k| (k, owner.clone())).collect();
+            (h_pairs, p_pairs)
+        })
+        .collect();
+
+    let mut hierarchy_rev: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    let mut pref_rev: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    for (h_pairs, p_pairs) in pairs {
+        for (key, owner) in h_pairs {
+            hierarchy_rev.entry(key).or_default().push(owner);
+        }
+        for (key, owner) in p_pairs {
+            pref_rev.entry(key).or_default().push(owner);
+        }
+    }
+
+    (hierarchy_rev, pref_rev)
+}
+
+/// Compute the set of di.xml config keys a type accesses during argument resolution.
+/// Mirrors the hierarchy walk in `merged_di_arguments_for_type_name` but collects keys
+/// instead of building args.  Also collects constructor type hints for preference deps.
+fn config_dependency_keys_for_type(
+    type_name: &str,
+    class_map: &FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> (FxHashSet<String>, FxHashSet<String>) {
+    let mut hierarchy_keys: FxHashSet<String> = FxHashSet::default();
+    let mut pref_keys: FxHashSet<String> = FxHashSet::default();
+
+    // Walk the VT chain; every step accesses virtual_types[entry].
+    let vchain = virtual_type_chain(type_name, di_config);
+    for entry in &vchain {
+        hierarchy_keys.insert(entry.clone());
+    }
+    let concrete = normalize(vchain.last().unwrap_or(&type_name.to_string()));
+
+    // Extends chain (root-ancestor-first), same as merged_di_arguments_for_type_name.
+    let mut extends_chain: Vec<String> = Vec::new();
+    {
+        let mut cursor = concrete.clone();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        while !cursor.is_empty() && seen.insert(cursor.clone()) {
+            extends_chain.push(cursor.clone());
+            match class_map.get(&cursor).and_then(|i| i.extends.as_ref()) {
+                Some(parent) => cursor = normalize(parent),
+                None => break,
+            }
+        }
+        extends_chain.reverse();
+    }
+
+    // Build class_hierarchy with new interfaces inserted before each class.
+    let mut class_hierarchy: Vec<String> = Vec::new();
+    {
+        let mut parent_implements: FxHashSet<String> = FxHashSet::default();
+        for class_name in &extends_chain {
+            if let Some(info) = class_map.get(class_name) {
+                let class_implements: FxHashSet<String> =
+                    info.implements.iter().map(|i| normalize(i)).collect();
+                let mut new_ifaces: Vec<String> = class_implements
+                    .difference(&parent_implements)
+                    .cloned()
+                    .collect();
+                new_ifaces.sort();
+                class_hierarchy.extend(new_ifaces);
+                parent_implements = class_implements;
+            }
+            class_hierarchy.push(class_name.clone());
+        }
+    }
+    if normalize(type_name) != concrete {
+        class_hierarchy.push(normalize(type_name));
+    }
+
+    // For each hierarchy entry, walk its VT chain and record all entries as dependency keys.
+    for ancestor in &class_hierarchy {
+        for entry in virtual_type_chain(ancestor, di_config) {
+            hierarchy_keys.insert(entry);
+        }
+    }
+
+    // Collect preference keys: constructor type hints (conservatively includes optional params).
+    if let Some(info) = class_info_with_inherited_constructor(&concrete, class_map) {
+        if let Some(ctor) = &info.constructor {
+            for param in &ctor.params {
+                if let Some(type_hint) = param
+                    .type_hint
+                    .as_deref()
+                    .and_then(|h| first_non_null_class_type_hint_arm(h, &info.namespace))
+                {
+                    pref_keys.insert(type_hint);
+                }
+            }
+        }
+    }
+
+    (hierarchy_keys, pref_keys)
+}
 
 /// Resolve constructor arguments for all classes.
 ///
@@ -56,47 +183,52 @@ pub fn resolve_all_arguments_for_named_types(
     di_config: &DiConfig,
     const_map: &FxHashMap<String, String>,
 ) -> FxHashMap<String, Vec<ResolvedArg>> {
-    let mut result = FxHashMap::default();
-    for type_name in type_names {
-        let name = type_name.trim_start_matches('\\');
-        let kind = class_map.get(name).map(|c| c.kind.clone());
-        // PHP never emits argument entries for pure interfaces or abstract classes.
-        if matches!(
-            kind,
-            Some(ClassKind::Interface) | Some(ClassKind::AbstractClass)
-        ) {
-            continue;
-        }
-
-        // TKT-052: For types not found by the PHP scanner but present in di.xml <type>
-        // entries, PHP still emits NULL (empty args). Replicate that behaviour here.
-        // Virtual types are not in class_map but have their own resolution path below.
-        if !class_map.contains_key(name) && !di_config.virtual_types.contains_key(name) {
-            let looks_like_interface = name.ends_with("Interface");
-            let is_generated = name.ends_with("Interceptor")
-                || name.ends_with("Factory")
-                || name.ends_with("Proxy");
-            if !looks_like_interface && !is_generated && di_config.type_configs.contains_key(name) {
-                result.insert(type_name.clone(), vec![]);
+    // All inputs are shared references (Sync) — safe to par_iter across the Rayon pool.
+    type_names
+        .par_iter()
+        .filter_map(|type_name| {
+            let name = type_name.trim_start_matches('\\');
+            let kind = class_map.get(name).map(|c| c.kind.clone());
+            // PHP never emits argument entries for pure interfaces or abstract classes.
+            if matches!(
+                kind,
+                Some(ClassKind::Interface) | Some(ClassKind::AbstractClass)
+            ) {
+                return None;
             }
-            continue;
-        }
 
-        let resolved = resolve_for_type_name(type_name, class_map, di_config, const_map);
-        if resolved.is_empty() {
-            // PHP emits NULL for source concrete classes, traits, AND virtual types with
-            // no resolved constructor args. It does NOT emit NULL for generated artifacts
-            // (interceptors, factories, proxies) or unknown non-VT types.
-            let is_virtual = di_config.virtual_types.contains_key(name);
-            let is_source_classlike = matches!(kind, Some(ClassKind::Class | ClassKind::Trait))
-                && base_class_fqcns.contains(name);
-            if !is_source_classlike && !is_virtual {
-                continue;
+            // TKT-052: For types not found by the PHP scanner but present in di.xml <type>
+            // entries, PHP still emits NULL (empty args). Replicate that behaviour here.
+            // Virtual types are not in class_map but have their own resolution path below.
+            if !class_map.contains_key(name) && !di_config.virtual_types.contains_key(name) {
+                let looks_like_interface = name.ends_with("Interface");
+                let is_generated = name.ends_with("Interceptor")
+                    || name.ends_with("Factory")
+                    || name.ends_with("Proxy");
+                if !looks_like_interface
+                    && !is_generated
+                    && di_config.type_configs.contains_key(name)
+                {
+                    return Some((type_name.clone(), vec![]));
+                }
+                return None;
             }
-        }
-        result.insert(type_name.clone(), resolved);
-    }
-    result
+
+            let resolved = resolve_for_type_name(type_name, class_map, di_config, const_map);
+            if resolved.is_empty() {
+                // PHP emits NULL for source concrete classes, traits, AND virtual types with
+                // no resolved constructor args. It does NOT emit NULL for generated artifacts
+                // (interceptors, factories, proxies) or unknown non-VT types.
+                let is_virtual = di_config.virtual_types.contains_key(name);
+                let is_source_classlike = matches!(kind, Some(ClassKind::Class | ClassKind::Trait))
+                    && base_class_fqcns.contains(name);
+                if !is_source_classlike && !is_virtual {
+                    return None;
+                }
+            }
+            Some((type_name.clone(), resolved))
+        })
+        .collect()
 }
 
 /// Resolve constructor args for a single class.

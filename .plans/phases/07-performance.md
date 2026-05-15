@@ -36,8 +36,15 @@ Expected hot paths: string allocation in lexer, di.xml parse, file I/O.
 
 TKT-025 through TKT-026
 
-## Current Snapshot (2026-03-06)
+## Current Snapshot (2026-05-15)
 
-- Baseline phase timers and major hot-path reductions have been implemented in CLI.
-- Ongoing reflection/discovery hardening work is tracked in Phase 09:
+Warm-cache target of < 5s achieved. Incremental re-run (FP-SCOPE-3 skip) consistently ~1.29s.
+
+- First run (cold fingerprint): `~2.2s` total
+- Repeat run (Phase 7 skipped): `~1.29s` total
+- Phase 7 (first run): `~0.85s`
+- Phase 7 (warm FP hit): `~6ms`
+
+All Phase 7 optimizations are complete and tracked in Phase 09:
   - [09-performance-hardening](09-performance-hardening.md)
+  - [analyzis/phase-7-performance.md](../analyzis/phase-7-performance.md)

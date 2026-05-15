@@ -25,6 +25,11 @@ Correctness first. Speed second. Never silent failures.
 - Output must be byte-for-byte identical (or semantically equivalent) to PHP compiler output
 - Validated by diff harness before any release (TKT-023)
 - No PHP runtime dependency at compile time (PHP fallback is opt-in, not required)
+- Rust must not accept constructor signatures that Magento's DI compiler rejects.
+  Constructor scalar/pseudo compatibility follows
+  `Magento\Framework\Code\Reader\ScalarTypesProvider`; unsupported bare pseudo-types
+  such as `object` and `iterable` fail by default, with an explicit ignore flag only
+  for migration/debugging.
 
 ## Current Status (2026-03-10)
 
@@ -57,14 +62,29 @@ From `generated/diff/summary.json`:
 
 ### Performance Snapshot
 
-Latest full run with `--compare-archive`:
+Latest full run (warm filesystem cache, 3-run average):
 
-- Total: `23.885s`
-- Phase 5 (argument resolution): `0.672s`
-- Phase 7 (metadata generation): `4.142s`
-- Archive compare step: `16.121s`
+- Total (first run, cold fingerprint): `~2.2s`
+- Total (repeat run, fingerprint hit): `~1.29s`
+- Phase 7 global arg baseline: `0.037s`
+- Phase 7 dependency reverse index: `0.040s`
+- Phase 7 area-config loop: `0.153s` (down from 0.240s after OVERLAY)
+- Phase 7 (metadata generation, total, first run): `~0.85s`
+- Phase 7 (metadata generation, total, repeat run): `~0.006s` (FP-SCOPE-3 skip)
 
-The prior Phase 5 regression (~103s) is closed.
+Phase 7 sub-buckets (from `--verbose`, first run):
+- Constant resolution: `~11ms`
+- Setup overrides: `~48ms`
+- Generated class map extraction: `~244ms` (scans `generated/code/`, 4953 files)
+- Constructor reflection: `~121ms`
+- Interception registry: `~22ms`
+
+**All Phase 7 optimizations applied** (2026-05-15):
+- OPT-DELTA: global args resolved once (par_iter, 37ms), per-area delta re-resolves only affected types
+- DEP-IDX: dep reverse index parallel (40ms)
+- SER-1/2/4: `write!` + pre-allocated String + `escape_php` Cow (zero-alloc for non-special strings)
+- OVERLAY: serializer accepts baseline+delta maps directly — avoids 25K HashMap clone per area (204ms→153ms)
+- FP-SCOPE-3: fingerprint Phase 7 inputs; skip entire phase on repeat runs (~850ms saved, ~1.29s total)
 
 ### Primary Remaining Gaps
 
@@ -79,6 +99,8 @@ The prior Phase 5 regression (~103s) is closed.
 - Use `quick-xml` for di.xml SAX parsing
 - Three-tier PHP extraction: custom state-machine lexer → `tree-sitter-php` → PHP shell
 - Content-addressed writes: hash before writing, skip unchanged files
+- Constructor integrity validation is fatal by default when Magento would fail the
+  compile; `--ignore-constructor-integrity` is an explicit non-parity escape hatch.
 - All errors use `thiserror` — no `unwrap()` in library crates
 
 ## Workspace Layout

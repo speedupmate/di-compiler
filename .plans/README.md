@@ -14,6 +14,7 @@ Canonical compare baseline for this repo is:
 - [.tickets/](.tickets/) — execution-sized ticket packs
 - [.skills/](.skills/) — reusable project-specific agent skills
 - [.debugging/](.debugging/) — deep-dive debugging notes and parity investigations
+- [analyzis/](analyzis/) — performance and architecture analysis notes
 
 ## Phase Order
 
@@ -40,3 +41,7 @@ Canonical compare baseline for this repo is:
   - `missing=0`
   - `mismatches=0`
   - `extra=40` accepted as deferred residual (tracked by Feature 37 / TKT-055).
+- Magento compiler compatibility is a correctness guardrail: constructor type hints
+  accepted by Rust must not exceed Magento's own compile-time limits. Unsupported
+  pseudo-types such as `object` and `iterable` fail by default (Feature 39 / TKT-062),
+  with `--ignore-constructor-integrity` reserved for migration/debugging.

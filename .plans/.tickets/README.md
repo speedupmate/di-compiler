@@ -52,10 +52,17 @@ Execution-sized slices. One agent per ticket. Dependencies are explicit.
 | [046](TKT-046-proxy-method-surface-order-and-shape-parity.md) | Proxy method surface, order, and class-shape parity | 08 | Ready | 039, 042 |
 | [047](TKT-047-debugging-knowledge-base-and-skill-packaging.md) | Debugging knowledge base relocation and skill packaging | 09 | Done | 037 |
 | [048](TKT-048-di-merge-config-order-fix.md) | Fix config.php module-order HashMap ordering bug | 08 | Done | — |
-| [049](TKT-049-plugin-list-interface-inheritance-fix.md) | Exclude pure interfaces from plugin-list Section 1 unless directly registered | 08 | Ready | — |
-| [050](TKT-050-plugin-sort-order-tiebreak.md) | Add secondary sort-by-name tiebreak for plugins with equal sort_order | 08 | Ready | — |
-| [051](TKT-051-disabled-plugin-filter-fix.md) | Fix filter_enabled_di_xml dropping disabled plugin entries | 08 | Ready | — |
+| [049](TKT-049-plugin-list-interface-inheritance-fix.md) | Exclude pure interfaces from plugin-list Section 1 unless directly registered | 08 | Done | — |
+| [050](TKT-050-plugin-sort-order-tiebreak.md) | Add secondary sort-by-name tiebreak for plugins with equal sort_order | 08 | Done | — |
+| [051](TKT-051-disabled-plugin-filter-fix.md) | Fix filter_enabled_di_xml dropping disabled plugin entries | 08 | Done | — |
 | [052](TKT-052-dxml-only-null-emission.md) | Emit NULL for di.xml-only configured types missing from PHP scan | 08 | Done | 035 |
 | [053](TKT-053-shared-nonshared-instance-fix.md) | Fix _i_ vs _ins_ shared/non-shared instance resolution | 08 | Done | 048, 051 |
 | [054](TKT-054-php-constant-bootstrap.md) | Bootstrap const_map from PHP runtime get_defined_constants | 08 | Done | — |
 | [055](TKT-055-argument-surface-extra-closure.md) | Deferred closure of remaining arguments extra=40 surface | 08 | Planned | 052 |
+| [056](TKT-056-fxhashmap-across-all-crates.md) | FxHashMap/FxHashSet across all crates | 09 | Done | — |
+| [057](TKT-057-lock-free-class-extraction-and-arc-diconfig.md) | Lock-free class extraction and Arc\<DiConfig\> area loop | 09 | Done | 056 |
+| [058](TKT-058-merged-reflection-pass-and-bfs-propagation.md) | Merged reflection pass and BFS propagation | 09 | Done | 057 |
+| [059](TKT-059-incremental-dixml-cache-correctness-fix.md) | Incremental di.xml cache correctness fix | 09 | Done | 026 |
+| [060](TKT-060-archive-compare-parallelization.md) | Archive compare parallelization | 09 | Done | 036 |
+| [061](TKT-061-phase7-micro-optimizations.md) | Phase 7 micro-optimizations | 09 | Done | 057, 058 |
+| [062](TKT-062-magento-constructor-integrity-compatibility.md) | Fail fast on Magento-incompatible constructor pseudo-type hints | 08 | Done | 015, 024 |

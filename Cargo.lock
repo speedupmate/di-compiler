@@ -254,6 +254,7 @@ dependencies = [
  "insta",
  "log",
  "php-extractor",
+ "rayon",
  "rustc-hash",
  "serde_json",
  "thiserror",

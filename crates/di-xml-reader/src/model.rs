@@ -38,6 +38,25 @@ impl DiConfig {
                 .or_insert_with(|| key.clone());
         }
     }
+
+    /// Insert a preference and update the lowercase index in O(1).
+    /// Preserves first-seen canonical casing (same invariant as refresh_lookup_indexes).
+    pub fn insert_preference(&mut self, from: String, to: String) {
+        let lower = from.to_ascii_lowercase();
+        self.preference_keys_lc
+            .entry(lower)
+            .or_insert_with(|| from.clone());
+        self.preferences.insert(from, to);
+    }
+
+    /// Insert a type_config entry and update the lowercase index in O(1).
+    /// Preserves first-seen canonical casing (same invariant as refresh_lookup_indexes).
+    pub fn insert_type_config_key(&mut self, name: &str) {
+        let lower = name.to_ascii_lowercase();
+        self.type_config_keys_lc
+            .entry(lower)
+            .or_insert_with(|| name.to_string());
+    }
 }
 
 #[derive(Debug, Clone)]
