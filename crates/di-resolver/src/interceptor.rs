@@ -133,7 +133,8 @@ pub fn detect_interceptors(
     // NOT already intercepted, walk its `extends` chain. If any ancestor is in
     // the intercepted set, this class also needs an interceptor.
     // -----------------------------------------------------------------------
-    let intercepted_set: FxHashSet<&str> = directly_intercepted.iter().map(|s| s.as_str()).collect();
+    let intercepted_set: FxHashSet<&str> =
+        directly_intercepted.iter().map(|s| s.as_str()).collect();
 
     // Build a cache to avoid repeated ancestor walks.
     // `ancestor_intercepted` memoizes: fqcn → bool

@@ -1,7 +1,7 @@
 //! TKT-033: app_action_list.php generation.
 
-use std::collections::BTreeMap;
 use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 
 use php_extractor::ClassInfo;
 

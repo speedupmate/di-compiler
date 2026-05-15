@@ -324,9 +324,8 @@ fn collect_di_xml_files(
     /// The cache reduces that to at most 87 traversals (one per unique package root).
     fn cached_discover_module_roots(package_root: &std::path::Path) -> Vec<std::path::PathBuf> {
         use std::sync::{Mutex, OnceLock};
-        static CACHE: OnceLock<
-            Mutex<FxHashMap<std::path::PathBuf, Vec<std::path::PathBuf>>>,
-        > = OnceLock::new();
+        static CACHE: OnceLock<Mutex<FxHashMap<std::path::PathBuf, Vec<std::path::PathBuf>>>> =
+            OnceLock::new();
         let cache = CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
         {
             let map = cache.lock().unwrap();
@@ -427,8 +426,7 @@ fn module_name_from_module_xml(module_root: &std::path::Path) -> Option<String> 
 /// re-reading the same module.xml files on repeated `collect_di_xml_files` calls.
 fn cached_module_name(module_root: &std::path::Path) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<FxHashMap<std::path::PathBuf, Option<String>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<Mutex<FxHashMap<std::path::PathBuf, Option<String>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
     {
         let map = cache.lock().unwrap();

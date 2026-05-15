@@ -122,7 +122,7 @@ pub fn resolve_for_class(
             let type_hint = param
                 .type_hint
                 .as_deref()
-                .and_then(first_non_null_class_type_hint_arm);
+                .and_then(|hint| first_non_null_class_type_hint_arm(hint, &info.namespace));
             resolved.push(ResolvedArg {
                 name: param.name.clone(),
                 resolved: if type_hint.is_some() {
@@ -150,7 +150,7 @@ pub fn resolve_for_class(
         } else if let Some(type_hint) = param
             .type_hint
             .as_deref()
-            .and_then(first_non_null_class_type_hint_arm)
+            .and_then(|hint| first_non_null_class_type_hint_arm(hint, &info.namespace))
         {
             let concrete = di_config.get_preference(&type_hint);
             // PHP's ArgumentsResolver.getInstanceArgument() calls isShared() on the
@@ -431,10 +431,10 @@ fn normalize(s: &str) -> String {
     s.trim().trim_start_matches('\\').to_string()
 }
 
-fn first_non_null_class_type_hint_arm(type_hint: &str) -> Option<String> {
+fn first_non_null_class_type_hint_arm(type_hint: &str, namespace: &str) -> Option<String> {
     const NON_CLASS_TYPES: &[&str] = &[
-        "null", "false", "true", "int", "float", "string", "bool", "array", "callable", "iterable",
-        "object", "mixed", "void", "never", "self", "parent", "static",
+        "null", "false", "true", "int", "float", "string", "bool", "array", "callable", "mixed",
+        "void", "never", "self", "parent", "static",
     ];
 
     type_hint
@@ -442,7 +442,15 @@ fn first_non_null_class_type_hint_arm(type_hint: &str) -> Option<String> {
         .map(str::trim)
         .map(|arm| arm.trim_start_matches('?').trim_start_matches('\\'))
         .find(|arm| !arm.is_empty() && !NON_CLASS_TYPES.contains(arm))
-        .map(ToOwned::to_owned)
+        .map(|arm| {
+            // Magento's ScalarTypesProvider does not include PHP's object/iterable
+            // pseudo-types. ArgumentsReader therefore namespace-resolves them.
+            if matches!(arm, "object" | "iterable") && !namespace.is_empty() {
+                format!("{namespace}\\{arm}")
+            } else {
+                arm.to_string()
+            }
+        })
 }
 
 fn resolve_di_argument(
@@ -1289,6 +1297,54 @@ mod tests {
         class_map.insert(
             "App\\Service".to_string(),
             make_class("App\\Service", vec![("dep", Some("string|null"))]),
+        );
+
+        let di_config = DiConfig::default();
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
+        let args = &map["App\\Service"];
+        assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
+    }
+
+    #[test]
+    fn test_object_type_hint_matches_magento_namespace_resolution_limit() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("dep", Some("object"))]),
+        );
+
+        let di_config = DiConfig::default();
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
+        let args = &map["App\\Service"];
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\object"
+        ));
+    }
+
+    #[test]
+    fn test_iterable_type_hint_matches_magento_namespace_resolution_limit() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("items", Some("iterable"))]),
+        );
+
+        let di_config = DiConfig::default();
+        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
+        let args = &map["App\\Service"];
+        assert!(matches!(
+            &args[0].resolved,
+            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\iterable"
+        ));
+    }
+
+    #[test]
+    fn test_mixed_type_hint_stays_supported_scalar_limit() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("value", Some("mixed"))]),
         );
 
         let di_config = DiConfig::default();

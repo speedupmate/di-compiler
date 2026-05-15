@@ -20,7 +20,12 @@ pub fn generate_area_config(
     args_map: &FxHashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
 ) -> String {
-    generate_area_config_with_overrides(args_map, di_config, &FxHashMap::default(), &FxHashMap::default())
+    generate_area_config_with_overrides(
+        args_map,
+        di_config,
+        &FxHashMap::default(),
+        &FxHashMap::default(),
+    )
 }
 
 /// Generate area config while injecting additional preferences that should

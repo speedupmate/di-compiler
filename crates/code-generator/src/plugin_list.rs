@@ -3,8 +3,8 @@
 //! Generates Magento-style compiled plugin list metadata files:
 //! `primary|global|...|plugin-list.php`
 
-use std::collections::BTreeMap;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 
 use di_xml_reader::{DiConfig, Plugin as DiPlugin};
 use php_extractor::types::ClassKind;
