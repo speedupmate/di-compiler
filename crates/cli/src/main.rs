@@ -10,8 +10,8 @@
 //!   7. Generate metadata files (area configs, interception.php)
 //!   8. Incremental writes (skip unchanged — TKT-022/026)
 
-use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,12 +26,11 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use code_generator::{
-    extension_path, factory_path, generate_app_action_list_php,
+    compile_plugin_list, extension_path, factory_path, generate_app_action_list_php,
     generate_area_config_with_overrides, generate_extension, generate_extension_interface,
-    compile_plugin_list, generate_factory, generate_interceptor, generate_proxy,
-    generate_proxy_deferred, generate_search_results, interceptor_path,
-    proxy_deferred_path, proxy_path, search_results_path, serialize_interception_php,
-    serialize_plugin_list_php, write_if_changed,
+    generate_factory, generate_interceptor, generate_proxy, generate_proxy_deferred,
+    generate_search_results, interceptor_path, proxy_deferred_path, proxy_path,
+    search_results_path, serialize_interception_php, serialize_plugin_list_php, write_if_changed,
     ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
@@ -109,6 +108,10 @@ struct Args {
     /// Exit with code 1 when archive comparison has differences
     #[arg(long)]
     compare_fail_on_diff: bool,
+
+    /// Continue when Magento-style constructor integrity validation fails
+    #[arg(long)]
+    ignore_constructor_integrity: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +484,38 @@ fn main() {
         fallbacks,
         failures
     );
+
+    let constructor_violations = validate_constructor_integrity(&class_map);
+    if !constructor_violations.is_empty() {
+        let shown = constructor_violations.len().min(20);
+        for violation in constructor_violations.iter().take(shown) {
+            log::error!("{}", violation);
+        }
+        if constructor_violations.len() > shown {
+            log::error!(
+                "... {} additional constructor integrity violation(s)",
+                constructor_violations.len() - shown
+            );
+        }
+        if args.ignore_constructor_integrity {
+            log::warn!(
+                "Ignoring {} constructor integrity violation(s) because --ignore-constructor-integrity was set",
+                constructor_violations.len()
+            );
+        } else {
+            let supported_types = magento_supported_constructor_scalar_types().join(", ");
+            eprintln!(
+                "error: Magento constructor integrity validation failed ({} violation(s)).\n\
+                 Magento-supported constructor scalar/pseudo type hints: {}.\n\
+                 Class/interface type hints are valid too. Unsupported bare pseudo-types such as \
+                 object and iterable are resolved as class names by Magento's compiler.\n\
+                 Re-run with --ignore-constructor-integrity to continue anyway.",
+                constructor_violations.len(),
+                supported_types
+            );
+            std::process::exit(1);
+        }
+    }
     log_phase_elapsed("Phase 1+2", phase_1_2_started);
 
     // -----------------------------------------------------------------------
@@ -563,11 +598,7 @@ fn main() {
     // area loop can look up already-parsed configs instead of re-parsing.
     let area_di_xml_cache: FxHashMap<std::path::PathBuf, DiConfig> = extra_di_files
         .par_iter()
-        .filter_map(|path| {
-            parse_di_xml(path)
-                .ok()
-                .map(|cfg| ((*path).clone(), cfg))
-        })
+        .filter_map(|path| parse_di_xml(path).ok().map(|cfg| ((*path).clone(), cfg)))
         .collect();
     // Preserve original file order for deterministic scanner_di_configs merge.
     let extra_configs: Vec<DiConfig> = extra_di_files
@@ -813,8 +844,7 @@ fn main() {
     log::info!("Resolved arguments for {} classes", args_map.len());
 
     // Build all_fqcns map for interception.php (all FQCNs → bool intercepted)
-    let intercepted_set: FxHashSet<&str> =
-        interceptors.iter().map(|s| s.fqcn.as_str()).collect();
+    let intercepted_set: FxHashSet<&str> = interceptors.iter().map(|s| s.fqcn.as_str()).collect();
     let all_fqcns_phase5: FxHashMap<String, bool> = interception_class_map
         .keys()
         .map(|fqcn| {
@@ -1175,42 +1205,40 @@ fn main() {
 
             // Only re-merge if there are area-specific files beyond the global set.
             // Use Arc::clone for the no-overrides path to avoid cloning the large DiConfig.
-            let area_di_config: std::sync::Arc<DiConfig> =
-                if area_di_files.len() > di_xml_files.len() {
-                    let area_only: Vec<_> = area_di_files
-                        .iter()
-                        .filter(|p| !di_xml_files_set.contains(p))
-                        .collect();
-                    if area_only.is_empty() {
-                        std::sync::Arc::clone(&metadata_base_di_config)
-                    } else {
-                        // Look up from Phase 3b cache; fall back to re-parsing only for
-                        // files not in the cache (should not happen in practice).
-                        let extra_configs: Vec<DiConfig> = area_only
-                            .iter()
-                            .filter_map(|p| {
-                                area_di_xml_cache
-                                    .get(*p)
-                                    .cloned()
-                                    .or_else(|| parse_di_xml(p).ok())
-                            })
-                            .collect();
-                        // Area-specific module configs applied via the same two-phase merge as
-                        // global: deep-merge area module configs together, then apply on the
-                        // global base using shallow (array_replace) semantics per PHP behaviour.
-                        let mut merged_area = apply_module_config_on_primary(
-                            (*metadata_base_di_config).clone(),
-                            merge_configs(extra_configs),
-                        );
-                        apply_resolved_constants_to_di_config(
-                            &mut merged_area,
-                            &resolved_const_values,
-                        );
-                        std::sync::Arc::new(merged_area)
-                    }
-                } else {
+            let area_di_config: std::sync::Arc<DiConfig> = if area_di_files.len()
+                > di_xml_files.len()
+            {
+                let area_only: Vec<_> = area_di_files
+                    .iter()
+                    .filter(|p| !di_xml_files_set.contains(p))
+                    .collect();
+                if area_only.is_empty() {
                     std::sync::Arc::clone(&metadata_base_di_config)
-                };
+                } else {
+                    // Look up from Phase 3b cache; fall back to re-parsing only for
+                    // files not in the cache (should not happen in practice).
+                    let extra_configs: Vec<DiConfig> = area_only
+                        .iter()
+                        .filter_map(|p| {
+                            area_di_xml_cache
+                                .get(*p)
+                                .cloned()
+                                .or_else(|| parse_di_xml(p).ok())
+                        })
+                        .collect();
+                    // Area-specific module configs applied via the same two-phase merge as
+                    // global: deep-merge area module configs together, then apply on the
+                    // global base using shallow (array_replace) semantics per PHP behaviour.
+                    let mut merged_area = apply_module_config_on_primary(
+                        (*metadata_base_di_config).clone(),
+                        merge_configs(extra_configs),
+                    );
+                    apply_resolved_constants_to_di_config(&mut merged_area, &resolved_const_values);
+                    std::sync::Arc::new(merged_area)
+                }
+            } else {
+                std::sync::Arc::clone(&metadata_base_di_config)
+            };
 
             // Build area-specific preference overrides.
             // global_interceptor_map is shared read-only; no per-area clone needed.
@@ -1460,6 +1488,376 @@ fn log_phase_elapsed(phase: &str, started: Instant) {
         elapsed.as_secs_f64(),
         elapsed.as_millis()
     );
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConstructorIntegrityViolation {
+    class_name: String,
+    message: String,
+}
+
+impl std::fmt::Display for ConstructorIntegrityViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParentCallArg {
+    name: Option<String>,
+    variable: Option<String>,
+}
+
+fn validate_constructor_integrity(
+    class_map: &FxHashMap<String, ClassInfo>,
+) -> Vec<ConstructorIntegrityViolation> {
+    let mut violations = Vec::new();
+
+    for info in class_map.values() {
+        let Some(parent_name) = info.extends.as_ref().map(|s| s.trim_start_matches('\\')) else {
+            continue;
+        };
+        let Some(parent_info) = class_map.get(parent_name) else {
+            continue;
+        };
+        let Some(parent_ctor) = parent_info.constructor.as_ref() else {
+            continue;
+        };
+        if parent_ctor.params.is_empty() {
+            continue;
+        }
+        // Guard: only read the child source file if the parent actually has an
+        // object/iterable param that needs validation. Rare in practice.
+        if !parent_ctor
+            .params
+            .iter()
+            .any(|p| is_magento_namespace_resolved_pseudo_type(p.type_hint.as_deref()))
+        {
+            continue;
+        }
+        let Some(child_ctor) = info.constructor.as_ref() else {
+            continue;
+        };
+        let Some(call_args) = extract_parent_constructor_call_args(info) else {
+            continue;
+        };
+
+        let child_params_by_name: FxHashMap<&str, &ConstructorParam> = child_ctor
+            .params
+            .iter()
+            .map(|param| (param.name.as_str(), param))
+            .collect();
+        let named_call_args: FxHashMap<&str, &ParentCallArg> = call_args
+            .iter()
+            .filter_map(|arg| arg.name.as_deref().map(|name| (name, arg)))
+            .collect();
+
+        for (index, required_arg) in parent_ctor.params.iter().enumerate() {
+            if !is_magento_namespace_resolved_pseudo_type(required_arg.type_hint.as_deref()) {
+                continue;
+            }
+            let call_arg = named_call_args
+                .get(required_arg.name.as_str())
+                .copied()
+                .or_else(|| call_args.get(index));
+            let Some(call_arg) = call_arg else {
+                if !required_arg.is_optional {
+                    violations.push(ConstructorIntegrityViolation {
+                        class_name: info.fqcn.clone(),
+                        message: format!(
+                            "Missed required argument {} in parent::__construct call. File: {}",
+                            required_arg.name,
+                            info.path.display()
+                        ),
+                    });
+                }
+                continue;
+            };
+            let Some(variable_name) = call_arg.variable.as_deref() else {
+                continue;
+            };
+            let required_type = magento_constructor_param_type(parent_info, required_arg);
+            let actual_type = child_params_by_name
+                .get(variable_name)
+                .and_then(|actual_arg| magento_constructor_param_type(info, actual_arg));
+
+            if constructor_types_compatible(
+                required_type.as_deref(),
+                actual_type.as_deref(),
+                class_map,
+            ) {
+                continue;
+            }
+
+            violations.push(ConstructorIntegrityViolation {
+                class_name: info.fqcn.clone(),
+                message: format!(
+                    "Incompatible argument type: Required type: {}. Actual type: {}; File: {}",
+                    required_type.as_deref().unwrap_or(""),
+                    actual_type.as_deref().unwrap_or(""),
+                    info.path.display()
+                ),
+            });
+        }
+    }
+
+    violations.sort_by(|a, b| {
+        a.class_name
+            .cmp(&b.class_name)
+            .then(a.message.cmp(&b.message))
+    });
+    violations
+}
+
+fn is_magento_namespace_resolved_pseudo_type(type_hint: Option<&str>) -> bool {
+    let Some(type_hint) = type_hint else {
+        return false;
+    };
+    let normalized = type_hint
+        .trim()
+        .trim_start_matches('?')
+        .trim_start_matches('\\');
+    matches!(normalized, "object" | "iterable")
+}
+
+// Mirrors Magento\Framework\Code\Reader\ScalarTypesProvider::getTypes()
+// in vendor/magento/framework/Code/Reader/ScalarTypesProvider.php.
+fn magento_supported_constructor_scalar_types() -> &'static [&'static str] {
+    &[
+        "array", "string", "int", "integer", "float", "bool", "boolean", "mixed", "callable",
+    ]
+}
+
+fn magento_constructor_param_type(
+    class_info: &ClassInfo,
+    param: &ConstructorParam,
+) -> Option<String> {
+    let raw = param.type_hint.as_deref()?.trim();
+    if raw.is_empty() || raw.contains('|') || raw.contains('&') {
+        return None;
+    }
+
+    let raw = raw.trim_start_matches('?').trim_start_matches('\\');
+    let lower = raw.to_ascii_lowercase();
+    if magento_supported_constructor_scalar_types().contains(&lower.as_str()) {
+        Some(lower)
+    } else if lower == "null" {
+        None
+    } else if raw.contains('\\') || class_info.namespace.is_empty() {
+        Some(raw.to_string())
+    } else {
+        Some(format!("{}\\{}", class_info.namespace, raw))
+    }
+}
+
+fn constructor_types_compatible(
+    required_type: Option<&str>,
+    actual_type: Option<&str>,
+    class_map: &FxHashMap<String, ClassInfo>,
+) -> bool {
+    let Some(required_type) = required_type.map(normalize_type_name) else {
+        return true;
+    };
+    let Some(actual_type) = actual_type.map(normalize_type_name) else {
+        return true;
+    };
+    if required_type == actual_type {
+        return true;
+    }
+    if required_type == "array" || actual_type == "array" {
+        return false;
+    }
+    if required_type == "mixed" || actual_type == "mixed" {
+        return true;
+    }
+
+    let mut seen = FxHashSet::default();
+    is_subtype_of(&actual_type, &required_type, class_map, &mut seen)
+}
+
+fn is_subtype_of(
+    actual_type: &str,
+    required_type: &str,
+    class_map: &FxHashMap<String, ClassInfo>,
+    seen: &mut FxHashSet<String>,
+) -> bool {
+    if actual_type == required_type {
+        return true;
+    }
+    if !seen.insert(actual_type.to_string()) {
+        return false;
+    }
+    let Some(info) = class_map.get(actual_type) else {
+        return false;
+    };
+
+    if let Some(parent) = info.extends.as_deref().map(normalize_type_name) {
+        if parent == required_type || is_subtype_of(&parent, required_type, class_map, seen) {
+            return true;
+        }
+    }
+    info.implements.iter().any(|implemented| {
+        let implemented = normalize_type_name(implemented);
+        implemented == required_type || is_subtype_of(&implemented, required_type, class_map, seen)
+    })
+}
+
+fn normalize_type_name(type_name: &str) -> String {
+    type_name.trim().trim_start_matches('\\').to_string()
+}
+
+fn extract_parent_constructor_call_args(info: &ClassInfo) -> Option<Vec<ParentCallArg>> {
+    let source = std::fs::read_to_string(&info.path).ok()?;
+    let marker = "parent::__construct";
+    let marker_pos = source.find(marker)?;
+    let after_marker = marker_pos + marker.len();
+    let open_paren = after_marker + source[after_marker..].find('(')?;
+    let close_paren = find_matching_paren(&source, open_paren)?;
+    let inner = &source[open_paren + 1..close_paren];
+    Some(
+        split_top_level_args(inner)
+            .into_iter()
+            .map(parse_parent_call_arg)
+            .collect(),
+    )
+}
+
+fn parse_parent_call_arg(raw: &str) -> ParentCallArg {
+    let raw = raw.trim();
+    let (name, value) = if let Some(colon) = find_top_level_colon(raw) {
+        (
+            Some(raw[..colon].trim().to_string()),
+            raw[colon + 1..].trim(),
+        )
+    } else {
+        (None, raw)
+    };
+
+    ParentCallArg {
+        name,
+        variable: extract_variable_name(value),
+    }
+}
+
+fn extract_variable_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.strip_prefix('$')?;
+    let name: String = value
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn find_matching_paren(source: &str, open_paren: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(open_paren) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = open_paren;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_top_level_args(source: &str) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let mut args = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                let arg = source[start..i].trim();
+                if !arg.is_empty() {
+                    args.push(arg);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let arg = source[start..].trim();
+    if !arg.is_empty() {
+        args.push(arg);
+    }
+    args
+}
+
+fn find_top_level_colon(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && bytes.get(i + 1) != Some(&b':') => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -3613,7 +4011,8 @@ fn enrich_interceptor_specs_with_reflection(
             continue;
         }
 
-        let current: FxHashSet<String> = spec.public_methods.iter().map(|m| m.name.clone()).collect();
+        let current: FxHashSet<String> =
+            spec.public_methods.iter().map(|m| m.name.clone()).collect();
         let missing_expected = !spec.plugins.is_empty() && !expected.is_subset(&current);
         if !missing_expected && !needs_sig {
             continue;
@@ -3950,7 +4349,6 @@ fn apply_case_index(
         }
     }
 }
-
 
 fn canonicalize_resolved_arg_value_case(
     value: &mut di_resolver::ResolvedArgValue,
@@ -4955,17 +5353,17 @@ fn maybe_push_proxy_target(candidate: &str, out: &mut FxHashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_setup_di_compile_runtime_overrides, build_argument_type_names,
-        build_interception_registry, build_interception_type_names,
-        apply_case_index, build_case_index, infer_comparable_fix_categories,
-        render_comparable_metadata_report_text, ComparableMetadataReport, ComparableReportSummary,
-        ComparableTypeMismatchSample, ComparableValueMismatchSample,
+        apply_case_index, apply_setup_di_compile_runtime_overrides, build_argument_type_names,
+        build_case_index, build_interception_registry, build_interception_type_names,
+        infer_comparable_fix_categories, render_comparable_metadata_report_text,
+        ComparableMetadataReport, ComparableReportSummary, ComparableTypeMismatchSample,
+        ComparableValueMismatchSample,
     };
     use di_resolver::{
         ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
     };
     use di_xml_reader::{Argument, DiConfig, VirtualType};
-    use php_extractor::types::{ClassInfo, ClassKind};
+    use php_extractor::types::{ClassInfo, ClassKind, Constructor, ConstructorParam};
     use rustc_hash::FxHashMap;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -4980,7 +5378,12 @@ mod tests {
         extends: Option<&str>,
         implements: Vec<&str>,
     ) -> ClassInfo {
-        class_info_impl(fqcn, extends, false, implements.iter().map(|s| s.to_string()).collect())
+        class_info_impl(
+            fqcn,
+            extends,
+            false,
+            implements.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     fn class_info_impl(
@@ -5010,6 +5413,126 @@ mod tests {
             is_final: false,
             public_methods: vec![],
         }
+    }
+
+    fn ctor_param(name: &str, type_hint: Option<&str>, is_optional: bool) -> ConstructorParam {
+        ConstructorParam {
+            name: name.to_string(),
+            type_hint: type_hint.map(str::to_string),
+            is_optional,
+            default_value: None,
+            is_primitive: false,
+            is_variadic: false,
+            is_promoted: false,
+        }
+    }
+
+    fn class_info_with_ctor(
+        fqcn: &str,
+        extends: Option<&str>,
+        path: PathBuf,
+        params: Vec<ConstructorParam>,
+    ) -> ClassInfo {
+        let mut info = class_info_impl(fqcn, extends, false, vec![]);
+        info.path = path;
+        info.constructor = Some(Constructor { params });
+        info
+    }
+
+    #[test]
+    fn constructor_integrity_flags_object_parent_type_like_magento() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let child_path = tmp.path().join("Child.php");
+        std::fs::write(
+            &child_path,
+            r#"<?php
+namespace Spmt\Probe\Model;
+
+class ChildWithConcreteInterface extends ParentWithObjectType
+{
+    public function __construct(\Magento\Framework\App\Config\ScopeConfigInterface $dependency)
+    {
+        parent::__construct($dependency);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let parent = class_info_with_ctor(
+            "Spmt\\Probe\\Model\\ParentWithObjectType",
+            None,
+            tmp.path().join("Parent.php"),
+            vec![ctor_param("dependency", Some("object"), false)],
+        );
+        let child = class_info_with_ctor(
+            "Spmt\\Probe\\Model\\ChildWithConcreteInterface",
+            Some("Spmt\\Probe\\Model\\ParentWithObjectType"),
+            child_path,
+            vec![ctor_param(
+                "dependency",
+                Some("Magento\\Framework\\App\\Config\\ScopeConfigInterface"),
+                false,
+            )],
+        );
+        let mut class_map = FxHashMap::default();
+        class_map.insert(parent.fqcn.clone(), parent);
+        class_map.insert(child.fqcn.clone(), child);
+
+        let violations = super::validate_constructor_integrity(&class_map);
+
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0]
+            .message
+            .contains("Required type: Spmt\\Probe\\Model\\object"));
+        assert!(violations[0]
+            .message
+            .contains("Actual type: Magento\\Framework\\App\\Config\\ScopeConfigInterface"));
+    }
+
+    #[test]
+    fn constructor_integrity_allows_mixed_parent_type() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let child_path = tmp.path().join("Child.php");
+        std::fs::write(
+            &child_path,
+            r#"<?php
+namespace Spmt\Probe\Model;
+
+class ChildWithConcreteInterface extends ParentWithMixedType
+{
+    public function __construct(\Magento\Framework\App\Config\ScopeConfigInterface $dependency)
+    {
+        parent::__construct($dependency);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let parent = class_info_with_ctor(
+            "Spmt\\Probe\\Model\\ParentWithMixedType",
+            None,
+            tmp.path().join("Parent.php"),
+            vec![ctor_param("dependency", Some("mixed"), false)],
+        );
+        let child = class_info_with_ctor(
+            "Spmt\\Probe\\Model\\ChildWithConcreteInterface",
+            Some("Spmt\\Probe\\Model\\ParentWithMixedType"),
+            child_path,
+            vec![ctor_param(
+                "dependency",
+                Some("Magento\\Framework\\App\\Config\\ScopeConfigInterface"),
+                false,
+            )],
+        );
+        let mut class_map = FxHashMap::default();
+        class_map.insert(parent.fqcn.clone(), parent);
+        class_map.insert(child.fqcn.clone(), child);
+
+        let violations = super::validate_constructor_integrity(&class_map);
+
+        assert!(violations.is_empty());
     }
 
     #[test]
@@ -5458,14 +5981,7 @@ mod tests {
             })
             .collect();
         let names: Vec<String> = type_names.iter().map(|s| s.to_string()).collect();
-        build_interception_registry(
-            &names,
-            &specs,
-            &[],
-            &[],
-            &DiConfig::default(),
-            class_map,
-        )
+        build_interception_registry(&names, &specs, &[], &[], &DiConfig::default(), class_map)
     }
 
     #[test]
@@ -5490,9 +6006,16 @@ mod tests {
             "Magento\\Framework\\App\\ActionInterface",
             "Magento\\Framework\\App\\Action\\AbstractAction",
         ];
-        let map = registry(&type_names, &["Magento\\Framework\\App\\ActionInterface"], &class_map);
+        let map = registry(
+            &type_names,
+            &["Magento\\Framework\\App\\ActionInterface"],
+            &class_map,
+        );
 
-        assert_eq!(map.get("Magento\\Framework\\App\\ActionInterface"), Some(&true));
+        assert_eq!(
+            map.get("Magento\\Framework\\App\\ActionInterface"),
+            Some(&true)
+        );
         assert_eq!(
             map.get("Magento\\Framework\\App\\Action\\AbstractAction"),
             Some(&true),
@@ -5535,7 +6058,11 @@ mod tests {
 
         assert_eq!(map.get("Vendor\\IFace"), Some(&true));
         assert_eq!(map.get("Vendor\\A"), Some(&true));
-        assert_eq!(map.get("Vendor\\B"), Some(&true), "transitive via implements chain");
+        assert_eq!(
+            map.get("Vendor\\B"),
+            Some(&true),
+            "transitive via implements chain"
+        );
         assert_eq!(map.get("Vendor\\Unrelated"), Some(&false));
     }
 
@@ -5640,12 +6167,10 @@ mod tests {
 
     #[test]
     fn incremental_cache_hash_of_nonexistent_file_returns_none() {
-        assert!(
-            super::IncrementalCache::hash_of(std::path::Path::new(
-                "/nonexistent/__no_such_file__.php"
-            ))
-            .is_none()
-        );
+        assert!(super::IncrementalCache::hash_of(std::path::Path::new(
+            "/nonexistent/__no_such_file__.php"
+        ))
+        .is_none());
     }
 
     #[test]
@@ -5706,8 +6231,7 @@ mod tests {
 
     #[test]
     fn incremental_cache_load_returns_empty_for_missing_file() {
-        let cache =
-            super::IncrementalCache::load(std::path::Path::new("/no/such/cache.json"));
+        let cache = super::IncrementalCache::load(std::path::Path::new("/no/such/cache.json"));
         assert!(cache.files.is_empty());
     }
 
@@ -5718,8 +6242,6 @@ mod tests {
     // always returns None. All tests verify candidate-selection logic and that
     // the function handles gracefully, returning correct zero counts.
     // =========================================================================
-
-    use php_extractor::types::{Constructor, ConstructorParam};
 
     fn ctor_with_const_default() -> Constructor {
         Constructor {
