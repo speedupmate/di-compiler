@@ -42,3 +42,5 @@ One file per feature. Status values: Planned | In Progress | Implemented.
 | 35 | [interface-argument-inheritance](35-interface-argument-inheritance.md) | 03 | Implemented |
 | 36 | [di-merge-order-and-null-surface](36-di-merge-order-and-null-surface.md) | 08 | Implemented |
 | 37 | [argument-surface-extra-closure](37-argument-surface-extra-closure.md) | 08 | Planned |
+| 38 | [low-level-performance-hardening](38-low-level-performance-hardening.md) | 09 | Implemented |
+| 39 | [magento-constructor-integrity-compatibility](39-magento-constructor-integrity-compatibility.md) | 08 | Implemented |

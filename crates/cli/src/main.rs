@@ -54,6 +54,7 @@ use php_extractor::{
 #[derive(Parser, Debug)]
 #[command(
     name = "fast-di-compile",
+    version = env!("GIT_VERSION"),
     about = "Fast Rust replacement for bin/magento setup:di:compile"
 )]
 struct Args {
@@ -1101,64 +1102,130 @@ fn main() {
     let phase_7_started = Instant::now();
     log::info!("Generating metadata files");
 
-    // Metadata type universe: include real classes, generated classes, and
-    // DI-declared logical types (virtual types/preferences/plugins/type configs).
+    // Resolve PHP built-in/class constants before fingerprinting so changes to the
+    // PHP runtime (binary, extension, constant value) invalidate the skip cache.
+    let t_const = Instant::now();
     let resolved_const_values =
         resolve_php_constants_in_config(&full_di_config, &args.magento_root, &args.fallback_php);
-    let mut metadata_base_di_config = di_config.clone();
-    // setup:di:compile mutates ObjectManager config at runtime before metadata
-    // generation. Mirror the relevant overrides so Setup/compiler classes and
-    // scanner exclusions match PHP metadata output.
-    apply_setup_di_compile_runtime_overrides(
-        &mut metadata_base_di_config,
-        &args.magento_root,
-        &module_paths,
-        &args.fallback_php,
-    );
-    apply_resolved_constants_to_di_config(&mut metadata_base_di_config, &resolved_const_values);
-    // Freeze into Arc so the area par_iter loop can share it without cloning.
-    let metadata_base_di_config = std::sync::Arc::new(metadata_base_di_config);
+    log::debug!("Phase 7 constant resolution: {:?}", t_const.elapsed());
 
-    let generated_class_map = extract_generated_class_map(&code_root);
-    let mut metadata_class_map = merged_class_map(&interception_class_map, &generated_class_map);
-    // Source-only FQCNs for null-emission filtering: PHP emits NULL only for scanned
-    // source concrete classes, not for generated artifacts (interceptors, factories, proxies).
-    let base_class_fqcns: FxHashSet<String> = interception_class_map.keys().cloned().collect();
-    let argument_type_names = build_argument_type_names(
-        &interception_class_map,
-        &generated_class_map,
-        &metadata_base_di_config,
+    // FP-SCOPE-3: fingerprint Phase 7 inputs — skip entire phase if unchanged.
+    // Stored outside metadata/ so archive compare does not treat it as a metadata file.
+    let fp_dir = generated_root.join(".fast-di-cache");
+    let fp_path = fp_dir.join("phase7.fp");
+    let new_fp = compute_phase7_fp(
+        &class_map,
+        &full_di_config,
         &interceptors,
         &factories,
         &proxies,
         &search_results,
         &proxy_deferred,
         &extension_specs,
+        &resolved_const_values,
+        &module_paths,
     );
-    let interception_type_names = build_interception_type_names(
-        &interception_class_map,
-        &generated_class_map,
-        &metadata_base_di_config,
-        &interceptors,
-        &factories,
-        &proxies,
-        &search_results,
-        &proxy_deferred,
-        &extension_specs,
-    );
-    // All three reflection passes merged into one par_iter — eliminates two
-    // Rayon barriers. Candidates are disjoint: pass 1 has constructors with
-    // constant defaults, pass 2 has no constructor + extends, pass 3 adds
-    // VT targets absent from class_map.
-    let (reflected_metadata_ctors, reflected_inherited_ctors, reflected_virtual_target_ctors) =
-        enrich_all_constructors_with_reflection(
-            &mut metadata_class_map,
-            &argument_type_names,
-            &metadata_base_di_config,
+    let fp_hit = std::fs::read(&fp_path)
+        .ok()
+        .map(|b| b == new_fp)
+        .unwrap_or(false);
+    // On hit, verify all expected metadata files exist before skipping.
+    let plugin_scopes_for_fp = [
+        "global",
+        "adminhtml",
+        "crontab",
+        "frontend",
+        "graphql",
+        "webapi_rest",
+        "webapi_soap",
+    ];
+    let fp_hit = fp_hit && {
+        AREAS
+            .iter()
+            .map(|a| metadata_root.join(format!("{}.php", a)))
+            .chain(std::iter::once(metadata_root.join("interception.php")))
+            .chain(std::iter::once(metadata_root.join("app_action_list.php")))
+            .chain(
+                plugin_scopes_for_fp
+                    .iter()
+                    .map(|s| metadata_root.join(format!("{}.php", plugin_list_cache_id(s)))),
+            )
+            .all(|p| p.exists())
+    };
+    'phase7: {
+        if fp_hit {
+            log::info!("Phase 7 skipped: fingerprint match");
+            break 'phase7;
+        }
+
+        // Metadata type universe: include real classes, generated classes, and
+        // DI-declared logical types (virtual types/preferences/plugins/type configs).
+        // resolved_const_values was computed before the fingerprint check above.
+        let t_setup = Instant::now();
+        let mut metadata_base_di_config = di_config.clone();
+        // setup:di:compile mutates ObjectManager config at runtime before metadata
+        // generation. Mirror the relevant overrides so Setup/compiler classes and
+        // scanner exclusions match PHP metadata output.
+        apply_setup_di_compile_runtime_overrides(
+            &mut metadata_base_di_config,
             &args.magento_root,
+            &module_paths,
             &args.fallback_php,
         );
-    log::info!(
+        apply_resolved_constants_to_di_config(&mut metadata_base_di_config, &resolved_const_values);
+        // Freeze into Arc so the area par_iter loop can share it without cloning.
+        let metadata_base_di_config = std::sync::Arc::new(metadata_base_di_config);
+        log::debug!("Phase 7 setup overrides: {:?}", t_setup.elapsed());
+
+        let t_classmap = Instant::now();
+        let generated_class_map = extract_generated_class_map(&code_root);
+        let mut metadata_class_map =
+            merged_class_map(&interception_class_map, &generated_class_map);
+        log::debug!("Phase 7 generated class map: {:?}", t_classmap.elapsed());
+        // Source-only FQCNs for null-emission filtering: PHP emits NULL only for scanned
+        // source concrete classes, not for generated artifacts (interceptors, factories, proxies).
+        let base_class_fqcns: FxHashSet<String> = interception_class_map.keys().cloned().collect();
+        // Wrap in Arc so the area par_iter loop shares it without cloning 25K strings per area.
+        let argument_type_names = std::sync::Arc::new(build_argument_type_names(
+            &interception_class_map,
+            &generated_class_map,
+            &metadata_base_di_config,
+            &interceptors,
+            &factories,
+            &proxies,
+            &search_results,
+            &proxy_deferred,
+            &extension_specs,
+        ));
+        let interception_type_names = build_interception_type_names(
+            &interception_class_map,
+            &generated_class_map,
+            &metadata_base_di_config,
+            &interceptors,
+            &factories,
+            &proxies,
+            &search_results,
+            &proxy_deferred,
+            &extension_specs,
+        );
+        // All three reflection passes merged into one par_iter — eliminates two
+        // Rayon barriers. Candidates are disjoint: pass 1 has constructors with
+        // constant defaults, pass 2 has no constructor + extends, pass 3 adds
+        // VT targets absent from class_map.
+        let t_reflection = Instant::now();
+        let (reflected_metadata_ctors, reflected_inherited_ctors, reflected_virtual_target_ctors) =
+            enrich_all_constructors_with_reflection(
+                &mut metadata_class_map,
+                &*argument_type_names,
+                &metadata_base_di_config,
+                &args.magento_root,
+                &args.fallback_php,
+            );
+        log::debug!(
+            "Phase 7 constructor reflection: {:?}",
+            t_reflection.elapsed()
+        );
+        log::info!(
         "Metadata universe: args {} / interception {} type names (base {}, generated {}, ctor reflections {}, inherited reflections {}, virtual-target reflections {})",
         argument_type_names.len(),
         interception_type_names.len(),
@@ -1168,216 +1235,387 @@ fn main() {
         reflected_inherited_ctors,
         reflected_virtual_target_ctors
     );
-    // Build direct interception map once; area-specific preference/instanceTypes
-    // overrides are derived from this and each area's merged DI config.
-    let global_interceptor_map = build_direct_interception_map(&interceptors);
-    let all_fqcns = build_interception_registry(
-        &interception_type_names,
-        &interceptors,
-        &proxies,
-        &proxy_deferred,
-        &interception_di_config,
-        &metadata_class_map,
-    );
+        // Build direct interception map once; area-specific preference/instanceTypes
+        // overrides are derived from this and each area's merged DI config.
+        let global_interceptor_map = build_direct_interception_map(&interceptors);
+        let t_interception = Instant::now();
+        let all_fqcns = build_interception_registry(
+            &interception_type_names,
+            &interceptors,
+            &proxies,
+            &proxy_deferred,
+            &interception_di_config,
+            &metadata_class_map,
+        );
 
-    // interception.php
-    let interception_content = serialize_interception_php(&all_fqcns);
-    let interception_path = metadata_root.join("interception.php");
-    let _ = write_if_changed(&interception_path, &interception_content);
+        // interception.php
+        let interception_content = serialize_interception_php(&all_fqcns);
+        let interception_path = metadata_root.join("interception.php");
+        let _ = write_if_changed(&interception_path, &interception_content);
+        log::debug!(
+            "Phase 7 interception registry+php: {:?}",
+            t_interception.elapsed()
+        );
 
-    // Build the case-normalisation index once from the interception class map.
-    // All 7 area iterations reuse the same index; previously it was rebuilt
-    // from scratch inside canonicalize_instance_reference_case on every call.
-    let case_index = build_case_index(&interception_class_map);
+        // Build the case-normalisation index once from the interception class map.
+        // All 7 area iterations reuse the same index; previously it was rebuilt
+        // from scratch inside canonicalize_instance_reference_case on every call.
+        let case_index = build_case_index(&interception_class_map);
 
-    // Per-area config files — each area merges global + area-specific di.xml overlays.
-    // Run in parallel: each area is independent (different files, different output path).
-    let t_area_config = Instant::now();
-    let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
-    let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = AREAS
-        .par_iter()
-        .map(|&area| {
-            let area_di_files = filter_enabled_di_xml(
-                find_di_xml_files_for_area(&magento_root, area, &enabled_modules),
-                &enabled_modules,
-                &magento_root,
-            );
-
-            // Only re-merge if there are area-specific files beyond the global set.
-            // Use Arc::clone for the no-overrides path to avoid cloning the large DiConfig.
-            let area_di_config: std::sync::Arc<DiConfig> = if area_di_files.len()
-                > di_xml_files.len()
+        // OPT-DELTA: resolve all 25K types once with global interception overrides baked in.
+        // Areas typically change only ~40 type_configs; per-area re-resolution only processes
+        // the small affected set instead of all 25K types × 7 areas = 175K resolutions.
+        let global_preference_overrides = build_interception_preference_overrides(
+            &metadata_base_di_config,
+            &global_interceptor_map,
+        );
+        let mut global_resolution_di_config = (*metadata_base_di_config).clone();
+        for (from, to) in &global_preference_overrides {
+            if !global_resolution_di_config
+                .virtual_types
+                .contains_key(from.as_str())
             {
-                let area_only: Vec<_> = area_di_files
-                    .iter()
-                    .filter(|p| !di_xml_files_set.contains(p))
-                    .collect();
-                if area_only.is_empty() {
-                    std::sync::Arc::clone(&metadata_base_di_config)
-                } else {
-                    // Look up from Phase 3b cache; fall back to re-parsing only for
-                    // files not in the cache (should not happen in practice).
-                    let extra_configs: Vec<DiConfig> = area_only
-                        .iter()
-                        .filter_map(|p| {
-                            area_di_xml_cache
-                                .get(*p)
-                                .cloned()
-                                .or_else(|| parse_di_xml(p).ok())
-                        })
-                        .collect();
-                    // Area-specific module configs applied via the same two-phase merge as
-                    // global: deep-merge area module configs together, then apply on the
-                    // global base using shallow (array_replace) semantics per PHP behaviour.
-                    let mut merged_area = apply_module_config_on_primary(
-                        (*metadata_base_di_config).clone(),
-                        merge_configs(extra_configs),
-                    );
-                    apply_resolved_constants_to_di_config(&mut merged_area, &resolved_const_values);
-                    std::sync::Arc::new(merged_area)
-                }
-            } else {
-                std::sync::Arc::clone(&metadata_base_di_config)
-            };
-
-            // Build area-specific preference overrides.
-            // global_interceptor_map is shared read-only; no per-area clone needed.
-            let area_preference_overrides =
-                build_interception_preference_overrides(&area_di_config, &global_interceptor_map);
-
-            let mut area_di_config_for_args = (*area_di_config).clone();
-            for (from, to) in &area_preference_overrides {
-                // Keep VT argument values stable: synthetic interception overrides for
-                // virtual-type names should not participate in argument object resolution.
-                // Explicit DI preferences for VT aliases are already present in
-                // area_di_config.preferences and remain intact.
-                if area_di_config_for_args
-                    .virtual_types
-                    .contains_key(from.as_str())
-                {
-                    continue;
-                }
-                area_di_config_for_args
-                    .preferences
-                    .insert(from.clone(), to.clone());
+                global_resolution_di_config.insert_preference(from.clone(), to.clone());
             }
-            area_di_config_for_args.refresh_lookup_indexes();
+        }
+        let t_global_resolve = Instant::now();
+        let mut global_baseline_args = resolve_all_arguments_for_named_types(
+            &*argument_type_names,
+            &metadata_class_map,
+            &base_class_fqcns,
+            &global_resolution_di_config,
+            &const_map,
+        );
+        apply_case_index(&mut global_baseline_args, &case_index);
+        // Apply the same interceptor filter as the per-area path uses.
+        global_baseline_args.retain(|fqcn, args| {
+            if !global_interceptor_map.contains_key(fqcn) {
+                return true;
+            }
+            if metadata_base_di_config
+                .virtual_types
+                .contains_key(fqcn.as_str())
+            {
+                return true;
+            }
+            if !args.is_empty() {
+                return false;
+            }
+            let normalized = fqcn.trim_start_matches('\\');
+            if !base_class_fqcns.contains(normalized) {
+                return false;
+            }
+            matches!(
+                metadata_class_map.get(normalized).map(|info| &info.kind),
+                Some(ClassKind::Class) | Some(ClassKind::Trait)
+            )
+        });
+        log_phase_elapsed("Phase 7 global arg baseline", t_global_resolve);
 
-            // Area-specific di.xml files may define additional virtual types not present
-            // in the global di config. Extend the type universe with those for this area.
-            let area_type_names: Vec<String> = {
+        let t_dep_idx = Instant::now();
+        let (hierarchy_dep_rev, pref_dep_rev) =
+            di_resolver::arguments::build_dependency_reverse_index(
+                &*argument_type_names,
+                &metadata_class_map,
+                &global_resolution_di_config,
+            );
+        // pref_to_iface[V] = preference keys whose resolved value is V.
+        // Used to find types injecting K via an interface when K's type_config changes.
+        let mut pref_to_iface: FxHashMap<String, Vec<String>> = FxHashMap::default();
+        for (from, to) in &global_resolution_di_config.preferences {
+            pref_to_iface
+                .entry(to.trim_start_matches('\\').to_string())
+                .or_default()
+                .push(from.trim_start_matches('\\').to_string());
+        }
+        log_phase_elapsed("Phase 7 dependency reverse index", t_dep_idx);
+        let global_baseline_args = std::sync::Arc::new(global_baseline_args);
+        let global_preference_overrides = std::sync::Arc::new(global_preference_overrides);
+        let hierarchy_dep_rev = std::sync::Arc::new(hierarchy_dep_rev);
+        let pref_dep_rev = std::sync::Arc::new(pref_dep_rev);
+        let pref_to_iface = std::sync::Arc::new(pref_to_iface);
+
+        // Per-area config files — each area merges global + area-specific di.xml overlays.
+        // Run in parallel: each area is independent (different files, different output path).
+        let t_area_config = Instant::now();
+        let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
+        let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = AREAS
+            .par_iter()
+            .map(|&area| {
+                let area_di_files = filter_enabled_di_xml(
+                    find_di_xml_files_for_area(&magento_root, area, &enabled_modules),
+                    &enabled_modules,
+                    &magento_root,
+                );
+
+                // Only re-merge if there are area-specific files beyond the global set.
+                // Use Arc::clone for the no-overrides path to avoid cloning the large DiConfig.
+                // Collect changed di.xml keys before consuming extra_configs so OPT-DELTA can
+                // compute the affected type set without a full re-resolution.
+                let mut changed_hierarchy_keys: FxHashSet<String> = FxHashSet::default();
+                let mut changed_pref_keys: FxHashSet<String> = FxHashSet::default();
+                let area_di_config: std::sync::Arc<DiConfig> = if area_di_files.len()
+                    > di_xml_files.len()
+                {
+                    let area_only: Vec<_> = area_di_files
+                        .iter()
+                        .filter(|p| !di_xml_files_set.contains(p))
+                        .collect();
+                    if area_only.is_empty() {
+                        std::sync::Arc::clone(&metadata_base_di_config)
+                    } else {
+                        // Look up from Phase 3b cache; fall back to re-parsing only for
+                        // files not in the cache (should not happen in practice).
+                        let extra_configs: Vec<DiConfig> = area_only
+                            .iter()
+                            .filter_map(|p| {
+                                area_di_xml_cache
+                                    .get(*p)
+                                    .cloned()
+                                    .or_else(|| parse_di_xml(p).ok())
+                            })
+                            .collect();
+                        // Collect which keys change so OPT-DELTA can compute the affected set.
+                        for cfg in &extra_configs {
+                            for k in cfg.type_configs.keys() {
+                                changed_hierarchy_keys
+                                    .insert(k.trim_start_matches('\\').to_string());
+                            }
+                            for k in cfg.virtual_types.keys() {
+                                changed_hierarchy_keys
+                                    .insert(k.trim_start_matches('\\').to_string());
+                            }
+                            for k in cfg.preferences.keys() {
+                                changed_pref_keys.insert(k.trim_start_matches('\\').to_string());
+                            }
+                        }
+                        // Area-specific module configs applied via the same two-phase merge as
+                        // global: deep-merge area module configs together, then apply on the
+                        // global base using shallow (array_replace) semantics per PHP behaviour.
+                        let mut merged_area = apply_module_config_on_primary(
+                            (*metadata_base_di_config).clone(),
+                            merge_configs(extra_configs),
+                        );
+                        apply_resolved_constants_to_di_config(
+                            &mut merged_area,
+                            &resolved_const_values,
+                        );
+                        std::sync::Arc::new(merged_area)
+                    }
+                } else {
+                    std::sync::Arc::clone(&metadata_base_di_config)
+                };
+
+                // Build area-specific preference overrides.
+                // global_interceptor_map is shared read-only; no per-area clone needed.
+                let area_preference_overrides = build_interception_preference_overrides(
+                    &area_di_config,
+                    &global_interceptor_map,
+                );
+
+                // OPT-DELTA: also treat preference keys where area diverges from global as changed.
+                for (from, to) in &area_preference_overrides {
+                    if global_preference_overrides
+                        .get(from.as_str())
+                        .map_or(true, |g| g != to)
+                    {
+                        changed_pref_keys.insert(from.trim_start_matches('\\').to_string());
+                    }
+                }
+                for from in global_preference_overrides.keys() {
+                    if !area_preference_overrides.contains_key(from.as_str()) {
+                        changed_pref_keys.insert(from.trim_start_matches('\\').to_string());
+                    }
+                }
+
+                // OPT-DELTA: compute the set of types whose resolution could differ from the
+                // global baseline.  Only these types need a delta re-resolution.
+                let mut affected: FxHashSet<String> = FxHashSet::default();
+
+                // Extra VTs introduced in area di.xml are absent from the global baseline —
+                // they always need fresh resolution.
                 let base_set: FxHashSet<&str> =
                     argument_type_names.iter().map(|s| s.as_str()).collect();
-                let extra: Vec<String> = area_di_config_for_args
+                let area_extra_vt_names: Vec<String> = area_di_config
                     .virtual_types
                     .keys()
                     .filter(|k| !base_set.contains(k.as_str()))
                     .cloned()
                     .collect();
-                if extra.is_empty() {
-                    argument_type_names.clone()
-                } else {
-                    let mut v = argument_type_names.clone();
-                    v.extend(extra);
-                    v
+                for name in &area_extra_vt_names {
+                    affected.insert(name.clone());
                 }
-            };
-            let mut area_args = resolve_all_arguments_for_named_types(
-                &area_type_names,
-                &metadata_class_map,
-                &base_class_fqcns,
-                &area_di_config_for_args,
-                &const_map,
-            );
-            // Reuse pre-built case index: avoids rebuilding from class_map on every area.
-            apply_case_index(&mut area_args, &case_index);
-            let area_args: FxHashMap<String, Vec<di_resolver::ResolvedArg>> = area_args
-                .into_iter()
-                .filter(|(fqcn, args)| {
-                    // Intercepted concrete classes appear under ClassName\Interceptor, not
-                    // their original name.  However virtual types must still appear even when
-                    // their direct concrete type is intercepted — PHP generates arguments for
-                    // both the VT name and the Interceptor. Exception: when intercepted
-                    // source classes resolve to no constructor args, PHP keeps a class-level
-                    // NULL entry for the original class name.
-                    if !global_interceptor_map.contains_key(fqcn) {
-                        return true;
+
+                for k in &changed_hierarchy_keys {
+                    // Types that access K in their hierarchy walk.
+                    if let Some(types) = hierarchy_dep_rev.get(k) {
+                        for t in types {
+                            affected.insert(t.clone());
+                        }
                     }
-                    if metadata_base_di_config
-                        .virtual_types
-                        .contains_key(fqcn.as_str())
-                    {
-                        return true;
+                    // Types that directly inject K as a constructor type hint (K's type_config
+                    // changes affect whether args resolve as shared or non-shared).
+                    if let Some(types) = pref_dep_rev.get(k) {
+                        for t in types {
+                            affected.insert(t.clone());
+                        }
                     }
-                    if !args.is_empty() {
-                        return false;
+                    // Transitive: types that inject K via a preference (interface I → K).
+                    // Their resolved concrete type is K; K's type_config change affects them too.
+                    if let Some(ifaces) = pref_to_iface.get(k) {
+                        for iface in ifaces {
+                            if let Some(types) = pref_dep_rev.get(iface) {
+                                for t in types {
+                                    affected.insert(t.clone());
+                                }
+                            }
+                        }
                     }
-                    let normalized = fqcn.trim_start_matches('\\');
-                    if !base_class_fqcns.contains(normalized) {
-                        return false;
+                }
+                for p in &changed_pref_keys {
+                    // Types that inject via preference key P — the resolved concrete type may change.
+                    if let Some(types) = pref_dep_rev.get(p) {
+                        for t in types {
+                            affected.insert(t.clone());
+                        }
                     }
-                    matches!(
-                        metadata_class_map.get(normalized).map(|info| &info.kind),
-                        Some(ClassKind::Class) | Some(ClassKind::Trait)
+                }
+
+                let t_area_delta = Instant::now();
+                let affected_count = affected.len();
+                let area_content = if affected.is_empty() {
+                    // Fast path: global baseline applies as-is — no clone needed.
+                    generate_area_config_with_overrides(
+                        &*global_baseline_args,
+                        &FxHashMap::default(),
+                        &area_di_config,
+                        &area_preference_overrides,
+                        &global_interceptor_map,
                     )
-                })
-                .collect();
-            let area_content = generate_area_config_with_overrides(
-                &area_args,
-                &area_di_config,
-                &area_preference_overrides,
-                &global_interceptor_map,
-            );
-            let area_path = metadata_root.join(format!("{}.php", area));
-            let _ = write_if_changed(&area_path, &area_content);
-            pb_area.inc(1);
-            (area.to_string(), area_di_config)
-        })
-        .collect();
-    pb_area.finish_with_message("done");
-    log::debug!("Phase 7 area-config loop: {:?}", t_area_config.elapsed());
+                } else {
+                    // Delta path: build area_di_config_for_args with interception overrides.
+                    let mut area_di_config_for_args = (*area_di_config).clone();
+                    for (from, to) in &area_preference_overrides {
+                        // Keep VT argument values stable: synthetic interception overrides for
+                        // virtual-type names should not participate in argument object resolution.
+                        if area_di_config_for_args
+                            .virtual_types
+                            .contains_key(from.as_str())
+                        {
+                            continue;
+                        }
+                        area_di_config_for_args.insert_preference(from.clone(), to.clone());
+                    }
 
-    // Scope-specific plugin-list metadata files.
-    let plugin_list_class_definitions: Vec<String> = Vec::new();
-    let plugin_scopes = [
-        "global",
-        "adminhtml",
-        "crontab",
-        "frontend",
-        "graphql",
-        "webapi_rest",
-        "webapi_soap",
-    ];
-    let t_plugin_list = Instant::now();
-    let pb_plugins = progress_bar(
-        plugin_scopes.len() as u64,
-        "Generating plugin-list metadata",
-    );
-    for scope in plugin_scopes {
-        if let Some(scope_di_config) = area_di_configs.get(scope) {
-            // For non-global scopes virtual types are not emitted; pass the flag
-            // directly instead of cloning + clearing the full DiConfig.
-            let include_vt = scope == "global";
-            let metadata = compile_plugin_list(
-                &**scope_di_config,
-                &class_map,
-                &plugin_list_class_definitions,
-                include_vt,
-            );
-            let content = serialize_plugin_list_php(&metadata);
-            let cache_id = plugin_list_cache_id(scope);
-            let path = metadata_root.join(format!("{}.php", cache_id));
-            let _ = write_if_changed(&path, &content);
-        }
-        pb_plugins.inc(1);
-    }
-    pb_plugins.finish_with_message("done");
-    log::debug!("Phase 7 plugin-list loop: {:?}", t_plugin_list.elapsed());
+                    // Resolve only the affected types (plus any new area VTs).
+                    let affected_names: Vec<String> = affected.into_iter().collect();
+                    let mut delta_args = resolve_all_arguments_for_named_types(
+                        &affected_names,
+                        &metadata_class_map,
+                        &base_class_fqcns,
+                        &area_di_config_for_args,
+                        &const_map,
+                    );
+                    apply_case_index(&mut delta_args, &case_index);
+                    // Apply the same interceptor filter to the delta results.
+                    delta_args.retain(|fqcn, args| {
+                        if !global_interceptor_map.contains_key(fqcn) {
+                            return true;
+                        }
+                        if metadata_base_di_config
+                            .virtual_types
+                            .contains_key(fqcn.as_str())
+                        {
+                            return true;
+                        }
+                        if !args.is_empty() {
+                            return false;
+                        }
+                        let normalized = fqcn.trim_start_matches('\\');
+                        if !base_class_fqcns.contains(normalized) {
+                            return false;
+                        }
+                        matches!(
+                            metadata_class_map.get(normalized).map(|info| &info.kind),
+                            Some(ClassKind::Class) | Some(ClassKind::Trait)
+                        )
+                    });
+                    // OVERLAY: pass baseline + delta directly — no 25K HashMap clone.
+                    generate_area_config_with_overrides(
+                        &*global_baseline_args,
+                        &delta_args,
+                        &area_di_config,
+                        &area_preference_overrides,
+                        &global_interceptor_map,
+                    )
+                };
+                log::debug!(
+                    "Phase 7 area={} delta (changed_keys={}, affected={}, extra_vt={}): {:?}",
+                    area,
+                    changed_hierarchy_keys.len() + changed_pref_keys.len(),
+                    affected_count,
+                    area_extra_vt_names.len(),
+                    t_area_delta.elapsed()
+                );
+                let area_path = metadata_root.join(format!("{}.php", area));
+                let _ = write_if_changed(&area_path, &area_content);
+                pb_area.inc(1);
+                (area.to_string(), area_di_config)
+            })
+            .collect();
+        pb_area.finish_with_message("done");
+        log_phase_elapsed("Phase 7 area-config loop", t_area_config);
 
-    // App action list metadata.
-    let app_action_list = generate_app_action_list_php(&class_map);
-    let app_action_list_path = metadata_root.join("app_action_list.php");
-    let _ = write_if_changed(&app_action_list_path, &app_action_list);
+        // Scope-specific plugin-list metadata files.
+        let plugin_list_class_definitions: Vec<String> = Vec::new();
+        let plugin_scopes = [
+            "global",
+            "adminhtml",
+            "crontab",
+            "frontend",
+            "graphql",
+            "webapi_rest",
+            "webapi_soap",
+        ];
+        let t_plugin_list = Instant::now();
+        let pb_plugins = progress_bar(
+            plugin_scopes.len() as u64,
+            "Generating plugin-list metadata",
+        );
+        plugin_scopes.par_iter().for_each(|&scope| {
+            if let Some(scope_di_config) = area_di_configs.get(scope) {
+                // For non-global scopes virtual types are not emitted; pass the flag
+                // directly instead of cloning + clearing the full DiConfig.
+                let include_vt = scope == "global";
+                let t_scope = Instant::now();
+                let metadata = compile_plugin_list(
+                    &**scope_di_config,
+                    &class_map,
+                    &plugin_list_class_definitions,
+                    include_vt,
+                );
+                let content = serialize_plugin_list_php(&metadata);
+                let cache_id = plugin_list_cache_id(scope);
+                let path = metadata_root.join(format!("{}.php", cache_id));
+                let _ = write_if_changed(&path, &content);
+                log::debug!(
+                    "Phase 7 plugin-list scope={}: {:?}",
+                    scope,
+                    t_scope.elapsed()
+                );
+            }
+            pb_plugins.inc(1);
+        });
+        pb_plugins.finish_with_message("done");
+        log_phase_elapsed("Phase 7 plugin-list loop", t_plugin_list);
+
+        // App action list metadata.
+        let app_action_list = generate_app_action_list_php(&class_map);
+        let app_action_list_path = metadata_root.join("app_action_list.php");
+        let _ = write_if_changed(&app_action_list_path, &app_action_list);
+        let _ = std::fs::create_dir_all(&fp_dir);
+        let _ = std::fs::write(&fp_path, new_fp);
+    } // end 'phase7
     log_phase_elapsed("Phase 7", phase_7_started);
 
     let total_written = written.load(std::sync::atomic::Ordering::Relaxed);
@@ -1478,6 +1716,432 @@ fn progress_bar(len: u64, msg: &str) -> ProgressBar {
     );
     pb.set_message(msg.to_string());
     pb
+}
+
+fn hash_di_argument(h: &mut impl std::hash::Hasher, arg: &di_xml_reader::Argument) {
+    use di_xml_reader::Argument;
+    match arg {
+        Argument::Object {
+            name,
+            value,
+            shared,
+            sort_order,
+        } => {
+            h.write_u8(0);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write(value.as_bytes());
+            h.write_u8(0);
+            h.write_u8(shared.map(|b| b as u8 + 1).unwrap_or(0));
+            h.write_i32(*sort_order);
+        }
+        Argument::String {
+            name,
+            value,
+            sort_order,
+        } => {
+            h.write_u8(1);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write(value.as_bytes());
+            h.write_u8(0);
+            h.write_i32(*sort_order);
+        }
+        Argument::Boolean {
+            name,
+            value,
+            sort_order,
+        } => {
+            h.write_u8(2);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write_u8(*value as u8);
+            h.write_i32(*sort_order);
+        }
+        Argument::Number {
+            name,
+            value,
+            sort_order,
+        } => {
+            h.write_u8(3);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write(value.as_bytes());
+            h.write_u8(0);
+            h.write_i32(*sort_order);
+        }
+        Argument::Null { name, sort_order } => {
+            h.write_u8(4);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write_i32(*sort_order);
+        }
+        Argument::Array {
+            name,
+            items,
+            sort_order,
+        } => {
+            h.write_u8(5);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write_usize(items.len());
+            for item in items {
+                hash_di_argument(h, item);
+            }
+            h.write_i32(*sort_order);
+        }
+        Argument::Init {
+            name,
+            value,
+            sort_order,
+        } => {
+            h.write_u8(6);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write(value.as_bytes());
+            h.write_u8(0);
+            h.write_i32(*sort_order);
+        }
+        Argument::Const {
+            name,
+            value,
+            sort_order,
+        } => {
+            h.write_u8(7);
+            h.write(name.as_bytes());
+            h.write_u8(0);
+            h.write(value.as_bytes());
+            h.write_u8(0);
+            h.write_i32(*sort_order);
+        }
+    }
+}
+
+fn hash_method_signature(h: &mut impl std::hash::Hasher, method: &MethodSignature) {
+    h.write(method.name.as_bytes());
+    h.write_u8(0);
+    h.write_u8(method.is_static as u8);
+    h.write_u8(method.returns_reference as u8);
+    match &method.return_type {
+        Some(t) => {
+            h.write_u8(1);
+            h.write(t.as_bytes());
+            h.write_u8(0);
+        }
+        None => h.write_u8(0),
+    }
+
+    h.write_usize(method.params.len());
+    for param in &method.params {
+        h.write(param.name.as_bytes());
+        h.write_u8(0);
+        match &param.type_hint {
+            Some(t) => {
+                h.write_u8(1);
+                h.write(t.as_bytes());
+                h.write_u8(0);
+            }
+            None => h.write_u8(0),
+        }
+        h.write_u8(param.has_default as u8);
+        match &param.default_value {
+            Some(d) => {
+                h.write_u8(1);
+                h.write(d.as_bytes());
+                h.write_u8(0);
+            }
+            None => h.write_u8(0),
+        }
+        h.write_u8(param.is_variadic as u8);
+        h.write_u8(param.is_by_ref as u8);
+    }
+}
+
+fn compute_phase7_fp(
+    class_map: &FxHashMap<String, ClassInfo>,
+    full_di_config: &DiConfig,
+    interceptors: &[di_resolver::InterceptorSpec],
+    factories: &[FactorySpec],
+    proxies: &[di_resolver::ProxySpec],
+    search_results: &[SearchResultsSpec],
+    proxy_deferred: &[ProxyDeferredSpec],
+    extension_specs: &[ExtensionSpec],
+    resolved_const_values: &FxHashMap<String, ResolvedConstValue>,
+    module_paths: &[PathBuf],
+) -> [u8; 8] {
+    use php_extractor::types::ClassKind;
+    use std::hash::Hasher;
+
+    let mut h = rustc_hash::FxHasher::default();
+    h.write_u64(4u64); // version — bump to force cache invalidation on codegen changes
+
+    // --- class_map: FQCN + full ClassInfo content ---
+    let mut class_keys: Vec<&str> = class_map.keys().map(|s| s.as_str()).collect();
+    class_keys.sort_unstable();
+    h.write_usize(class_keys.len());
+    for fqcn in &class_keys {
+        h.write(fqcn.as_bytes());
+        h.write_u8(0);
+        let info = &class_map[*fqcn];
+        h.write_u8(match info.kind {
+            ClassKind::Class => 0,
+            ClassKind::AbstractClass => 1,
+            ClassKind::Interface => 2,
+            ClassKind::Trait => 3,
+            ClassKind::Enum => 4,
+        });
+        h.write_u8(info.is_abstract as u8);
+        h.write_u8(info.is_final as u8);
+        match &info.extends {
+            Some(s) => {
+                h.write_u8(1);
+                h.write(s.as_bytes());
+                h.write_u8(0);
+            }
+            None => h.write_u8(0),
+        }
+        h.write_usize(info.implements.len());
+        for iface in &info.implements {
+            h.write(iface.as_bytes());
+            h.write_u8(0);
+        }
+        match &info.constructor {
+            Some(ctor) => {
+                h.write_u8(1);
+                h.write_usize(ctor.params.len());
+                for p in &ctor.params {
+                    h.write(p.name.as_bytes());
+                    h.write_u8(0);
+                    match &p.type_hint {
+                        Some(t) => {
+                            h.write_u8(1);
+                            h.write(t.as_bytes());
+                            h.write_u8(0);
+                        }
+                        None => h.write_u8(0),
+                    }
+                    h.write_u8(p.is_optional as u8);
+                    h.write_u8(p.is_primitive as u8);
+                    h.write_u8(p.is_variadic as u8);
+                    match &p.default_value {
+                        Some(d) => {
+                            h.write_u8(1);
+                            h.write(d.as_bytes());
+                            h.write_u8(0);
+                        }
+                        None => h.write_u8(0),
+                    }
+                }
+            }
+            None => h.write_u8(0),
+        }
+
+        // Plugin-list metadata is derived from plugin class public methods
+        // (`before*`, `around*`, `after*`). Include the full method surface so
+        // warm fingerprint hits cannot skip after a plugin method change.
+        let mut methods: Vec<&MethodSignature> = info.public_methods.iter().collect();
+        methods.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        h.write_usize(methods.len());
+        for method in methods {
+            hash_method_signature(&mut h, method);
+        }
+    }
+
+    // --- preferences: key + value ---
+    let mut prefs: Vec<(&str, &str)> = full_di_config
+        .preferences
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    prefs.sort_unstable();
+    h.write_usize(prefs.len());
+    for (k, v) in &prefs {
+        h.write(k.as_bytes());
+        h.write_u8(1);
+        h.write(v.as_bytes());
+        h.write_u8(0);
+    }
+
+    // --- virtual_types: key + type_name ---
+    let mut vts: Vec<(&str, &str)> = full_di_config
+        .virtual_types
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.type_name.as_str()))
+        .collect();
+    vts.sort_unstable();
+    h.write_usize(vts.len());
+    for (k, v) in &vts {
+        h.write(k.as_bytes());
+        h.write_u8(1);
+        h.write(v.as_bytes());
+        h.write_u8(0);
+    }
+
+    // --- type_configs: key + shared flag + full argument tree ---
+    let mut tc_keys: Vec<&str> = full_di_config
+        .type_configs
+        .keys()
+        .map(|s| s.as_str())
+        .collect();
+    tc_keys.sort_unstable();
+    h.write_usize(tc_keys.len());
+    for k in &tc_keys {
+        h.write(k.as_bytes());
+        h.write_u8(0);
+        let tc = &full_di_config.type_configs[*k];
+        h.write_u8(tc.shared.map(|b| b as u8 + 1).unwrap_or(0));
+        h.write_usize(tc.arguments.len());
+        for arg in &tc.arguments {
+            hash_di_argument(&mut h, arg);
+        }
+    }
+
+    // --- plugins: owner key + per-plugin name/type/sort/disabled ---
+    let mut plugin_keys: Vec<&str> = full_di_config.plugins.keys().map(|s| s.as_str()).collect();
+    plugin_keys.sort_unstable();
+    h.write_usize(plugin_keys.len());
+    for k in &plugin_keys {
+        h.write(k.as_bytes());
+        h.write_u8(0);
+        let ps = &full_di_config.plugins[*k];
+        let mut sorted_ps: Vec<&di_xml_reader::Plugin> = ps.iter().collect();
+        sorted_ps.sort_unstable_by_key(|p| p.name.as_str());
+        h.write_usize(sorted_ps.len());
+        for p in sorted_ps {
+            h.write(p.name.as_bytes());
+            h.write_u8(0);
+            h.write(p.type_name.as_bytes());
+            h.write_u8(0);
+            h.write_i32(p.sort_order);
+            h.write_u8(p.disabled as u8);
+        }
+    }
+
+    // --- interceptors: fqcn + plugin refs + public method names ---
+    let mut int_idx: Vec<usize> = (0..interceptors.len()).collect();
+    int_idx.sort_unstable_by_key(|&i| interceptors[i].fqcn.as_str());
+    h.write_usize(int_idx.len());
+    for i in int_idx {
+        let spec = &interceptors[i];
+        h.write(spec.fqcn.as_bytes());
+        h.write_u8(0);
+        let mut ps: Vec<&di_resolver::PluginRef> = spec.plugins.iter().collect();
+        ps.sort_unstable_by_key(|p| p.name.as_str());
+        h.write_usize(ps.len());
+        for p in ps {
+            h.write(p.name.as_bytes());
+            h.write_u8(0);
+            h.write(p.type_name.as_bytes());
+            h.write_u8(0);
+            h.write_i32(p.sort_order);
+        }
+        h.write_usize(spec.public_methods.len());
+        for m in &spec.public_methods {
+            h.write(m.name.as_bytes());
+            h.write_u8(0);
+            h.write_u8(m.is_static as u8);
+        }
+    }
+
+    // --- factories: target + factory fqcns ---
+    let mut f_idx: Vec<usize> = (0..factories.len()).collect();
+    f_idx.sort_unstable_by_key(|&i| factories[i].factory_fqcn.as_str());
+    h.write_usize(f_idx.len());
+    for i in f_idx {
+        h.write(factories[i].target_fqcn.as_bytes());
+        h.write_u8(0);
+        h.write(factories[i].factory_fqcn.as_bytes());
+        h.write_u8(0);
+    }
+
+    // --- proxies: target + proxy fqcns ---
+    let mut p_idx: Vec<usize> = (0..proxies.len()).collect();
+    p_idx.sort_unstable_by_key(|&i| proxies[i].proxy_fqcn.as_str());
+    h.write_usize(p_idx.len());
+    for i in p_idx {
+        h.write(proxies[i].target_fqcn.as_bytes());
+        h.write_u8(0);
+        h.write(proxies[i].proxy_fqcn.as_bytes());
+        h.write_u8(0);
+    }
+
+    // --- search_results ---
+    let mut sr_idx: Vec<usize> = (0..search_results.len()).collect();
+    sr_idx.sort_unstable_by_key(|&i| search_results[i].result_fqcn.as_str());
+    h.write_usize(sr_idx.len());
+    for i in sr_idx {
+        h.write(search_results[i].result_fqcn.as_bytes());
+        h.write_u8(0);
+        h.write(search_results[i].source_fqcn.as_bytes());
+        h.write_u8(0);
+    }
+
+    // --- proxy_deferred ---
+    let mut pd_idx: Vec<usize> = (0..proxy_deferred.len()).collect();
+    pd_idx.sort_unstable_by_key(|&i| proxy_deferred[i].proxy_fqcn.as_str());
+    h.write_usize(pd_idx.len());
+    for i in pd_idx {
+        h.write(proxy_deferred[i].proxy_fqcn.as_bytes());
+        h.write_u8(0);
+        h.write(proxy_deferred[i].target_fqcn.as_bytes());
+        h.write_u8(0);
+    }
+
+    // --- extension_specs ---
+    let mut es_idx: Vec<usize> = (0..extension_specs.len()).collect();
+    es_idx.sort_unstable_by_key(|&i| extension_specs[i].extension_interface_fqcn.as_str());
+    h.write_usize(es_idx.len());
+    for i in es_idx {
+        let spec = &extension_specs[i];
+        h.write(spec.source_interface_fqcn.as_bytes());
+        h.write_u8(0);
+        h.write(spec.extension_interface_fqcn.as_bytes());
+        h.write_u8(0);
+        h.write(spec.extension_class_fqcn.as_bytes());
+        h.write_u8(0);
+        h.write_usize(spec.attributes.len());
+        for attr in &spec.attributes {
+            h.write(attr.code.as_bytes());
+            h.write_u8(0);
+            h.write(attr.php_type.as_bytes());
+            h.write_u8(0);
+        }
+    }
+
+    // --- resolved PHP constants (values from PHP runtime, not source-scanned) ---
+    let mut consts: Vec<(&str, u8, &str)> = resolved_const_values
+        .iter()
+        .map(|(k, v)| {
+            let (tag, s) = match v {
+                ResolvedConstValue::String(s) => (0u8, s.as_str()),
+                ResolvedConstValue::Number(s) => (1u8, s.as_str()),
+                ResolvedConstValue::Bool(true) => (2u8, "true"),
+                ResolvedConstValue::Bool(false) => (3u8, "false"),
+                ResolvedConstValue::Null => (4u8, ""),
+            };
+            (k.as_str(), tag, s)
+        })
+        .collect();
+    consts.sort_unstable_by_key(|(k, _, _)| *k);
+    h.write_usize(consts.len());
+    for (k, tag, s) in &consts {
+        h.write(k.as_bytes());
+        h.write_u8(0);
+        h.write_u8(*tag);
+        h.write(s.as_bytes());
+        h.write_u8(0);
+    }
+
+    // --- module_paths (setup runtime override inputs) ---
+    let mut mpaths: Vec<&str> = module_paths.iter().filter_map(|p| p.to_str()).collect();
+    mpaths.sort_unstable();
+    h.write_usize(mpaths.len());
+    for p in &mpaths {
+        h.write(p.as_bytes());
+        h.write_u8(0);
+    }
+
+    h.finish().to_le_bytes()
 }
 
 fn log_phase_elapsed(phase: &str, started: Instant) {
@@ -5363,7 +6027,9 @@ mod tests {
         ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue, ResolvedScalar,
     };
     use di_xml_reader::{Argument, DiConfig, VirtualType};
-    use php_extractor::types::{ClassInfo, ClassKind, Constructor, ConstructorParam};
+    use php_extractor::types::{
+        ClassInfo, ClassKind, Constructor, ConstructorParam, MethodSignature,
+    };
     use rustc_hash::FxHashMap;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -5437,6 +6103,61 @@ mod tests {
         info.path = path;
         info.constructor = Some(Constructor { params });
         info
+    }
+
+    #[test]
+    fn phase7_fingerprint_changes_when_public_plugin_method_changes() {
+        let mut class_map = FxHashMap::default();
+        let mut plugin_info = class_info("Vendor\\Module\\Plugin", None, false);
+        plugin_info.public_methods = vec![MethodSignature {
+            name: "beforeSave".to_string(),
+            params: vec![],
+            return_type: None,
+            is_static: false,
+            returns_reference: false,
+        }];
+        class_map.insert(plugin_info.fqcn.clone(), plugin_info.clone());
+
+        let di_config = DiConfig::default();
+        let interceptors: Vec<di_resolver::InterceptorSpec> = Vec::new();
+        let factories: Vec<di_resolver::FactorySpec> = Vec::new();
+        let proxies: Vec<di_resolver::ProxySpec> = Vec::new();
+        let search_results: Vec<super::SearchResultsSpec> = Vec::new();
+        let proxy_deferred: Vec<super::ProxyDeferredSpec> = Vec::new();
+        let extension_specs: Vec<code_generator::ExtensionSpec> = Vec::new();
+        let resolved_const_values: FxHashMap<String, super::ResolvedConstValue> =
+            FxHashMap::default();
+        let module_paths: Vec<PathBuf> = Vec::new();
+
+        let before = super::compute_phase7_fp(
+            &class_map,
+            &di_config,
+            &interceptors,
+            &factories,
+            &proxies,
+            &search_results,
+            &proxy_deferred,
+            &extension_specs,
+            &resolved_const_values,
+            &module_paths,
+        );
+
+        plugin_info.public_methods[0].name = "afterSave".to_string();
+        class_map.insert(plugin_info.fqcn.clone(), plugin_info);
+        let after = super::compute_phase7_fp(
+            &class_map,
+            &di_config,
+            &interceptors,
+            &factories,
+            &proxies,
+            &search_results,
+            &proxy_deferred,
+            &extension_specs,
+            &resolved_const_values,
+            &module_paths,
+        );
+
+        assert_ne!(before, after);
     }
 
     #[test]

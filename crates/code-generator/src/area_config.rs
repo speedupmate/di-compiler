@@ -5,12 +5,41 @@
 //!   - `preferences` — interface → implementation map (from DiConfig)
 //!   - `instanceTypes` — virtualType name → concrete type map
 
+use std::borrow::Cow;
+use std::fmt::Write as FmtWrite;
+
 use rustc_hash::FxHashMap;
 
 use di_resolver::{ResolvedArg, ResolvedArgValue, ResolvedArrayItem, ResolvedArrayValue};
 use di_xml_reader::DiConfig;
 
 use crate::metadata::{escape_php, render_scalar, render_untyped_default};
+
+// Static pad strings eliminate " ".repeat(n) heap allocations in hot serialization loops.
+const PADS: &[&str] = &[
+    "",               // 0
+    " ",              // 1
+    "  ",             // 2
+    "   ",            // 3
+    "    ",           // 4
+    "     ",          // 5
+    "      ",         // 6
+    "       ",        // 7
+    "        ",       // 8
+    "         ",      // 9
+    "          ",     // 10
+    "           ",    // 11
+    "            ",   // 12
+    "             ",  // 13
+    "              ", // 14
+];
+
+fn spad(n: usize) -> Cow<'static, str> {
+    match PADS.get(n) {
+        Some(&s) => Cow::Borrowed(s),
+        None => Cow::Owned(" ".repeat(n)),
+    }
+}
 
 /// Generate the PHP source for one area config file.
 ///
@@ -22,6 +51,7 @@ pub fn generate_area_config(
 ) -> String {
     generate_area_config_with_overrides(
         args_map,
+        &FxHashMap::default(),
         di_config,
         &FxHashMap::default(),
         &FxHashMap::default(),
@@ -35,33 +65,54 @@ pub fn generate_area_config_with_extra_preferences(
     di_config: &DiConfig,
     extra_preferences: &FxHashMap<String, String>,
 ) -> String {
-    generate_area_config_with_overrides(args_map, di_config, extra_preferences, extra_preferences)
+    generate_area_config_with_overrides(
+        args_map,
+        &FxHashMap::default(),
+        di_config,
+        extra_preferences,
+        extra_preferences,
+    )
 }
 
 /// Generate area config while injecting separate override maps:
+/// - `args_delta` entries override `args_baseline` entries in the arguments section
+///   (avoids a full clone of `args_baseline` in the delta-resolve path).
 /// - `preference_overrides` are applied to the preferences section.
 /// - `instance_type_overrides` are applied only to resolved instanceTypes targets.
 pub fn generate_area_config_with_overrides(
-    args_map: &FxHashMap<String, Vec<ResolvedArg>>,
+    args_baseline: &FxHashMap<String, Vec<ResolvedArg>>,
+    args_delta: &FxHashMap<String, Vec<ResolvedArg>>,
     di_config: &DiConfig,
     preference_overrides: &FxHashMap<String, String>,
     instance_type_overrides: &FxHashMap<String, String>,
 ) -> String {
-    let mut out = String::from("<?php return array (\n");
+    // Pre-allocate: estimate output size from entry counts to avoid String reallocations.
+    // ~100 bytes/arg-entry (NULL entries ~50, non-empty ~150), ~60/pref, ~80/VT.
+    let cap = (args_baseline.len() + args_delta.len()) * 100
+        + (di_config.preferences.len() + preference_overrides.len()) * 60
+        + di_config.virtual_types.len() * 80
+        + 64;
+    let mut out = String::with_capacity(cap);
 
-    // Section: arguments
-    out.push_str("  'arguments' => \n  array (\n");
-    let mut sorted_fqcns: Vec<&String> = args_map.keys().collect();
-    sorted_fqcns.sort();
+    out.push_str("<?php return array (\n  'arguments' => \n  array (\n");
+
+    // Section: arguments — union baseline + delta keys, sorted for deterministic output.
+    // Delta entries shadow baseline entries (area-specific resolution overrides global).
+    let mut sorted_fqcns: Vec<&String> = args_baseline.keys().collect();
+    for k in args_delta.keys() {
+        if !args_baseline.contains_key(k) {
+            sorted_fqcns.push(k);
+        }
+    }
+    sorted_fqcns.sort_unstable();
     for fqcn in sorted_fqcns {
-        let args = &args_map[fqcn];
+        let args = args_delta.get(fqcn).unwrap_or_else(|| &args_baseline[fqcn]);
         if args.is_empty() {
-            // PHP emits NULL for types in the universe whose constructor args resolve to nothing
-            // (class doesn't exist on disk, has no constructor, or all args are defaults).
-            out.push_str(&format!("    '{}' => NULL,\n", escape_php(fqcn)));
+            // PHP emits NULL for types whose constructor args resolve to nothing.
+            write!(out, "    '{}' => NULL,\n", escape_php(fqcn)).unwrap();
             continue;
         }
-        out.push_str(&format!("    '{}' => \n    array (\n", escape_php(fqcn)));
+        write!(out, "    '{}' => \n    array (\n", escape_php(fqcn)).unwrap();
         for arg in args {
             serialize_arg_indent(&mut out, &arg.name, &arg.resolved, 6);
         }
@@ -69,37 +120,25 @@ pub fn generate_area_config_with_overrides(
     }
     out.push_str("  ),\n");
 
-    // Section: preferences
-    // Merge di.xml preferences with interception preferences (extra_preferences maps
-    // Concrete → Concrete\Interceptor). Also add VTs whose DIRECT type is an intercepted
-    // concrete — they get a preference entry pointing to the Interceptor.
+    // Section: preferences — merge di.xml preferences with interception overrides.
+    // Virtual type names must NOT appear here; VTs go in instanceTypes.
     out.push_str("  'preferences' => \n  array (\n");
     let mut merged_preferences = di_config.preferences.clone();
     for (from, to) in preference_overrides {
         merged_preferences.insert(from.clone(), to.clone());
     }
-    // NOTE: Virtual type names must NOT appear in the preferences section.
-    // PHP only maps concrete class → ClassName\Interceptor in preferences.
-    // VTs are resolved via instanceTypes, not preferences.
     let mut sorted_prefs: Vec<(&String, &String)> = merged_preferences.iter().collect();
-    sorted_prefs.sort_by_key(|(k, _)| k.as_str());
+    sorted_prefs.sort_unstable_by_key(|(k, _)| k.as_str());
     for (from, to) in sorted_prefs {
-        out.push_str(&format!(
-            "    '{}' => '{}',\n",
-            escape_php(from),
-            escape_php(to)
-        ));
+        write!(out, "    '{}' => '{}',\n", escape_php(from), escape_php(to)).unwrap();
     }
     out.push_str("  ),\n");
 
-    // Section: instanceTypes (virtualTypes)
-    // Config\Compiled::getInstanceType only follows ONE hop, so we must fully resolve
-    // VT chains here (VT → VT → Concrete becomes VT → Concrete).
+    // Section: instanceTypes — fully-resolved VT chains (VT → VT → Concrete → Concrete).
     out.push_str("  'instanceTypes' => \n  array (\n");
     let mut sorted_vt: Vec<&String> = di_config.virtual_types.keys().collect();
-    sorted_vt.sort();
+    sorted_vt.sort_unstable();
     for name in sorted_vt {
-        // Follow VT chain to the final concrete type
         let mut concrete = di_config.virtual_types[name].type_name.as_str();
         let mut steps = 0;
         while let Some(vt) = di_config.virtual_types.get(concrete) {
@@ -107,167 +146,159 @@ pub fn generate_area_config_with_overrides(
             steps += 1;
             if steps > 64 {
                 break;
-            } // guard against cycles
+            }
         }
-        // If the resolved concrete is intercepted, point to its Interceptor.
         let resolved = instance_type_overrides
             .get(concrete.trim_start_matches('\\'))
             .map(|s| s.as_str())
             .unwrap_or(concrete);
-        out.push_str(&format!(
+        write!(
+            out,
             "    '{}' => '{}',\n",
             escape_php(name),
             escape_php(resolved)
-        ));
+        )
+        .unwrap();
     }
-    out.push_str("  ),\n");
-
-    out.push_str(");\n");
+    out.push_str("  ),\n);\n");
     out
 }
 
 fn serialize_arg_indent(out: &mut String, name: &str, value: &ResolvedArgValue, indent: usize) {
     use ResolvedArgValue::*;
-    let pad = " ".repeat(indent);
-    out.push_str(&format!(
-        "{}'{}' => \n{}array (\n",
-        pad,
-        escape_php(name),
-        pad
-    ));
+    let p = spad(indent);
+    if let GlobalArgRef { arg_name, default } = value {
+        let ds = match default {
+            Some(d) => render_untyped_default(d),
+            None => "NULL".to_string(),
+        };
+        write!(
+            out,
+            "{}'{}' => \n{}array (\n{}  '_a_' => '{}',\n{}  '_d_' => {},\n{}),\n",
+            p,
+            escape_php(name),
+            p,
+            p,
+            escape_php(arg_name),
+            p,
+            ds,
+            p
+        )
+        .unwrap();
+        return;
+    }
+    write!(out, "{}'{}' => \n{}array (\n", p, escape_php(name), p).unwrap();
     match value {
-        SharedInstance(fqcn) => {
-            out.push_str(&format!("{}  '_i_' => '{}',\n", pad, escape_php(fqcn)));
-        }
+        SharedInstance(fqcn) => write!(out, "{}  '_i_' => '{}',\n", p, escape_php(fqcn)).unwrap(),
         NonSharedInstance(fqcn) => {
-            out.push_str(&format!("{}  '_ins_' => '{}',\n", pad, escape_php(fqcn)));
+            write!(out, "{}  '_ins_' => '{}',\n", p, escape_php(fqcn)).unwrap()
         }
-        Scalar(val) => {
-            out.push_str(&format!("{}  '_v_' => {},\n", pad, render_scalar(val)));
-        }
-        Null => {
-            out.push_str(&format!("{}  '_vn_' => true,\n", pad));
-        }
+        Scalar(val) => write!(out, "{}  '_v_' => {},\n", p, render_scalar(val)).unwrap(),
+        Null => write!(out, "{}  '_vn_' => true,\n", p).unwrap(),
         Array(items) => {
-            out.push_str(&format!("{}  '_vac_' => \n{}  array (\n", pad, pad));
+            write!(out, "{}  '_vac_' => \n{}  array (\n", p, p).unwrap();
             for item in items {
                 serialize_vac_entry(out, &item.name, &item.resolved, indent + 4);
             }
-            out.push_str(&format!("{}  ),\n", pad));
+            write!(out, "{}  ),\n", p).unwrap();
         }
         PlainArray(items) => {
-            out.push_str(&format!("{}  '_v_' => \n{}  array (\n", pad, pad));
+            write!(out, "{}  '_v_' => \n{}  array (\n", p, p).unwrap();
             serialize_plain_array_items(out, items, indent + 4);
-            out.push_str(&format!("{}  ),\n", pad));
+            write!(out, "{}  ),\n", p).unwrap();
         }
-        GlobalArgRef { arg_name, default } => {
-            out.push_str(&format!("{}  '_a_' => '{}',\n", pad, escape_php(arg_name)));
-            let default_str = match default {
-                Some(d) => render_untyped_default(d),
-                None => "NULL".to_string(),
-            };
-            out.push_str(&format!("{}  '_d_' => {},\n", pad, default_str));
-        }
+        GlobalArgRef { .. } => unreachable!(),
     }
-    out.push_str(&format!("{}),\n", pad));
+    write!(out, "{}),\n", p).unwrap();
 }
 
 fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, indent: usize) {
     use ResolvedArgValue::*;
-    let pad = " ".repeat(indent);
+    let p = spad(indent);
     match value {
-        SharedInstance(fqcn) => {
-            out.push_str(&format!(
-                "{}'{}' => \n{}array (\n{}  '_i_' => '{}',\n{}),\n",
-                pad,
-                escape_php(name),
-                pad,
-                pad,
-                escape_php(fqcn),
-                pad
-            ));
-        }
-        NonSharedInstance(fqcn) => {
-            out.push_str(&format!(
-                "{}'{}' => \n{}array (\n{}  '_ins_' => '{}',\n{}),\n",
-                pad,
-                escape_php(name),
-                pad,
-                pad,
-                escape_php(fqcn),
-                pad
-            ));
-        }
+        SharedInstance(fqcn) => write!(
+            out,
+            "{}'{}' => \n{}array (\n{}  '_i_' => '{}',\n{}),\n",
+            p,
+            escape_php(name),
+            p,
+            p,
+            escape_php(fqcn),
+            p
+        )
+        .unwrap(),
+        NonSharedInstance(fqcn) => write!(
+            out,
+            "{}'{}' => \n{}array (\n{}  '_ins_' => '{}',\n{}),\n",
+            p,
+            escape_php(name),
+            p,
+            p,
+            escape_php(fqcn),
+            p
+        )
+        .unwrap(),
         GlobalArgRef { arg_name, default } => {
-            out.push_str(&format!(
-                "{}'{}' => \n{}array (\n{}  '_a_' => '{}',\n",
-                pad,
-                escape_php(name),
-                pad,
-                pad,
-                escape_php(arg_name)
-            ));
-            let default_str = match default {
+            let ds = match default {
                 Some(d) => render_untyped_default(d),
                 None => "NULL".to_string(),
             };
-            out.push_str(&format!("{}  '_d_' => {},\n{}),\n", pad, default_str, pad));
-        }
-        Scalar(val) => {
-            out.push_str(&format!(
-                "{}'{}' => {},\n",
-                pad,
+            write!(
+                out,
+                "{}'{}' => \n{}array (\n{}  '_a_' => '{}',\n{}  '_d_' => {},\n{}),\n",
+                p,
                 escape_php(name),
-                render_scalar(val)
-            ));
+                p,
+                p,
+                escape_php(arg_name),
+                p,
+                ds,
+                p
+            )
+            .unwrap();
         }
-        Null => {
-            out.push_str(&format!("{}'{}' => NULL,\n", pad, escape_php(name)));
-        }
+        Scalar(val) => write!(
+            out,
+            "{}'{}' => {},\n",
+            p,
+            escape_php(name),
+            render_scalar(val)
+        )
+        .unwrap(),
+        Null => write!(out, "{}'{}' => NULL,\n", p, escape_php(name)).unwrap(),
         Array(items) => {
-            out.push_str(&format!(
-                "{}'{}' => \n{}array (\n",
-                pad,
-                escape_php(name),
-                pad
-            ));
+            write!(out, "{}'{}' => \n{}array (\n", p, escape_php(name), p).unwrap();
             for item in items {
                 serialize_vac_entry(out, &item.name, &item.resolved, indent + 2);
             }
-            out.push_str(&format!("{}),\n", pad));
+            write!(out, "{}),\n", p).unwrap();
         }
         PlainArray(items) => {
-            out.push_str(&format!(
-                "{}'{}' => \n{}array (\n",
-                pad,
-                escape_php(name),
-                pad
-            ));
+            write!(out, "{}'{}' => \n{}array (\n", p, escape_php(name), p).unwrap();
             serialize_plain_array_items(out, items, indent + 2);
-            out.push_str(&format!("{}),\n", pad));
+            write!(out, "{}),\n", p).unwrap();
         }
     }
 }
 
 fn serialize_plain_array_items(out: &mut String, items: &[ResolvedArrayItem], indent: usize) {
-    let pad = " ".repeat(indent);
+    let p = spad(indent);
     for item in items {
-        out.push_str(&format!("{}'{}' => ", pad, escape_php(&item.name)));
+        write!(out, "{}'{}' => ", p, escape_php(&item.name)).unwrap();
         serialize_plain_array_value(out, &item.value, indent);
         out.push_str(",\n");
     }
 }
 
 fn serialize_plain_array_value(out: &mut String, value: &ResolvedArrayValue, indent: usize) {
-    let pad = " ".repeat(indent);
+    let p = spad(indent);
     match value {
         ResolvedArrayValue::Scalar(s) => out.push_str(&render_scalar(s)),
         ResolvedArrayValue::Null => out.push_str("NULL"),
         ResolvedArrayValue::Array(items) => {
-            out.push_str("\n");
-            out.push_str(&format!("{}array (\n", pad));
+            write!(out, "\n{}array (\n", p).unwrap();
             serialize_plain_array_items(out, items, indent + 2);
-            out.push_str(&format!("{})", pad));
+            write!(out, "{})", p).unwrap();
         }
     }
 }

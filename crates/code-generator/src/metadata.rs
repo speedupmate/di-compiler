@@ -225,8 +225,24 @@ fn serialize_plain_array_value(out: &mut String, value: &ResolvedArrayValue, ind
 }
 
 /// Escape a PHP string value (backslash and single-quote).
-pub fn escape_php(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+///
+/// Returns a borrowed slice when no escaping is needed (no special chars), otherwise
+/// a single-pass owned escape. FQCNs (backslashes only, no single-quote) are handled
+/// in one pass without the second `.replace()` allocation.
+pub fn escape_php(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.bytes().any(|b| b == b'\\' || b == b'\'') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    // Single-pass escape to avoid two intermediate String allocations.
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 pub(crate) fn render_scalar(val: &ResolvedScalar) -> String {

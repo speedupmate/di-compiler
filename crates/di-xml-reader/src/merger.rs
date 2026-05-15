@@ -11,19 +11,17 @@ pub fn merge_configs(configs: Vec<DiConfig>) -> DiConfig {
     for config in configs {
         merge_into_impl(&mut result, config);
     }
-    result.refresh_lookup_indexes();
     result
 }
 
 pub fn merge_into(dst: &mut DiConfig, src: DiConfig) {
     merge_into_impl(dst, src);
-    dst.refresh_lookup_indexes();
 }
 
 fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
-    // Preferences: last wins
+    // Preferences: last wins; incremental index update avoids full O(n) rebuild.
     for (k, v) in src.preferences {
-        dst.preferences.insert(k, v);
+        dst.insert_preference(k, v);
     }
 
     // Virtual types: merge by name.
@@ -67,8 +65,9 @@ fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
         }
     }
 
-    // TypeConfigs: merge arguments by name, shared overrides
+    // TypeConfigs: merge arguments by name, shared overrides; update index for new keys.
     for (type_name, src_tc) in src.type_configs {
+        dst.insert_type_config_key(&type_name);
         let dst_tc = dst.type_configs.entry(type_name).or_default();
         merge_type_config(dst_tc, src_tc);
     }
@@ -85,9 +84,9 @@ fn merge_into_impl(dst: &mut DiConfig, src: DiConfig) {
 ///   Phase 1: deep-merge all module di.xml files together (use `merge_configs`)
 ///   Phase 2: apply the merged module result onto `app/etc/di.xml` (use this fn)
 pub fn apply_module_config_on_primary(mut primary: DiConfig, module: DiConfig) -> DiConfig {
-    // Preferences: last wins
+    // Preferences: last wins; incremental index update avoids full O(n) rebuild.
     for (k, v) in module.preferences {
-        primary.preferences.insert(k, v);
+        primary.insert_preference(k, v);
     }
 
     // Virtual types: same logic as merge_into
@@ -128,11 +127,11 @@ pub fn apply_module_config_on_primary(mut primary: DiConfig, module: DiConfig) -
     // PHP's array_replace($existing_args, $module_args) replaces the whole value
     // for matching argument names rather than merging array items recursively.
     for (type_name, src_tc) in module.type_configs {
+        primary.insert_type_config_key(&type_name);
         let dst_tc = primary.type_configs.entry(type_name).or_default();
         apply_type_config_shallow(dst_tc, src_tc);
     }
 
-    primary.refresh_lookup_indexes();
     primary
 }
 
