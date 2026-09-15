@@ -433,7 +433,7 @@ impl<'a> Scanner<'a> {
                         }
                         // Optional `as Alias`
                         let alias = self.try_read_as_alias().unwrap_or_else(|| {
-                            part.split('\\').last().unwrap_or(&part).to_string()
+                            part.split('\\').next_back().unwrap_or(&part).to_string()
                         });
                         if !alias.is_empty() && !part.is_empty() {
                             self.use_map
@@ -462,7 +462,7 @@ impl<'a> Scanner<'a> {
         // Optional `as Alias`
         let alias = self
             .try_read_as_alias()
-            .unwrap_or_else(|| base.split('\\').last().unwrap_or(&base).to_string());
+            .unwrap_or_else(|| base.split('\\').next_back().unwrap_or(&base).to_string());
         if !alias.is_empty() {
             self.use_map.insert(alias.to_ascii_lowercase(), base);
         }

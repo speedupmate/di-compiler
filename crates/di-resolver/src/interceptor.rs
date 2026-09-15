@@ -206,7 +206,7 @@ fn select_interceptor_methods(
     };
     methods
         .into_iter()
-        .filter(|m| is_interceptable_method(m))
+        .filter(is_interceptable_method)
         .filter(|m| {
             if let Some(names) = intercepted_method_names {
                 names.contains(&m.name)

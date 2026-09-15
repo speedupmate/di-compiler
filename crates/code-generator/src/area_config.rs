@@ -109,7 +109,7 @@ pub fn generate_area_config_with_overrides(
         let args = args_delta.get(fqcn).unwrap_or_else(|| &args_baseline[fqcn]);
         if args.is_empty() {
             // PHP emits NULL for types whose constructor args resolve to nothing.
-            write!(out, "    '{}' => NULL,\n", escape_php(fqcn)).unwrap();
+            writeln!(out, "    '{}' => NULL,", escape_php(fqcn)).unwrap();
             continue;
         }
         write!(out, "    '{}' => \n    array (\n", escape_php(fqcn)).unwrap();
@@ -130,7 +130,7 @@ pub fn generate_area_config_with_overrides(
     let mut sorted_prefs: Vec<(&String, &String)> = merged_preferences.iter().collect();
     sorted_prefs.sort_unstable_by_key(|(k, _)| k.as_str());
     for (from, to) in sorted_prefs {
-        write!(out, "    '{}' => '{}',\n", escape_php(from), escape_php(to)).unwrap();
+        writeln!(out, "    '{}' => '{}',", escape_php(from), escape_php(to)).unwrap();
     }
     out.push_str("  ),\n");
 
@@ -152,9 +152,9 @@ pub fn generate_area_config_with_overrides(
             .get(concrete.trim_start_matches('\\'))
             .map(|s| s.as_str())
             .unwrap_or(concrete);
-        write!(
+        writeln!(
             out,
-            "    '{}' => '{}',\n",
+            "    '{}' => '{}',",
             escape_php(name),
             escape_php(resolved)
         )
@@ -189,27 +189,27 @@ fn serialize_arg_indent(out: &mut String, name: &str, value: &ResolvedArgValue, 
     }
     write!(out, "{}'{}' => \n{}array (\n", p, escape_php(name), p).unwrap();
     match value {
-        SharedInstance(fqcn) => write!(out, "{}  '_i_' => '{}',\n", p, escape_php(fqcn)).unwrap(),
+        SharedInstance(fqcn) => writeln!(out, "{}  '_i_' => '{}',", p, escape_php(fqcn)).unwrap(),
         NonSharedInstance(fqcn) => {
-            write!(out, "{}  '_ins_' => '{}',\n", p, escape_php(fqcn)).unwrap()
+            writeln!(out, "{}  '_ins_' => '{}',", p, escape_php(fqcn)).unwrap()
         }
-        Scalar(val) => write!(out, "{}  '_v_' => {},\n", p, render_scalar(val)).unwrap(),
-        Null => write!(out, "{}  '_vn_' => true,\n", p).unwrap(),
+        Scalar(val) => writeln!(out, "{}  '_v_' => {},", p, render_scalar(val)).unwrap(),
+        Null => writeln!(out, "{}  '_vn_' => true,", p).unwrap(),
         Array(items) => {
             write!(out, "{}  '_vac_' => \n{}  array (\n", p, p).unwrap();
             for item in items {
                 serialize_vac_entry(out, &item.name, &item.resolved, indent + 4);
             }
-            write!(out, "{}  ),\n", p).unwrap();
+            writeln!(out, "{}  ),", p).unwrap();
         }
         PlainArray(items) => {
             write!(out, "{}  '_v_' => \n{}  array (\n", p, p).unwrap();
             serialize_plain_array_items(out, items, indent + 4);
-            write!(out, "{}  ),\n", p).unwrap();
+            writeln!(out, "{}  ),", p).unwrap();
         }
         GlobalArgRef { .. } => unreachable!(),
     }
-    write!(out, "{}),\n", p).unwrap();
+    writeln!(out, "{}),", p).unwrap();
 }
 
 fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, indent: usize) {
@@ -257,26 +257,26 @@ fn serialize_vac_entry(out: &mut String, name: &str, value: &ResolvedArgValue, i
             )
             .unwrap();
         }
-        Scalar(val) => write!(
+        Scalar(val) => writeln!(
             out,
-            "{}'{}' => {},\n",
+            "{}'{}' => {},",
             p,
             escape_php(name),
             render_scalar(val)
         )
         .unwrap(),
-        Null => write!(out, "{}'{}' => NULL,\n", p, escape_php(name)).unwrap(),
+        Null => writeln!(out, "{}'{}' => NULL,", p, escape_php(name)).unwrap(),
         Array(items) => {
             write!(out, "{}'{}' => \n{}array (\n", p, escape_php(name), p).unwrap();
             for item in items {
                 serialize_vac_entry(out, &item.name, &item.resolved, indent + 2);
             }
-            write!(out, "{}),\n", p).unwrap();
+            writeln!(out, "{}),", p).unwrap();
         }
         PlainArray(items) => {
             write!(out, "{}'{}' => \n{}array (\n", p, escape_php(name), p).unwrap();
             serialize_plain_array_items(out, items, indent + 2);
-            write!(out, "{}),\n", p).unwrap();
+            writeln!(out, "{}),", p).unwrap();
         }
     }
 }

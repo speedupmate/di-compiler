@@ -22,6 +22,8 @@ use crate::graph::{
 };
 use di_xml_reader::{Argument, DiConfig};
 
+type DependencyPairs = (Vec<(String, String)>, Vec<(String, String)>);
+
 /// For each type in `type_names`, compute which di.xml config keys are consulted
 /// during argument resolution, then build two reverse indexes:
 ///
@@ -40,7 +42,7 @@ pub fn build_dependency_reverse_index(
 ) {
     // Compute per-type (key → owner) pairs in parallel, then merge serially.
     // All inputs are shared references (Sync) so par_iter is safe.
-    let pairs: Vec<(Vec<(String, String)>, Vec<(String, String)>)> = type_names
+    let pairs: Vec<DependencyPairs> = type_names
         .par_iter()
         .map(|type_name| {
             let owner = normalize(type_name);
@@ -1020,9 +1022,7 @@ impl<'a> PhpArrayDefaultParser<'a> {
 
     fn parse_numeric_literal(&mut self) -> Option<String> {
         let start = self.pos;
-        let Some(first) = self.peek() else {
-            return None;
-        };
+        let first = self.peek()?;
         if !(first.is_ascii_digit() || first == b'+' || first == b'-') {
             return None;
         }

@@ -1,8 +1,18 @@
-# fast-di-compile
+<p align="center">
+  <img src="assets/fast-di-compile.svg" alt="Fast DI Compile logo" width="240">
+</p>
 
-Fast-Di-Compile is a Battle-tested and production-ready replacement for Magento's `bin/magento setup:di:compile` process.
+<p align="center">
+  <a href="https://github.com/speedupmate/di-compiler/actions/workflows/rust.yml?query=branch%3Amain">
+    <img src="https://github.com/speedupmate/di-compiler/actions/workflows/rust.yml/badge.svg?branch=main" alt="Main build and test status">
+  </a>
+</p>
 
-**Compilation step takes 4 seconds instead of 50 seconds. A whooping 12.5× faster performer.**
+<h1 align="center">fast-di-compile</h1>
+
+<p align="center">A battle-tested, production-ready replacement for Magento's <code>bin/magento setup:di:compile</code>.</p>
+
+<p align="center"><strong>4 seconds instead of 50 seconds. 12.5× faster.</strong></p>
 
 ## Time and money estimate
 
@@ -154,6 +164,8 @@ cargo test --workspace
 cargo check --workspace
 ```
 
-## License
+## License and copyright
 
-[MIT](LICENSE).
+Copyright © 2026 Anton Siniorg.
+
+Fast-Di-Compile is released under the [MIT License](LICENSE). Use it, improve it, and share it.

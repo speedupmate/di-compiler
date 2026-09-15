@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" role="img" aria-labelledby="title desc">
+  <title id="title">Fast DI Compile</title>
+  <desc id="desc">A code editor panel between dependency injection braces with speed lines.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101827"/>
+      <stop offset="1" stop-color="#1f1640"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#55e6d2"/>
+      <stop offset="1" stop-color="#70a7ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="624" height="344" rx="54" fill="url(#bg)"/>
+  <path d="M86 122h-30M70 150H34M86 178H50" stroke="url(#cyan)" stroke-width="11" stroke-linecap="round" opacity=".9"/>
+  <path d="M554 122h30M570 150h36M554 178h30" stroke="url(#cyan)" stroke-width="11" stroke-linecap="round" opacity=".9"/>
+
+  <path d="M170 88 126 112v136l44 24M470 88l44 24v136l-44 24" fill="none" stroke="url(#cyan)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="214" y="86" width="212" height="188" rx="24" fill="#111827" stroke="#31446b" stroke-width="3"/>
+  <circle cx="242" cy="116" r="6" fill="#ff8a4c"/>
+  <circle cx="262" cy="116" r="6" fill="#ffe66d"/>
+  <circle cx="282" cy="116" r="6" fill="#55e6d2"/>
+  <path d="M242 151h54M307 151h82M242 179h104M356 179h33M242 207h72M325 207h64M242 235h114M375 235h14" stroke="url(#cyan)" stroke-width="9" stroke-linecap="round"/>
+
+  <circle cx="188" cy="104" r="7" fill="#55e6d2"/>
+  <circle cx="452" cy="256" r="7" fill="#70a7ff"/>
+  <circle cx="452" cy="104" r="7" fill="#55e6d2"/>
+  <circle cx="188" cy="256" r="7" fill="#70a7ff"/>
+</svg>

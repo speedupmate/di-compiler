@@ -49,7 +49,7 @@ pub fn generate_interceptor(spec: &InterceptorSpec, target_info: Option<&ClassIn
     let rendered_methods: Vec<String> = spec
         .public_methods
         .iter()
-        .filter_map(|method| render_intercepted_method(method))
+        .filter_map(render_intercepted_method)
         .collect();
     if !rendered_methods.is_empty() {
         out.push('\n');
@@ -216,7 +216,7 @@ pub fn render_type_hint(th: &str) -> String {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .collect();
-        let has_null = raw_parts.iter().any(|p| *p == "null");
+        let has_null = raw_parts.contains(&"null");
         let non_null: Vec<&str> = raw_parts.iter().copied().filter(|p| *p != "null").collect();
         if has_null && non_null.len() == 1 && !PRIMITIVES.contains(&non_null[0]) {
             let rendered = render_type_part(non_null[0], PRIMITIVES);
