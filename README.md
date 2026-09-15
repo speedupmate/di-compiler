@@ -14,8 +14,9 @@
 
 <p align="center"><strong>4 seconds instead of 50 seconds. 12.5× faster.</strong></p>
 
-## Time and money estimate
-
+<details align="center">
+<summary><strong>Time and money estimate</strong></summary>
+<p align="left">
 Each compilation estimatedly saves **46 seconds**. The table uses an 8-vCPU AWS CodeBuild Linux `general1.large` runner at **$0.02 per minute**, and assumes each build saves one billed minute. Developer time is valued at an assumed **$75 per hour**. The first two rows use 260 working days. The Magento 2 row uses 68 requested builds per calendar day, based on a public 30-day sample of the [Magento 2 testing workflow](https://github.com/magento/magento2/wiki/Magento-Automated-Testing), annualized to 365 days.
 
 | Scenario | Builds per year | Time saved | Allocated CPU time | AWS build cost saved | Developer time value |
@@ -24,7 +25,9 @@ Each compilation estimatedly saves **46 seconds**. The table uses an 8-vCPU AWS 
 | 10 developers, 20 test pipelines total per day | 5,200 | **66.4 hours** | 531.6 vCPU-hours | **$104** | **$4,983** |
 | Magento 2 public CI activity, 68 builds per day | 24,820 | **317.1 hours** | 2,537.2 vCPU-hours | **$496** | **$23,786** |
 
-- Calculation is a free estimate based on predicted price and time value, your milage may vary, faster process always wins.
+- Estimate based on predicted price and time value, your milage may vary, faster process always wins.
+</p>
+</details>
 
 ## What it does
 
