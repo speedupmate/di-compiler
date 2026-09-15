@@ -1216,7 +1216,7 @@ fn main() {
         let (reflected_metadata_ctors, reflected_inherited_ctors, reflected_virtual_target_ctors) =
             enrich_all_constructors_with_reflection(
                 &mut metadata_class_map,
-                &*argument_type_names,
+                &argument_type_names,
                 &metadata_base_di_config,
                 &args.magento_root,
                 &args.fallback_php,
@@ -1280,7 +1280,7 @@ fn main() {
         }
         let t_global_resolve = Instant::now();
         let mut global_baseline_args = resolve_all_arguments_for_named_types(
-            &*argument_type_names,
+            &argument_type_names,
             &metadata_class_map,
             &base_class_fqcns,
             &global_resolution_di_config,
@@ -1315,7 +1315,7 @@ fn main() {
         let t_dep_idx = Instant::now();
         let (hierarchy_dep_rev, pref_dep_rev) =
             di_resolver::arguments::build_dependency_reverse_index(
-                &*argument_type_names,
+                &argument_type_names,
                 &metadata_class_map,
                 &global_resolution_di_config,
             );
@@ -1415,10 +1415,7 @@ fn main() {
 
                 // OPT-DELTA: also treat preference keys where area diverges from global as changed.
                 for (from, to) in &area_preference_overrides {
-                    if global_preference_overrides
-                        .get(from.as_str())
-                        .map_or(true, |g| g != to)
-                    {
+                    if global_preference_overrides.get(from.as_str()) != Some(to) {
                         changed_pref_keys.insert(from.trim_start_matches('\\').to_string());
                     }
                 }
@@ -1486,7 +1483,7 @@ fn main() {
                 let area_content = if affected.is_empty() {
                     // Fast path: global baseline applies as-is — no clone needed.
                     generate_area_config_with_overrides(
-                        &*global_baseline_args,
+                        &global_baseline_args,
                         &FxHashMap::default(),
                         &area_di_config,
                         &area_preference_overrides,
@@ -1542,7 +1539,7 @@ fn main() {
                     });
                     // OVERLAY: pass baseline + delta directly — no 25K HashMap clone.
                     generate_area_config_with_overrides(
-                        &*global_baseline_args,
+                        &global_baseline_args,
                         &delta_args,
                         &area_di_config,
                         &area_preference_overrides,
@@ -1589,7 +1586,7 @@ fn main() {
                 let include_vt = scope == "global";
                 let t_scope = Instant::now();
                 let metadata = compile_plugin_list(
-                    &**scope_di_config,
+                    scope_di_config,
                     &class_map,
                     &plugin_list_class_definitions,
                     include_vt,
@@ -1857,6 +1854,7 @@ fn hash_method_signature(h: &mut impl std::hash::Hasher, method: &MethodSignatur
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_phase7_fp(
     class_map: &FxHashMap<String, ClassInfo>,
     full_di_config: &DiConfig,
@@ -2814,8 +2812,10 @@ fn string_list_array_arg(name: &str, values: &[String]) -> Argument {
     }
 }
 
+type ModulesByBase = (String, Vec<(String, Vec<String>)>);
+
 fn build_setup_excluded_module_patterns(module_roots: &[PathBuf]) -> Vec<String> {
-    let mut modules_by_base: Vec<(String, Vec<(String, Vec<String>)>)> = Vec::new();
+    let mut modules_by_base: Vec<ModulesByBase> = Vec::new();
 
     for module_root in module_roots {
         let Some(module_dir) = module_root.file_name().and_then(|s| s.to_str()) else {
@@ -3171,6 +3171,7 @@ fn merged_class_map(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_argument_type_names(
     base_class_map: &FxHashMap<String, ClassInfo>,
     _generated_class_map: &FxHashMap<String, ClassInfo>,
@@ -3231,6 +3232,7 @@ fn build_argument_type_names(
     sorted
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_interception_type_names(
     base_class_map: &FxHashMap<String, ClassInfo>,
     generated_class_map: &FxHashMap<String, ClassInfo>,
@@ -3697,14 +3699,11 @@ echo $json, "\n";
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "failed to normalize metadata {}: {}",
-                src.display(),
-                stderr.trim()
-            ),
-        ));
+        return Err(std::io::Error::other(format!(
+            "failed to normalize metadata {}: {}",
+            src.display(),
+            stderr.trim()
+        )));
     }
     Ok(output.stdout)
 }
@@ -3763,16 +3762,16 @@ fn build_comparable_metadata_report(
     output_json: &[u8],
 ) -> std::io::Result<ComparableMetadataReport> {
     let truth: serde_json::Value = serde_json::from_slice(archive_json).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to parse archive comparable json for {}: {e}", file),
-        )
+        std::io::Error::other(format!(
+            "failed to parse archive comparable json for {}: {e}",
+            file
+        ))
     })?;
     let ours: serde_json::Value = serde_json::from_slice(output_json).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to parse output comparable json for {}: {e}", file),
-        )
+        std::io::Error::other(format!(
+            "failed to parse output comparable json for {}: {e}",
+            file
+        ))
     })?;
 
     let mut acc = ComparableReportAccumulator::default();
@@ -3915,12 +3914,8 @@ fn section_from_path(path: &str) -> String {
     if path.is_empty() {
         return "root".to_string();
     }
-    if let Some(rest) = path.strip_prefix('[') {
-        return if rest.is_empty() {
-            "list".to_string()
-        } else {
-            "list".to_string()
-        };
+    if path.starts_with('[') {
+        return "list".to_string();
     }
     let first = path.split('.').next().unwrap_or("root");
     let first = first.split('[').next().unwrap_or(first);
@@ -5046,7 +5041,7 @@ fn canonicalize_resolved_arg_value_case(
 }
 
 fn canonicalize_plain_array_case(
-    items: &mut Vec<di_resolver::ResolvedArrayItem>,
+    items: &mut [di_resolver::ResolvedArrayItem],
     case_index: &FxHashMap<String, String>,
 ) {
     use di_resolver::{ResolvedArrayValue, ResolvedScalar};

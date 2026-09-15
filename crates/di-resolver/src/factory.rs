@@ -58,10 +58,11 @@ pub fn detect_factories_from_configs(
         // Magento XmlScanner excludes virtual type names from XML object
         // candidates. For archive/runtime parity, we still allow area-only
         // virtualType names (e.g. etc/adminhtml/di.xml).
-        if from_xml && virtual_type_names.contains(factory_fqcn.as_str()) {
-            if global_virtual_type_names.contains(factory_fqcn.as_str()) {
-                return;
-            }
+        if from_xml
+            && virtual_type_names.contains(factory_fqcn.as_str())
+            && global_virtual_type_names.contains(factory_fqcn.as_str())
+        {
+            return;
         }
         if class_map.contains_key(&factory_fqcn) {
             return;

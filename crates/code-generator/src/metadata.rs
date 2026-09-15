@@ -216,7 +216,7 @@ fn serialize_plain_array_value(out: &mut String, value: &ResolvedArrayValue, ind
         ResolvedArrayValue::Scalar(s) => out.push_str(&render_scalar(s)),
         ResolvedArrayValue::Null => out.push_str("NULL"),
         ResolvedArrayValue::Array(items) => {
-            out.push_str("\n");
+            out.push('\n');
             out.push_str(&format!("{}array (\n", pad));
             serialize_plain_array_items(out, items, indent + 2);
             out.push_str(&format!("{})", pad));
