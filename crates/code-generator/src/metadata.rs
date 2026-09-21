@@ -294,7 +294,7 @@ fn is_safe_php_numeric_literal(s: &str) -> bool {
         (false, s)
     };
 
-    if rest.is_empty() || !rest.parse::<f64>().is_ok() {
+    if rest.is_empty() || rest.parse::<f64>().is_err() {
         return false;
     }
     if rest.eq_ignore_ascii_case("inf") || rest.eq_ignore_ascii_case("nan") {
