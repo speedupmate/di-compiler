@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, for example v1.0.3"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  BIN_NAME: fast-di-compile
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  test:
+    name: Test release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace
+
+  build:
+    name: Build ${{ matrix.asset_suffix }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset_suffix: linux-x64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            asset_suffix: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            asset_suffix: macos-x64
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            asset_suffix: macos-arm64
+            runner: macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release -p "$BIN_NAME" --target "${{ matrix.target }}"
+
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v, got: $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+          asset_name="${BIN_NAME}-${RELEASE_TAG}-${{ matrix.asset_suffix }}"
+          mkdir -p "dist/package"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/package/${BIN_NAME}"
+          cp LICENSE README.md "dist/package/"
+          chmod +x "dist/package/${BIN_NAME}"
+
+          tar -C "dist/package" -czf "dist/${asset_name}.tar.gz" .
+          cd dist
+          shasum -a 256 "${asset_name}.tar.gz" > "${asset_name}.tar.gz.sha256"
+
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Download release asset artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz > sha256sums.txt
+
+      - name: Create or update GitHub release
+        run: |
+          set -euo pipefail
+
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v, got: $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/sha256sums.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/sha256sums.txt \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
