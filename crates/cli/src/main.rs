@@ -25,8 +25,19 @@ use quick_xml::Reader;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+mod class_checks;
+mod cli_boot;
+mod compile_scope;
+mod di_xml_checks;
+mod file_level_checks;
+mod incompatible_modules;
+mod requested_regeneration;
+use class_checks::{ClassChecks, ScannedFile};
+use di_xml_checks::DiXmlCheck;
+use file_level_checks::run_file_level_checks;
+
 use code_generator::{
-    compile_plugin_list, extension_path, factory_path, generate_app_action_list_php,
+    compile_scope_plugin_list, extension_path, factory_path, generate_app_action_list_php,
     generate_area_config_with_overrides, generate_extension, generate_extension_interface,
     generate_factory, generate_interceptor, generate_proxy, generate_proxy_deferred,
     generate_search_results, interceptor_path, proxy_deferred_path, proxy_path,
@@ -34,21 +45,24 @@ use code_generator::{
     ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
-    detect_factories_from_configs, detect_interceptors, detect_proxies_from_configs_with_existing,
+    detect_factories_from_configs, detect_interceptors, detect_named_factories,
+    detect_proxies_from_configs_with_existing, proxy_targets_from_constructors,
     resolve_all_arguments, resolve_all_arguments_for_named_types, FactorySpec,
 };
 use di_xml_reader::{
-    apply_module_config_on_primary, find_all_di_xml_files, find_di_xml_files,
-    find_di_xml_files_for_area, merge_configs, merge_into, parse_di_xml, Argument, DiConfig,
-    Plugin,
+    apply_module_config_on_primary, composer_registered_module_roots, find_all_di_xml_files,
+    find_di_xml_files, find_di_xml_files_for_area, merge_configs, merge_into,
+    parse_di_xml_unfolded, registered_component_roots, Argument, DiConfig, Plugin,
 };
 use php_extractor::{
-    extract_file, extract_string_constants,
+    extract_file, extract_file_with_class_check, extract_string_constants,
+    is_plain_literal_default,
+    traits::apply_traits,
     types::{
         ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
         MethodSignature,
     },
-    walker::{read_module_paths, walk_php_files},
+    walker::{read_module_paths, walk_generated_php_files, walk_php_files},
 };
 
 #[derive(Parser, Debug)]
@@ -167,6 +181,35 @@ if ($root === '' || !file_exists($root . '/vendor/autoload.php')) {
     exit(1);
 }
 @require $root . '/vendor/autoload.php';
+// OBJECT MANAGER
+// Magento's Autoload\Populator adds the generation directory. Composer remembers a class it
+// did not find, and this worker can outlive that moment, so this loader looks again each time.
+$generated = $argv[2] ?? '';
+spl_autoload_register(function (string $class) use ($generated): void {
+    $file = $generated . '/' . str_replace('\\', '/', $class) . '.php';
+    if (is_file($file)) require $file;
+});
+// Encodes a default value. `__php__:` and `__obj__:` carry a var_export() expression.
+function holds_object($v): bool {
+    if (is_array($v)) { foreach ($v as $i) if (holds_object($i)) return true; return false; }
+    return is_object($v);
+}
+function holds_instance($v): bool {
+    if (is_array($v)) { foreach ($v as $i) if (holds_instance($i)) return true; return false; }
+    return is_object($v) && !($v instanceof UnitEnum);
+}
+function encode_default($v): string {
+    if (holds_instance($v)) return '__obj__:' . var_export($v, true);
+    if (holds_object($v)) return '__php__:' . var_export($v, true);
+    if (is_array($v)) {
+        $json = json_encode($v);
+        return $json === false ? '__php__:' . var_export($v, true) : '__json__:' . $json;
+    }
+    if ((is_float($v) && !is_finite($v)) || $v === PHP_INT_MIN || (is_string($v) && str_contains($v, "\0"))) {
+        return '__php__:' . var_export($v, true);
+    }
+    return var_export($v, true);
+}
 function tstr($t): ?string {
     if ($t === null) return null;
     if ($t instanceof ReflectionNamedType) {
@@ -184,6 +227,22 @@ function tstr($t): ?string {
     }
     return null;
 }
+function resolve_name(string $name, ReflectionClass $declaring): string {
+    $lower = strtolower($name);
+    if ($lower === 'self') return $declaring->getName();
+    if ($lower === 'parent') { $p = $declaring->getParentClass(); return $p ? $p->getName() : $name; }
+    return $name;
+}
+function method_tstr($t, ReflectionClass $declaring): ?string {
+    if ($t === null) return null;
+    if ($t instanceof ReflectionNamedType) {
+        $name = resolve_name($t->getName(), $declaring);
+        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') return '?' . $name;
+        return $name;
+    }
+    $parts = []; foreach ($t->getTypes() as $p) $parts[] = resolve_name($p->getName(), $declaring);
+    return implode($t instanceof ReflectionUnionType ? '|' : '&', $parts);
+}
 function reflect_methods(string $class): ?array {
     if (!class_exists($class) && !interface_exists($class) && !trait_exists($class)) return null;
     $ref = new ReflectionClass($class);
@@ -195,13 +254,13 @@ function reflect_methods(string $class): ?array {
         $params = [];
         foreach ($m->getParameters() as $p) {
             $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
-            if ($hd) { $raw = $p->getDefaultValue(); $dv = is_array($raw) ? '__json__:'.json_encode($raw) : var_export($raw, true); }
-            $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
+            if ($hd) { $dv = encode_default($p->getDefaultValue()); }
+            $params[] = ['name'=>$p->getName(),'type_hint'=>method_tstr($p->getType(), $m->getDeclaringClass()),
                 'has_default'=>$hd,'default_value'=>$dv,
                 'is_variadic'=>$p->isVariadic(),'is_by_ref'=>$p->isPassedByReference()];
         }
         $rows[] = ['name'=>$name,'params'=>$params,
-            'return_type'=>tstr($m->getReturnType()),'returns_reference'=>$m->returnsReference()];
+            'return_type'=>method_tstr($m->getReturnType(), $m->getDeclaringClass()),'returns_reference'=>$m->returnsReference()];
     }
     return $rows;
 }
@@ -212,9 +271,50 @@ function reflect_kind(string $class): ?string {
     if ($ref->isTrait()) return 'trait';
     return 'class';
 }
+// true or false like class_exists() in PluginListGenerator, whose autoloader also generates a
+// class on demand. A message means class_exists() threw, which stops Magento as well.
+function plugin_class_exists(string $class) {
+    try {
+        if (class_exists($class)) return true;
+        foreach (['\\Proxy', '\\Interceptor', '\\ProxyDeferred', '\\Remote', '\\Logger', 'Factory', 'Mapper',
+                  'Persistor', 'Repository', 'Converter', 'SearchResults', 'ExtensionInterface', 'Extension'] as $suffix) {
+            if (!str_ends_with($class, $suffix)) continue;
+            $source = substr($class, 0, -strlen($suffix));
+            foreach ([$source, $source . 'Interface'] as $name) {
+                if ($name !== 'Interface' && (class_exists($name) || interface_exists($name))) return true;
+            }
+        }
+        return false;
+    } catch (\Throwable $e) {
+        return $e->getMessage();
+    }
+}
+// `get_class_methods()` in `Definition\\Runtime::getMethodList()` takes any class-like name.
+function class_like_exists(string $class) {
+    $exists = plugin_class_exists($class);
+    if ($exists === false) return interface_exists($class) || trait_exists($class);
+    return $exists;
+}
+// What `Reader::generateCachePerScope()` needs to know about the target of a preference.
+function preference_target(string $class) {
+    $exists = plugin_class_exists($class);
+    if ($exists !== true) return $exists === false ? 'missing' : $exists;
+    return class_exists($class, false) && (new ReflectionClass($class))->getExtension() !== null ? 'extension' : 'class';
+}
+function is_readonly_class(string $class): bool {
+    return class_exists($class) && method_exists(ReflectionClass::class, 'isReadOnly')
+        && (new ReflectionClass($class))->isReadOnly();
+}
 function reflect_const(string $expr) {
     $expr = ltrim($expr, '\\');
-    if ($expr === '' || !defined($expr)) return null;
+    if ($expr === '') return null;
+    // `bin/magento` has loaded `app/bootstrap.php` by then, and that defines constants too.
+    if (!defined($expr) && is_file($GLOBALS['root'] . '/app/bootstrap.php')) {
+        ob_start();
+        require_once $GLOBALS['root'] . '/app/bootstrap.php';
+        ob_end_clean();
+    }
+    if (!defined($expr)) return ['__fast_di_undefined_constant__' => true];
     return constant($expr);
 }
 function reflect_ctor(string $class): ?array {
@@ -225,7 +325,7 @@ function reflect_ctor(string $class): ?array {
     $params = [];
     foreach ($ctor->getParameters() as $p) {
         $dv = null; $hd = $p->isDefaultValueAvailable() && !$p->isVariadic();
-        if ($hd) { $raw = $p->getDefaultValue(); $dv = is_array($raw) ? '__json__:'.json_encode($raw) : var_export($raw, true); }
+        if ($hd) { $dv = encode_default($p->getDefaultValue()); }
         $params[] = ['name'=>$p->getName(),'type_hint'=>tstr($p->getType()),
             'has_default'=>$hd,'default_value'=>$dv,'is_variadic'=>$p->isVariadic()];
     }
@@ -245,6 +345,10 @@ while (($line = fgets($stdin)) !== false) {
             'kind'    => reflect_kind($class),
             'const'   => reflect_const($class),
             'ctor'    => reflect_ctor($class),
+            'plugin_class_exists' => plugin_class_exists($class),
+            'preference_target' => preference_target($class),
+            'class_like_exists' => class_like_exists($class),
+            'is_readonly_class' => is_readonly_class($class),
             default   => null,
         };
         fwrite(STDOUT, json_encode($result) . "\n");
@@ -262,7 +366,12 @@ struct PhpWorker {
 }
 
 impl PhpWorker {
-    fn spawn(php_bin: &str, magento_root: &Path, script_path: &Path) -> Option<Self> {
+    fn spawn(
+        php_bin: &str,
+        magento_root: &Path,
+        code_root: &Path,
+        script_path: &Path,
+    ) -> Option<Self> {
         let mut child = Command::new(php_bin)
             .arg("-d")
             .arg("display_errors=0")
@@ -270,6 +379,7 @@ impl PhpWorker {
             .arg("display_startup_errors=0")
             .arg(script_path)
             .arg(magento_root)
+            .arg(code_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -311,25 +421,35 @@ struct PhpWorkerPool {
     workers: Mutex<Vec<PhpWorker>>,
     php_bin: String,
     magento_root: PathBuf,
+    code_root: PathBuf,
     script_path: PathBuf,
 }
 
 impl PhpWorkerPool {
-    fn new(php_bin: String, magento_root: PathBuf, script_path: PathBuf) -> Self {
+    fn new(
+        php_bin: String,
+        magento_root: PathBuf,
+        code_root: PathBuf,
+        script_path: PathBuf,
+    ) -> Self {
         PhpWorkerPool {
             workers: Mutex::new(Vec::new()),
             php_bin,
             magento_root,
+            code_root,
             script_path,
         }
     }
 
     fn checkout(&self) -> Option<PhpWorker> {
-        self.workers
-            .lock()
-            .unwrap()
-            .pop()
-            .or_else(|| PhpWorker::spawn(&self.php_bin, &self.magento_root, &self.script_path))
+        self.workers.lock().unwrap().pop().or_else(|| {
+            PhpWorker::spawn(
+                &self.php_bin,
+                &self.magento_root,
+                &self.code_root,
+                &self.script_path,
+            )
+        })
     }
 
     fn checkin(&self, w: PhpWorker) {
@@ -355,15 +475,54 @@ impl PhpWorkerPool {
 
 static PHP_WORKER_POOL: OnceLock<PhpWorkerPool> = OnceLock::new();
 
-fn init_php_worker_pool(php_bin: &str, magento_root: &Path) -> PathBuf {
+/// `bin/magento` starts with `app/bootstrap.php`, so a store where that fails stops at once. Here
+/// every later PHP process would fail the same way, one by one and without saying why.
+fn stop_when_php_cannot_start(php_bin: &str, magento_root: &Path) {
+    // Without an autoloader this is not a Magento store, and PHP can load nothing.
+    if !magento_root.join("vendor/autoload.php").is_file() {
+        return;
+    }
+    const STARTED: &str = "fast-di-compile: PHP started";
+    let script = format!(
+        "$root = $argv[1]; require is_file($root . '/app/bootstrap.php') ? $root . '/app/bootstrap.php' : $root . '/vendor/autoload.php'; echo '{STARTED}';"
+    );
+    let output = Command::new(php_bin)
+        .args(["-d", "display_errors=1", "-d", "html_errors=0", "-r"])
+        .arg(script)
+        .arg("--")
+        .arg(magento_root)
+        .current_dir(magento_root)
+        .stdin(Stdio::null())
+        .output();
+    // Without a PHP binary nothing can run in PHP, here or in any other phase.
+    let Ok(output) = output else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && stdout.contains(STARTED) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stop_compile(&format!(
+        "PHP cannot start this store, exit code {:?}: {}",
+        output.status.code(),
+        format!("{}\n{}", stdout.trim(), stderr.trim()).trim()
+    ));
+}
+
+fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) -> PathBuf {
     let script_path =
         std::env::temp_dir().join(format!("fast-di-worker-{}.php", std::process::id()));
-    std::fs::write(&script_path, WORKER_PHP)
-        .expect("failed to write PHP worker script to temp dir");
+    std::fs::write(
+        &script_path,
+        WORKER_PHP.replace("// OBJECT MANAGER", class_checks::OBJECT_MANAGER_PHP),
+    )
+    .expect("failed to write PHP worker script to temp dir");
     PHP_WORKER_POOL.get_or_init(|| {
         PhpWorkerPool::new(
             php_bin.to_string(),
             magento_root.to_path_buf(),
+            code_root.to_path_buf(),
             script_path.clone(),
         )
     });
@@ -408,15 +567,54 @@ fn main() {
         .magento_root
         .canonicalize()
         .unwrap_or(args.magento_root.clone());
+
+    // Before anything writes to or empties the output, so the store keeps its working output.
+    let enabled_modules = load_module_order_from_config_php(&magento_root, &args.fallback_php);
+    let mut all_module_paths = read_module_paths(&magento_root);
+    all_module_paths.extend(composer_registered_module_roots(&magento_root));
+    let mut all_module_paths: Vec<PathBuf> = all_module_paths
+        .iter()
+        .flat_map(|path| registered_component_roots(path))
+        .collect();
+    all_module_paths.sort();
+    all_module_paths.dedup();
+    let installed_modules: FxHashSet<String> = all_module_paths
+        .iter()
+        .filter_map(|path| read_module_name_from_module_xml(path))
+        .collect();
+    if let Some(message) =
+        incompatible_modules::incompatible_modules(&installed_modules, &enabled_modules)
+    {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    }
+
     let generated_root = args
         .output
         .clone()
         .unwrap_or_else(|| magento_root.join("generated"));
     let code_root = generated_root.join("code");
     let metadata_root = generated_root.join("metadata");
+    if !args.dry_run {
+        METADATA_ROOT.get_or_init(|| metadata_root.clone());
+    }
+    if !args.dry_run && !generated_folders_are_writable(&generated_root) {
+        eprintln!(
+            "error: Command line user does not have read and write permissions on generated directory ({}). Please address this issue before using this command.",
+            generated_root.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Magento's boot before setup:di:compile, before PHP loads anything from generated/.
+    if !args.dry_run && requested_regeneration::clean(&magento_root) {
+        log::info!("var/.regenerate was set: removed it with generated/code, generated/metadata and var/cache, as Magento's boot does");
+    }
+
+    stop_when_php_cannot_start(&args.fallback_php, &magento_root);
 
     // Initialise the persistent PHP worker pool (one autoload per worker process).
-    let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root);
+    let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root, &code_root);
 
     log::info!(
         "fast-di-compile starting\n  magento_root: {}\n  output:       {}",
@@ -437,8 +635,19 @@ fn main() {
     // Phase 1 + 2: Walk PHP files + extract ClassInfo (parallel)
     // -----------------------------------------------------------------------
     let phase_1_2_started = Instant::now();
-    let module_paths = read_module_paths(&magento_root);
-    let php_files = walk_php_files(&module_paths);
+    let (module_paths, mut disabled_module_paths) =
+        split_disabled_modules(all_module_paths, &enabled_modules);
+    let compiles_disabled_modules = compile_scope::compiles_disabled_modules(&magento_root)
+        .unwrap_or_else(|message| stop_compile(&message));
+    // The classes of disabled modules are either scanned, or lookups only. Their configuration
+    // and actions stay out in both cases, because Magento reads those by the module list.
+    let mut scanned_module_paths = module_paths.clone();
+    let mut not_listed_module_paths = Vec::new();
+    if compiles_disabled_modules {
+        not_listed_module_paths = std::mem::take(&mut disabled_module_paths);
+        scanned_module_paths.extend(not_listed_module_paths.iter().cloned());
+    }
+    let php_files = walk_php_files(&scanned_module_paths);
     log::info!("Found {} PHP files", php_files.len());
 
     let pb = progress_bar(php_files.len() as u64, "Extracting PHP classes");
@@ -449,25 +658,56 @@ fn main() {
     // (cache_ref is unused since di.xml parse-skip was removed as a correctness fix)
     let _cache_ref = &cache;
 
-    let class_map: FxHashMap<String, ClassInfo> = php_files
+    let file_level_checks = Mutex::new(Vec::new());
+    let classes_inside_a_block = Mutex::new(Vec::new());
+    let scanned_files = Mutex::new(Vec::with_capacity(php_files.len()));
+    let scanned = |class: &str, path: &Path| {
+        scanned_files.lock().unwrap().push(ScannedFile {
+            class: class.to_string(),
+            path: path.to_path_buf(),
+        });
+    };
+    let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
+    let extracted_classes: Vec<(String, ClassInfo)> = php_files
         .par_iter()
         .filter_map(|path| {
-            let result = extract_file(path);
+            let (result, facts) = extract_file_with_class_check(path);
             pb.inc(1);
             match result {
-                ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
+                ExtractResult::Ok(info) => {
+                    // `FileClassScanner` does not see this class, so Magento does not load the
+                    // file during compile. Enabled code can still name the class.
+                    if facts.inside_block {
+                        classes_inside_a_block
+                            .lock()
+                            .unwrap()
+                            .push(info.fqcn.clone());
+                    } else {
+                        scanned(&info.fqcn, path);
+                    }
+                    if facts.class_check {
+                        file_level_checks
+                            .lock()
+                            .unwrap()
+                            .push((info.fqcn.clone(), path.clone()));
+                    }
+                    Some((info.fqcn.clone(), info))
+                }
                 ExtractResult::NoClass => None,
                 ExtractResult::PhpFallbackFailed(e) => {
+                    scanned("", path);
                     fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Fallback failed for {}: {}", path.display(), e);
                     None
                 }
                 ExtractResult::LexError(e) => {
+                    scanned("", path);
                     failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Lex error for {}: {e}", path.display());
                     None
                 }
                 ExtractResult::ParseFailure(e) => {
+                    scanned("", path);
                     failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Parse failure for {}: {}", path.display(), e);
                     None
@@ -475,7 +715,52 @@ fn main() {
             }
         })
         .collect();
+    let mut class_map =
+        class_map_preferring_autoloaded_files(extracted_classes, composer_autoload.as_ref());
     pb.finish_with_message("done");
+    let class_checks = ClassChecks::start(
+        scanned_files.into_inner().unwrap(),
+        &magento_root,
+        &code_root,
+        &args.fallback_php,
+        rayon::current_num_threads(),
+        !args.ignore_constructor_integrity,
+    );
+
+    // Not compiled, but enabled code can still name these classes or extend them.
+    let mut disabled_class_map: FxHashMap<String, ClassInfo> =
+        walk_php_files(&disabled_module_paths)
+            .par_iter()
+            .filter_map(|path| match extract_file(path) {
+                ExtractResult::Ok(info) => Some((info.fqcn.clone(), info)),
+                _ => None,
+            })
+            .collect();
+
+    let classes_asked_for_by_files = run_file_level_checks(
+        &mut class_map,
+        file_level_checks.into_inner().unwrap(),
+        &magento_root,
+        &args.fallback_php,
+    );
+    for class in classes_inside_a_block.into_inner().unwrap() {
+        if let Some(info) = class_map.remove(&class) {
+            disabled_class_map.insert(class, info);
+        }
+    }
+
+    apply_traits(&mut class_map, &|name| {
+        disabled_class_map
+            .get(name)
+            .cloned()
+            .or_else(|| composer_class_info(composer_autoload.as_ref(), name))
+    });
+    apply_traits(&mut disabled_class_map, &|name| {
+        class_map
+            .get(name)
+            .cloned()
+            .or_else(|| composer_class_info(composer_autoload.as_ref(), name))
+    });
 
     let fallbacks = fallback_count.load(std::sync::atomic::Ordering::Relaxed);
     let failures = failure_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -486,44 +771,12 @@ fn main() {
         failures
     );
 
-    let constructor_violations = validate_constructor_integrity(&class_map);
-    if !constructor_violations.is_empty() {
-        let shown = constructor_violations.len().min(20);
-        for violation in constructor_violations.iter().take(shown) {
-            log::error!("{}", violation);
-        }
-        if constructor_violations.len() > shown {
-            log::error!(
-                "... {} additional constructor integrity violation(s)",
-                constructor_violations.len() - shown
-            );
-        }
-        if args.ignore_constructor_integrity {
-            log::warn!(
-                "Ignoring {} constructor integrity violation(s) because --ignore-constructor-integrity was set",
-                constructor_violations.len()
-            );
-        } else {
-            let supported_types = magento_supported_constructor_scalar_types().join(", ");
-            eprintln!(
-                "error: Magento constructor integrity validation failed ({} violation(s)).\n\
-                 Magento-supported constructor scalar/pseudo type hints: {}.\n\
-                 Class/interface type hints are valid too. Unsupported bare pseudo-types such as \
-                 object and iterable are resolved as class names by Magento's compiler.\n\
-                 Re-run with --ignore-constructor-integrity to continue anyway.",
-                constructor_violations.len(),
-                supported_types
-            );
-            std::process::exit(1);
-        }
-    }
     log_phase_elapsed("Phase 1+2", phase_1_2_started);
 
     // -----------------------------------------------------------------------
     // Phase 3a: Parse + merge global di.xml files (for per-area metadata)
     // -----------------------------------------------------------------------
     let phase_3a_started = Instant::now();
-    let enabled_modules = load_module_order_from_config_php(&magento_root);
     let di_xml_files = filter_enabled_di_xml(
         find_di_xml_files(&magento_root, &enabled_modules),
         &enabled_modules,
@@ -538,7 +791,7 @@ fn main() {
     let global_di_path_configs: Vec<_> = di_xml_files
         .par_iter()
         .filter_map(|path| {
-            let r = parse_di_xml(path);
+            let r = parse_di_xml_unfolded(path);
             pb.inc(1);
             match r {
                 Ok(cfg) => Some((path.clone(), cfg)),
@@ -551,26 +804,26 @@ fn main() {
         .collect();
     pb.finish_with_message("done");
 
+    let app_etc = magento_root.join("app/etc");
+    let (primary_scope, global_scope): (Vec<_>, Vec<_>) = global_di_path_configs
+        .iter()
+        .partition(|(path, _)| path.starts_with(&app_etc));
+    stop_on_unreadable_argument(primary_scope.into_iter().map(|(_, config)| config));
+    stop_on_unreadable_argument(global_scope.into_iter().map(|(_, config)| config));
+
     // Two-phase merge replicating PHP's Config::_mergeConfiguration behaviour:
     //   Phase 1: deep-merge all module di.xml files together (items accumulate by name)
     //   Phase 2: apply merged module result on app/etc/di.xml with shallow arg replacement
     //            (PHP uses array_replace at argument-name level, not item-level deep merge)
-    let app_etc_di_path = magento_root.join("app/etc/di.xml");
-    let (primary_configs, module_configs): (Vec<_>, Vec<_>) = global_di_path_configs
-        .iter()
-        .partition(|(p, _)| *p == app_etc_di_path);
-    let primary_base = merge_configs(
-        primary_configs
-            .into_iter()
-            .map(|(_, c)| c.clone())
-            .collect(),
-    );
-    let module_merged = merge_configs(module_configs.into_iter().map(|(_, c)| c.clone()).collect());
-    let di_config = apply_module_config_on_primary(primary_base, module_merged);
+    let di_config = merge_global_di_configs(&global_di_path_configs, &magento_root);
 
     // Flat Vec<DiConfig> (without path) for detection purposes (plugins/types, not arg values).
-    let global_di_configs: Vec<DiConfig> =
-        global_di_path_configs.into_iter().map(|(_, c)| c).collect();
+    let global_di_configs: Vec<DiConfig> = global_di_path_configs
+        .into_iter()
+        .map(|(_, c)| folded(c))
+        .collect();
+    let area_names = compiled_areas(&di_config);
+    let areas: Vec<&str> = area_names.iter().map(String::as_str).collect();
     // HashSet for O(1) membership tests — used in Phase 3b and Phase 7 filters.
     let di_xml_files_set: FxHashSet<&PathBuf> = di_xml_files.iter().collect();
     log_phase_elapsed("Phase 3a", phase_3a_started);
@@ -583,7 +836,7 @@ fn main() {
     // -----------------------------------------------------------------------
     let phase_3b_started = Instant::now();
     let all_di_xml_files = filter_enabled_di_xml(
-        find_all_di_xml_files(&magento_root, &enabled_modules),
+        find_all_di_xml_files(&magento_root, &enabled_modules, &areas),
         &enabled_modules,
         &magento_root,
     );
@@ -599,7 +852,11 @@ fn main() {
     // area loop can look up already-parsed configs instead of re-parsing.
     let area_di_xml_cache: FxHashMap<std::path::PathBuf, DiConfig> = extra_di_files
         .par_iter()
-        .filter_map(|path| parse_di_xml(path).ok().map(|cfg| ((*path).clone(), cfg)))
+        .filter_map(|path| {
+            parse_di_xml_unfolded(path)
+                .ok()
+                .map(|cfg| ((*path).clone(), cfg))
+        })
         .collect();
     // Preserve original file order for deterministic scanner_di_configs merge.
     let extra_configs: Vec<DiConfig> = extra_di_files
@@ -607,8 +864,20 @@ fn main() {
         .filter_map(|path| area_di_xml_cache.get(*path).cloned())
         .collect();
 
+    if extra_configs.iter().any(DiConfig::has_unreadable_argument) {
+        for area in &areas {
+            let area_files = find_di_xml_files_for_area(&magento_root, area, &enabled_modules);
+            stop_on_unreadable_argument(
+                area_files
+                    .iter()
+                    .filter(|path| !di_xml_files_set.contains(path))
+                    .filter_map(|path| area_di_xml_cache.get(path)),
+            );
+        }
+    }
+
     let mut scanner_di_configs = global_di_configs.clone();
-    scanner_di_configs.extend(extra_configs.clone());
+    scanner_di_configs.extend(extra_configs.iter().cloned().map(folded));
 
     let full_di_config = if extra_configs.is_empty() {
         di_config.clone()
@@ -634,7 +903,15 @@ fn main() {
     // Phase 3c: Collect extension-attributes metadata (for Extension* artifacts)
     // -----------------------------------------------------------------------
     let phase_3c_started = Instant::now();
-    let extension_attr_files = find_extension_attributes_files(&magento_root, &module_paths);
+    let extension_attr_files =
+        find_extension_attributes_files(&magento_root, &module_paths, &args.fallback_php);
+    let di_xml_check = DiXmlCheck::start(
+        all_di_xml_files.clone(),
+        extension_attr_files.clone(),
+        &magento_root,
+        &code_root,
+        args.fallback_php.clone(),
+    );
     let extension_attr_map = parse_extension_attributes_files(&extension_attr_files);
     let extension_specs = collect_extension_specs(&class_map, &extension_attr_map);
     log_phase_elapsed("Phase 3c", phase_3c_started);
@@ -643,12 +920,16 @@ fn main() {
     // Phase 4: Detection (uses full_di_config = all areas merged)
     // -----------------------------------------------------------------------
     let phase_4_started = Instant::now();
-    let composer_autoload = ComposerAutoloadIndex::from_magento_root(&magento_root);
-    let proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
+    let mut proxy_targets = collect_proxy_targets_from_di_configs(&scanner_di_configs);
+    proxy_targets.extend(proxy_targets_from_constructors(&class_map));
     let mut extra_existing_proxy_targets: FxHashSet<String> = FxHashSet::default();
     if let Some(index) = &composer_autoload {
         for target in proxy_targets {
             if class_map.contains_key(&target) {
+                continue;
+            }
+            if disabled_class_map.contains_key(&target) {
+                extra_existing_proxy_targets.insert(target);
                 continue;
             }
             // Keep Magento namespace existence tied to scanned ClassInfo scope.
@@ -662,17 +943,94 @@ fn main() {
         }
     }
 
-    let mut factories =
-        detect_factories_from_configs(&class_map, &full_di_config, &scanner_di_configs, &di_config);
+    // `bin/magento` creates the registered command lists before the compile starts, and
+    // Magento generates what they ask for. The compile then finds those files.
+    let boot = cli_boot::classes_built_at_boot(
+        &cli_boot::registered_command_lists(&magento_root),
+        &|name| {
+            class_map
+                .get(name)
+                .or_else(|| disabled_class_map.get(name))
+                .cloned()
+                .or_else(|| composer_class_info(composer_autoload.as_ref(), name))
+        },
+        &|name| class_map.contains_key(name),
+        &di_config.preferences,
+        &is_generated_class_name,
+    );
+    let classes_asked_for_by_files: FxHashSet<String> = classes_asked_for_by_files
+        .into_iter()
+        .chain(boot.asked.iter().cloned())
+        .collect();
+
+    // Files only ask for a proxy when PHP found its target class.
+    extra_existing_proxy_targets.extend(
+        classes_asked_for_by_files
+            .iter()
+            .filter_map(|name| name.strip_suffix("\\Proxy").map(str::to_string)),
+    );
+
+    let mut factories = detect_factories_from_configs(&class_map, &scanner_di_configs, &di_config);
+    // `Reader::getConfigForScope()` reflects the target of every virtual type, and
+    // a file-level check asks for a class by name. Either one generates the class.
+    let virtual_type_names: FxHashSet<&str> = scanner_di_configs
+        .iter()
+        .flat_map(|cfg| cfg.virtual_types.keys().map(String::as_str))
+        .collect();
+    let source_exists = |fqcn: &str| {
+        class_map.contains_key(fqcn)
+            || disabled_class_map.contains_key(fqcn)
+            || composer_autoload
+                .as_ref()
+                .is_some_and(|index| index.is_loadable(fqcn))
+    };
+    factories.extend(detect_named_factories(
+        scanner_di_configs
+            .iter()
+            .flat_map(|cfg| cfg.virtual_types.values())
+            .map(|vt| vt.type_name.as_str())
+            .filter(|name| !virtual_type_names.contains(name.trim_start_matches('\\'))),
+        &class_map,
+        source_exists,
+    ));
+    // Loading a class loads its parent, and that generates a parent which is a factory.
+    factories.extend(detect_named_factories(
+        class_map
+            .values()
+            .filter_map(|info| info.extends.as_deref()),
+        &class_map,
+        source_exists,
+    ));
+    factories.extend(detect_named_factories(
+        classes_asked_for_by_files
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !virtual_type_names.contains(*name)),
+        &class_map,
+        |_| true,
+    ));
+    factories.sort_by(|a, b| a.factory_fqcn.cmp(&b.factory_fqcn));
+    factories.dedup_by(|a, b| a.factory_fqcn == b.factory_fqcn);
     // Drop factories for classes that Composer already knows about (they exist in
     // a non-scanned vendor package, e.g. ramsey/uuid). PHP skips these too.
     if let Some(index) = &composer_autoload {
         factories.retain(|spec| !index.is_loadable(&spec.factory_fqcn));
     }
+    factories.retain(|spec| !disabled_class_map.contains_key(&spec.factory_fqcn));
+    // Magento's generator needs a source class, and PHP also knows built-in classes. Without
+    // this, the worker would find a factory on disk that Magento never has, and the check of
+    // constructor parameters would pass.
+    factories.retain(|spec| {
+        generated_class_source_exists(&spec.target_fqcn, &source_exists)
+            || plugin_class_failure(&spec.target_fqcn).is_none()
+    });
+    // A proxy needs a source class, and a factory exists once it is generated.
+    extra_existing_proxy_targets.extend(factories.iter().map(|spec| spec.factory_fqcn.clone()));
     let proxies = detect_proxies_from_configs_with_existing(
         &class_map,
         &scanner_di_configs,
         &extra_existing_proxy_targets,
+        &classes_asked_for_by_files,
     );
 
     // Extension class factories are generated by Magento's PHP scanner path.
@@ -682,6 +1040,19 @@ fn main() {
         .map(|spec| spec.factory_fqcn.clone())
         .collect();
     for ext in &extension_specs {
+        // A node without attributes on an interface that does not use extension attributes
+        // only gives the two classes that `ServiceDataAttributesScanner` lists.
+        let used = !ext.attributes.is_empty()
+            || class_map
+                .get(&ext.source_interface_fqcn)
+                .is_some_and(|info| {
+                    info.public_methods
+                        .iter()
+                        .any(|method| method.name == "getExtensionAttributes")
+                });
+        if !used {
+            continue;
+        }
         let factory_fqcn = format!("{}Factory", ext.extension_class_fqcn);
         if class_map.contains_key(&factory_fqcn) || !factory_seen.insert(factory_fqcn.clone()) {
             continue;
@@ -711,12 +1082,23 @@ fn main() {
     // Magento\Setup\...\EntityGeneratorFactory). Magento sees those classes
     // after factory generation; mirror that by adding synthetic class metadata
     // before interceptor detection.
+    let disabled_ancestors = collect_disabled_ancestors(&class_map, &disabled_class_map);
     let mut interception_class_map = class_map.clone();
+    interception_class_map.extend(disabled_ancestors.clone());
+    for (class, info) in &boot.built {
+        interception_class_map
+            .entry(class.clone())
+            .or_insert_with(|| info.clone());
+    }
     augment_with_composer_plugin_owner_classes(
         &mut interception_class_map,
         &interception_di_config,
         composer_autoload.as_ref(),
+        &disabled_class_map,
     );
+    apply_traits(&mut interception_class_map, &|name| {
+        composer_class_info(composer_autoload.as_ref(), name)
+    });
     for spec in &factories {
         if interception_class_map.contains_key(&spec.factory_fqcn) {
             continue;
@@ -745,19 +1127,70 @@ fn main() {
         );
     }
 
+    add_virtual_type_targets_with_plugins(
+        &mut interception_class_map,
+        &interception_di_config,
+        &disabled_class_map,
+        &proxies,
+    );
+
+    if let Some(class) = final_class_with_plugins(
+        &class_map,
+        &interception_class_map,
+        &interception_di_config,
+        &magento_root.join("setup"),
+    ) {
+        stop_compile(&format!(
+            "Class {class}\\Interceptor cannot extend final class {class}"
+        ));
+    }
+
     let mut interceptors = detect_interceptors(&interception_class_map, &interception_di_config);
     // PHP registers setup/src as type SETUP (not MODULE). It does not generate
     // interceptors for Magento\Setup\* classes that only inherit plugins (Phase 2
     // inheritance from e.g. Symfony\Console\Command\Command). However, if a Setup
     // class has a *direct* plugin declared in di.xml, PHP does generate its interceptor
     // (e.g. Magento\Setup\Model\FixtureGenerator\EntityGeneratorFactory). Keep those.
+    let setup_root = magento_root.join("setup");
+    let parents_of_scanned_classes = scanned_parents_outside(&class_map, &setup_root);
     interceptors.retain(|spec| {
         let fqcn = spec.fqcn.trim_start_matches('\\');
         if !fqcn.starts_with("Magento\\Setup\\") {
             return true; // non-Setup class — always keep
         }
-        !spec.plugins.is_empty() // Setup class with direct plugins — keep; inherited-only — drop
+        if spec.plugins.is_empty() {
+            return false; // inherited-only — drop
+        }
+        // `intercepted_paths` has no `setup/src`, so only a child on those paths reaches this class.
+        class_map
+            .get(fqcn)
+            .is_none_or(|info| !info.path.starts_with(&setup_root))
+            || parents_of_scanned_classes.contains(fqcn)
     });
+    // The generated interceptor of a readonly class is a fatal error when Magento loads it.
+    let mut readonly_classes: Vec<&str> = interceptors
+        .par_iter()
+        .filter(|spec| {
+            class_map.get(spec.fqcn.as_str()).is_some_and(|info| {
+                !info.path.starts_with(&setup_root)
+                    && std::fs::read_to_string(&info.path)
+                        .is_ok_and(|source| source.contains("readonly"))
+            })
+        })
+        .map(|spec| spec.fqcn.as_str())
+        .filter(|class| {
+            PHP_WORKER_POOL
+                .get()
+                .and_then(|pool| pool.request(&format!("is_readonly_class:{class}")))
+                .is_some_and(|answer| answer.trim() == "true")
+        })
+        .collect();
+    readonly_classes.sort();
+    if let Some(class) = readonly_classes.first() {
+        stop_compile(&format!(
+            "Non-readonly class {class}\\Interceptor cannot extend readonly class {class}"
+        ));
+    }
     enrich_interceptor_specs_with_reflection(
         &mut interceptors,
         &interception_class_map,
@@ -856,6 +1289,9 @@ fn main() {
     log_phase_elapsed("Phase 5", phase_5_started);
 
     if args.dry_run {
+        if let Err(message) = di_xml_check.finish().and(class_checks.finish()) {
+            stop_compile(&message);
+        }
         log::info!("Dry run — skipping file writes");
         print_summary(
             &interceptors,
@@ -899,6 +1335,10 @@ fn main() {
             }
             let params =
                 reflect_constructor_params(&spec.fqcn, &args.magento_root, &args.fallback_php)?;
+            stop_on_object_default(
+                &spec.fqcn,
+                params.iter().filter_map(|p| p.default_value.as_deref()),
+            );
             Some((spec.fqcn.clone(), params))
         })
         .collect();
@@ -919,10 +1359,8 @@ fn main() {
         let content = generate_interceptor(spec, effective_info.as_ref());
         let rel = interceptor_path(&spec.fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -932,10 +1370,8 @@ fn main() {
         let content = generate_factory(spec);
         let rel = factory_path(&spec.factory_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -969,11 +1405,14 @@ fn main() {
             let mut reflected_methods =
                 reflect_interceptable_methods(target_fqcn, &args.magento_root, &args.fallback_php)?;
             for method in reflected_methods.iter_mut() {
-                normalize_reflected_method_signature_for_proxy(
-                    method,
+                stop_on_object_default(
                     target_fqcn,
-                    &interception_class_map,
+                    method
+                        .params
+                        .iter()
+                        .filter_map(|p| p.default_value.as_deref()),
                 );
+                normalize_reflected_method_signature(method);
             }
             Some((target_fqcn.clone(), reflected_methods))
         })
@@ -1025,10 +1464,8 @@ fn main() {
         let content = generate_proxy(spec, target_info.as_ref());
         let rel = proxy_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1038,10 +1475,8 @@ fn main() {
         let content = generate_search_results(&spec.result_fqcn, &spec.source_fqcn);
         let rel = search_results_path(&spec.result_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1054,10 +1489,8 @@ fn main() {
             generate_proxy_deferred(&spec.proxy_fqcn, &spec.target_fqcn, target_info.as_ref());
         let rel = proxy_deferred_path(&spec.proxy_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1070,10 +1503,8 @@ fn main() {
         let content = generate_extension_interface(spec);
         let rel = extension_path(&spec.extension_interface_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
@@ -1086,15 +1517,18 @@ fn main() {
         let content = generate_extension(spec);
         let rel = extension_path(&spec.extension_class_fqcn);
         let out_path = code_root.join(&rel);
-        if let Ok(changed) = write_if_changed(&out_path, &content) {
-            if changed {
-                written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if must_write(&out_path, &content) {
+            written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pb.inc(1);
     });
     pb.finish_with_message("done");
     log_phase_elapsed("Phase 6", phase_6_started);
+
+    // Generated code is on disk now, so a failure can be checked against the real classes.
+    if let Err(message) = di_xml_check.finish().and(class_checks.finish()) {
+        stop_compile(&message);
+    }
 
     // -----------------------------------------------------------------------
     // Phase 7: Generate metadata files
@@ -1130,25 +1564,17 @@ fn main() {
         .map(|b| b == new_fp)
         .unwrap_or(false);
     // On hit, verify all expected metadata files exist before skipping.
-    let plugin_scopes_for_fp = [
-        "global",
-        "adminhtml",
-        "crontab",
-        "frontend",
-        "graphql",
-        "webapi_rest",
-        "webapi_soap",
-    ];
+    let plugin_list_ids = plugin_list_cache_ids(&magento_root, &args.fallback_php, &areas);
     let fp_hit = fp_hit && {
-        AREAS
+        areas
             .iter()
             .map(|a| metadata_root.join(format!("{}.php", a)))
             .chain(std::iter::once(metadata_root.join("interception.php")))
             .chain(std::iter::once(metadata_root.join("app_action_list.php")))
             .chain(
-                plugin_scopes_for_fp
+                areas
                     .iter()
-                    .map(|s| metadata_root.join(format!("{}.php", plugin_list_cache_id(s)))),
+                    .map(|s| metadata_root.join(format!("{}.php", plugin_list_ids[*s]))),
             )
             .all(|p| p.exists())
     };
@@ -1186,7 +1612,7 @@ fn main() {
         // source concrete classes, not for generated artifacts (interceptors, factories, proxies).
         let base_class_fqcns: FxHashSet<String> = interception_class_map.keys().cloned().collect();
         // Wrap in Arc so the area par_iter loop shares it without cloning 25K strings per area.
-        let argument_type_names = std::sync::Arc::new(build_argument_type_names(
+        let mut argument_type_names = build_argument_type_names(
             &interception_class_map,
             &generated_class_map,
             &metadata_base_di_config,
@@ -1196,8 +1622,15 @@ fn main() {
             &search_results,
             &proxy_deferred,
             &extension_specs,
-        ));
-        let interception_type_names = build_interception_type_names(
+        );
+        // ClassesScanner never lists these, so Magento gives them no arguments entry.
+        argument_type_names.retain(|name| {
+            let class = name.strip_suffix("\\Interceptor").unwrap_or(name);
+            class_map.contains_key(class)
+                || !(disabled_class_map.contains_key(class) || boot.built.contains_key(class))
+        });
+        let argument_type_names = std::sync::Arc::new(argument_type_names);
+        let mut interception_type_names = build_interception_type_names(
             &interception_class_map,
             &generated_class_map,
             &metadata_base_di_config,
@@ -1207,6 +1640,18 @@ fn main() {
             &search_results,
             &proxy_deferred,
             &extension_specs,
+        );
+        // The scan does not list a class that only the console boot creates. Its generated
+        // interceptor is listed, because the compile finds that file in `generated/code`.
+        interception_type_names.retain(|name| !boot.built.contains_key(name));
+        // `Config::generateIntercepted()` marks every plugin owner in every scope, even
+        // when the owner's module is disabled.
+        interception_type_names.extend(
+            interception_di_config
+                .plugins
+                .keys()
+                .filter(|owner| disabled_class_map.contains_key(*owner))
+                .cloned(),
         );
         // All three reflection passes merged into one par_iter — eliminates two
         // Rayon barriers. Candidates are disjoint: pass 1 has constructors with
@@ -1251,7 +1696,7 @@ fn main() {
         // interception.php
         let interception_content = serialize_interception_php(&all_fqcns);
         let interception_path = metadata_root.join("interception.php");
-        let _ = write_if_changed(&interception_path, &interception_content);
+        must_write(&interception_path, &interception_content);
         log::debug!(
             "Phase 7 interception registry+php: {:?}",
             t_interception.elapsed()
@@ -1260,11 +1705,15 @@ fn main() {
         // Build the case-normalisation index once from the interception class map.
         // All 7 area iterations reuse the same index; previously it was rebuilt
         // from scratch inside canonicalize_instance_reference_case on every call.
-        let case_index = build_case_index(&interception_class_map);
+        let mut case_index = build_case_index(&interception_class_map);
+        add_declared_constructor_classes(
+            &mut case_index,
+            &metadata_class_map,
+            composer_autoload.as_ref(),
+        );
 
-        // OPT-DELTA: resolve all 25K types once with global interception overrides baked in.
-        // Areas typically change only ~40 type_configs; per-area re-resolution only processes
-        // the small affected set instead of all 25K types × 7 areas = 175K resolutions.
+        // Resolve every type once with global interception overrides baked in. Areas with
+        // no di.xml of their own write this result as it is.
         let global_preference_overrides = build_interception_preference_overrides(
             &metadata_base_di_config,
             &global_interceptor_map,
@@ -1312,34 +1761,13 @@ fn main() {
         });
         log_phase_elapsed("Phase 7 global arg baseline", t_global_resolve);
 
-        let t_dep_idx = Instant::now();
-        let (hierarchy_dep_rev, pref_dep_rev) =
-            di_resolver::arguments::build_dependency_reverse_index(
-                &argument_type_names,
-                &metadata_class_map,
-                &global_resolution_di_config,
-            );
-        // pref_to_iface[V] = preference keys whose resolved value is V.
-        // Used to find types injecting K via an interface when K's type_config changes.
-        let mut pref_to_iface: FxHashMap<String, Vec<String>> = FxHashMap::default();
-        for (from, to) in &global_resolution_di_config.preferences {
-            pref_to_iface
-                .entry(to.trim_start_matches('\\').to_string())
-                .or_default()
-                .push(from.trim_start_matches('\\').to_string());
-        }
-        log_phase_elapsed("Phase 7 dependency reverse index", t_dep_idx);
         let global_baseline_args = std::sync::Arc::new(global_baseline_args);
-        let global_preference_overrides = std::sync::Arc::new(global_preference_overrides);
-        let hierarchy_dep_rev = std::sync::Arc::new(hierarchy_dep_rev);
-        let pref_dep_rev = std::sync::Arc::new(pref_dep_rev);
-        let pref_to_iface = std::sync::Arc::new(pref_to_iface);
 
         // Per-area config files — each area merges global + area-specific di.xml overlays.
         // Run in parallel: each area is independent (different files, different output path).
         let t_area_config = Instant::now();
-        let pb_area = progress_bar(AREAS.len() as u64, "Generating area configs");
-        let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = AREAS
+        let pb_area = progress_bar(areas.len() as u64, "Generating area configs");
+        let area_di_configs: FxHashMap<String, std::sync::Arc<DiConfig>> = areas
             .par_iter()
             .map(|&area| {
                 let area_di_files = filter_enabled_di_xml(
@@ -1350,61 +1778,42 @@ fn main() {
 
                 // Only re-merge if there are area-specific files beyond the global set.
                 // Use Arc::clone for the no-overrides path to avoid cloning the large DiConfig.
-                // Collect changed di.xml keys before consuming extra_configs so OPT-DELTA can
-                // compute the affected type set without a full re-resolution.
-                let mut changed_hierarchy_keys: FxHashSet<String> = FxHashSet::default();
-                let mut changed_pref_keys: FxHashSet<String> = FxHashSet::default();
-                let area_di_config: std::sync::Arc<DiConfig> = if area_di_files.len()
-                    > di_xml_files.len()
-                {
-                    let area_only: Vec<_> = area_di_files
-                        .iter()
-                        .filter(|p| !di_xml_files_set.contains(p))
-                        .collect();
-                    if area_only.is_empty() {
-                        std::sync::Arc::clone(&metadata_base_di_config)
-                    } else {
-                        // Look up from Phase 3b cache; fall back to re-parsing only for
-                        // files not in the cache (should not happen in practice).
-                        let extra_configs: Vec<DiConfig> = area_only
+                let area_di_config: std::sync::Arc<DiConfig> =
+                    if area_di_files.len() > di_xml_files.len() {
+                        let area_only: Vec<_> = area_di_files
                             .iter()
-                            .filter_map(|p| {
-                                area_di_xml_cache
-                                    .get(*p)
-                                    .cloned()
-                                    .or_else(|| parse_di_xml(p).ok())
-                            })
+                            .filter(|p| !di_xml_files_set.contains(p))
                             .collect();
-                        // Collect which keys change so OPT-DELTA can compute the affected set.
-                        for cfg in &extra_configs {
-                            for k in cfg.type_configs.keys() {
-                                changed_hierarchy_keys
-                                    .insert(k.trim_start_matches('\\').to_string());
-                            }
-                            for k in cfg.virtual_types.keys() {
-                                changed_hierarchy_keys
-                                    .insert(k.trim_start_matches('\\').to_string());
-                            }
-                            for k in cfg.preferences.keys() {
-                                changed_pref_keys.insert(k.trim_start_matches('\\').to_string());
-                            }
+                        if area_only.is_empty() {
+                            std::sync::Arc::clone(&metadata_base_di_config)
+                        } else {
+                            // Look up from Phase 3b cache; fall back to re-parsing only for
+                            // files not in the cache (should not happen in practice).
+                            let extra_configs: Vec<DiConfig> = area_only
+                                .iter()
+                                .filter_map(|p| {
+                                    area_di_xml_cache
+                                        .get(*p)
+                                        .cloned()
+                                        .or_else(|| parse_di_xml_unfolded(p).ok())
+                                })
+                                .collect();
+                            // Area-specific module configs applied via the same two-phase merge as
+                            // global: deep-merge area module configs together, then apply on the
+                            // global base using shallow (array_replace) semantics per PHP behaviour.
+                            let mut merged_area = apply_module_config_on_primary(
+                                (*metadata_base_di_config).clone(),
+                                merge_configs(extra_configs),
+                            );
+                            apply_resolved_constants_to_di_config(
+                                &mut merged_area,
+                                &resolved_const_values,
+                            );
+                            std::sync::Arc::new(merged_area)
                         }
-                        // Area-specific module configs applied via the same two-phase merge as
-                        // global: deep-merge area module configs together, then apply on the
-                        // global base using shallow (array_replace) semantics per PHP behaviour.
-                        let mut merged_area = apply_module_config_on_primary(
-                            (*metadata_base_di_config).clone(),
-                            merge_configs(extra_configs),
-                        );
-                        apply_resolved_constants_to_di_config(
-                            &mut merged_area,
-                            &resolved_const_values,
-                        );
-                        std::sync::Arc::new(merged_area)
-                    }
-                } else {
-                    std::sync::Arc::clone(&metadata_base_di_config)
-                };
+                    } else {
+                        std::sync::Arc::clone(&metadata_base_di_config)
+                    };
 
                 // Build area-specific preference overrides.
                 // global_interceptor_map is shared read-only; no per-area clone needed.
@@ -1413,24 +1822,7 @@ fn main() {
                     &global_interceptor_map,
                 );
 
-                // OPT-DELTA: also treat preference keys where area diverges from global as changed.
-                for (from, to) in &area_preference_overrides {
-                    if global_preference_overrides.get(from.as_str()) != Some(to) {
-                        changed_pref_keys.insert(from.trim_start_matches('\\').to_string());
-                    }
-                }
-                for from in global_preference_overrides.keys() {
-                    if !area_preference_overrides.contains_key(from.as_str()) {
-                        changed_pref_keys.insert(from.trim_start_matches('\\').to_string());
-                    }
-                }
-
-                // OPT-DELTA: compute the set of types whose resolution could differ from the
-                // global baseline.  Only these types need a delta re-resolution.
-                let mut affected: FxHashSet<String> = FxHashSet::default();
-
-                // Extra VTs introduced in area di.xml are absent from the global baseline —
-                // they always need fresh resolution.
+                // Extra VTs introduced in area di.xml are absent from the global baseline.
                 let base_set: FxHashSet<&str> =
                     argument_type_names.iter().map(|s| s.as_str()).collect();
                 let area_extra_vt_names: Vec<String> = area_di_config
@@ -1439,162 +1831,155 @@ fn main() {
                     .filter(|k| !base_set.contains(k.as_str()))
                     .cloned()
                     .collect();
-                for name in &area_extra_vt_names {
-                    affected.insert(name.clone());
-                }
 
-                for k in &changed_hierarchy_keys {
-                    // Types that access K in their hierarchy walk.
-                    if let Some(types) = hierarchy_dep_rev.get(k) {
-                        for t in types {
-                            affected.insert(t.clone());
-                        }
-                    }
-                    // Types that directly inject K as a constructor type hint (K's type_config
-                    // changes affect whether args resolve as shared or non-shared).
-                    if let Some(types) = pref_dep_rev.get(k) {
-                        for t in types {
-                            affected.insert(t.clone());
-                        }
-                    }
-                    // Transitive: types that inject K via a preference (interface I → K).
-                    // Their resolved concrete type is K; K's type_config change affects them too.
-                    if let Some(ifaces) = pref_to_iface.get(k) {
-                        for iface in ifaces {
-                            if let Some(types) = pref_dep_rev.get(iface) {
-                                for t in types {
-                                    affected.insert(t.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                for p in &changed_pref_keys {
-                    // Types that inject via preference key P — the resolved concrete type may change.
-                    if let Some(types) = pref_dep_rev.get(p) {
-                        for t in types {
-                            affected.insert(t.clone());
-                        }
-                    }
-                }
-
-                let t_area_delta = Instant::now();
-                let affected_count = affected.len();
-                let area_content = if affected.is_empty() {
-                    // Fast path: global baseline applies as-is — no clone needed.
-                    generate_area_config_with_overrides(
-                        &global_baseline_args,
-                        &FxHashMap::default(),
-                        &area_di_config,
-                        &area_preference_overrides,
-                        &global_interceptor_map,
-                    )
-                } else {
-                    // Delta path: build area_di_config_for_args with interception overrides.
-                    let mut area_di_config_for_args = (*area_di_config).clone();
-                    for (from, to) in &area_preference_overrides {
-                        // Keep VT argument values stable: synthetic interception overrides for
-                        // virtual-type names should not participate in argument object resolution.
-                        if area_di_config_for_args
-                            .virtual_types
-                            .contains_key(from.as_str())
-                        {
-                            continue;
-                        }
-                        area_di_config_for_args.insert_preference(from.clone(), to.clone());
-                    }
-
-                    // Resolve only the affected types (plus any new area VTs).
-                    let affected_names: Vec<String> = affected.into_iter().collect();
-                    let mut delta_args = resolve_all_arguments_for_named_types(
-                        &affected_names,
-                        &metadata_class_map,
-                        &base_class_fqcns,
-                        &area_di_config_for_args,
-                        &const_map,
-                    );
-                    apply_case_index(&mut delta_args, &case_index);
-                    // Apply the same interceptor filter to the delta results.
-                    delta_args.retain(|fqcn, args| {
-                        if !global_interceptor_map.contains_key(fqcn) {
-                            return true;
-                        }
-                        if metadata_base_di_config
-                            .virtual_types
-                            .contains_key(fqcn.as_str())
-                        {
-                            return true;
-                        }
-                        if !args.is_empty() {
-                            return false;
-                        }
-                        let normalized = fqcn.trim_start_matches('\\');
-                        if !base_class_fqcns.contains(normalized) {
-                            return false;
-                        }
-                        matches!(
-                            metadata_class_map.get(normalized).map(|info| &info.kind),
-                            Some(ClassKind::Class) | Some(ClassKind::Trait)
+                let t_area_args = Instant::now();
+                let area_content =
+                    if std::sync::Arc::ptr_eq(&area_di_config, &metadata_base_di_config) {
+                        // No area-specific di.xml: the global baseline applies as-is.
+                        generate_area_config_with_overrides(
+                            &global_baseline_args,
+                            &FxHashMap::default(),
+                            &area_di_config,
+                            &area_preference_overrides,
+                            &global_interceptor_map,
                         )
-                    });
-                    // OVERLAY: pass baseline + delta directly — no 25K HashMap clone.
-                    generate_area_config_with_overrides(
-                        &global_baseline_args,
-                        &delta_args,
-                        &area_di_config,
-                        &area_preference_overrides,
-                        &global_interceptor_map,
-                    )
-                };
+                    } else {
+                        // Magento resolves every type against the merged area config
+                        // (Compiler\Config\Reader::generateCachePerScope), because an area
+                        // preference or shared setting can reach any configured object at any
+                        // depth. Build area_di_config_for_args with interception overrides.
+                        let mut area_di_config_for_args = (*area_di_config).clone();
+                        for (from, to) in &area_preference_overrides {
+                            // Keep VT argument values stable: synthetic interception overrides for
+                            // virtual-type names should not participate in argument object resolution.
+                            if area_di_config_for_args
+                                .virtual_types
+                                .contains_key(from.as_str())
+                            {
+                                continue;
+                            }
+                            area_di_config_for_args.insert_preference(from.clone(), to.clone());
+                        }
+
+                        let mut area_type_names: Vec<String> = (*argument_type_names).clone();
+                        area_type_names.extend(area_extra_vt_names.iter().cloned());
+                        let mut area_args = resolve_all_arguments_for_named_types(
+                            &area_type_names,
+                            &metadata_class_map,
+                            &base_class_fqcns,
+                            &area_di_config_for_args,
+                            &const_map,
+                        );
+                        apply_case_index(&mut area_args, &case_index);
+                        // Apply the same interceptor filter as the global baseline.
+                        area_args.retain(|fqcn, args| {
+                            if !global_interceptor_map.contains_key(fqcn) {
+                                return true;
+                            }
+                            if metadata_base_di_config
+                                .virtual_types
+                                .contains_key(fqcn.as_str())
+                            {
+                                return true;
+                            }
+                            if !args.is_empty() {
+                                return false;
+                            }
+                            let normalized = fqcn.trim_start_matches('\\');
+                            if !base_class_fqcns.contains(normalized) {
+                                return false;
+                            }
+                            matches!(
+                                metadata_class_map.get(normalized).map(|info| &info.kind),
+                                Some(ClassKind::Class) | Some(ClassKind::Trait)
+                            )
+                        });
+                        generate_area_config_with_overrides(
+                            &area_args,
+                            &FxHashMap::default(),
+                            &area_di_config,
+                            &area_preference_overrides,
+                            &global_interceptor_map,
+                        )
+                    };
                 log::debug!(
-                    "Phase 7 area={} delta (changed_keys={}, affected={}, extra_vt={}): {:?}",
+                    "Phase 7 area={} args (extra_vt={}): {:?}",
                     area,
-                    changed_hierarchy_keys.len() + changed_pref_keys.len(),
-                    affected_count,
                     area_extra_vt_names.len(),
-                    t_area_delta.elapsed()
+                    t_area_args.elapsed()
                 );
                 let area_path = metadata_root.join(format!("{}.php", area));
-                let _ = write_if_changed(&area_path, &area_content);
+                must_write(&area_path, &area_content);
                 pb_area.inc(1);
                 (area.to_string(), area_di_config)
             })
             .collect();
         pb_area.finish_with_message("done");
         log_phase_elapsed("Phase 7 area-config loop", t_area_config);
+        if let Err(message) =
+            check_preference_targets(&areas, &area_di_configs, &class_map, &generated_class_map)
+        {
+            stop_compile(&message);
+        }
 
         // Scope-specific plugin-list metadata files.
         let plugin_list_class_definitions: Vec<String> = Vec::new();
-        let plugin_scopes = [
-            "global",
-            "adminhtml",
-            "crontab",
-            "frontend",
-            "graphql",
-            "webapi_rest",
-            "webapi_soap",
-        ];
-        let t_plugin_list = Instant::now();
-        let pb_plugins = progress_bar(
-            plugin_scopes.len() as u64,
-            "Generating plugin-list metadata",
+        // PluginList follows the parents of every plugin owner, wherever the owner lives.
+        let mut plugin_list_class_map = disabled_class_map.clone();
+        plugin_list_class_map.extend(class_map.clone());
+        // Magento reads the parents of generated classes too, through the autoloader.
+        for (fqcn, info) in &generated_class_map {
+            plugin_list_class_map
+                .entry(fqcn.clone())
+                .or_insert_with(|| info.clone());
+        }
+        add_library_classes_for_plugin_list(
+            &mut plugin_list_class_map,
+            &full_di_config,
+            composer_autoload.as_ref(),
         );
-        plugin_scopes.par_iter().for_each(|&scope| {
+        apply_traits(&mut plugin_list_class_map, &|name| {
+            composer_class_info(composer_autoload.as_ref(), name)
+        });
+        let t_plugin_list = Instant::now();
+        let pb_plugins = progress_bar(areas.len() as u64, "Generating plugin-list metadata");
+        let unconfirmed_plugin_classes = Mutex::new(std::collections::BTreeSet::new());
+        let disabled_plugin_classes = Mutex::new(std::collections::BTreeSet::new());
+        areas.par_iter().for_each(|&scope| {
             if let Some(scope_di_config) = area_di_configs.get(scope) {
-                // For non-global scopes virtual types are not emitted; pass the flag
-                // directly instead of cloning + clearing the full DiConfig.
-                let include_vt = scope == "global";
+                // A scope with no di.xml of its own has the global config here, but loads
+                // no virtual types.
+                let reads_own_files = scope == "global"
+                    || !std::sync::Arc::ptr_eq(scope_di_config, &metadata_base_di_config);
+                let scope_virtual_types: &[String] = if reads_own_files {
+                    &scope_di_config.scope_virtual_types
+                } else {
+                    &[]
+                };
                 let t_scope = Instant::now();
-                let metadata = compile_plugin_list(
+                let metadata = compile_scope_plugin_list(
                     scope_di_config,
-                    &class_map,
+                    &metadata_base_di_config,
+                    &plugin_list_class_map,
                     &plugin_list_class_definitions,
-                    include_vt,
+                    scope_virtual_types,
+                );
+                unconfirmed_plugin_classes
+                    .lock()
+                    .unwrap()
+                    .extend(metadata.unconfirmed_plugin_classes.iter().cloned());
+                disabled_plugin_classes.lock().unwrap().extend(
+                    disabled_plugin_classes_of_intercepted_types(
+                        &metadata,
+                        &class_map,
+                        &plugin_list_class_map,
+                        &metadata_base_di_config,
+                        &magento_root.join("setup"),
+                    ),
                 );
                 let content = serialize_plugin_list_php(&metadata);
-                let cache_id = plugin_list_cache_id(scope);
-                let path = metadata_root.join(format!("{}.php", cache_id));
-                let _ = write_if_changed(&path, &content);
+                let path = metadata_root.join(format!("{}.php", plugin_list_ids[scope]));
+                must_write(&path, &content);
                 log::debug!(
                     "Phase 7 plugin-list scope={}: {:?}",
                     scope,
@@ -1604,14 +1989,28 @@ fn main() {
             pb_plugins.inc(1);
         });
         pb_plugins.finish_with_message("done");
+        stop_on_missing_plugin_classes(&unconfirmed_plugin_classes.into_inner().unwrap());
+        stop_on_missing_disabled_plugin_classes(&disabled_plugin_classes.into_inner().unwrap());
         log_phase_elapsed("Phase 7 plugin-list loop", t_plugin_list);
 
         // App action list metadata.
-        let app_action_list = generate_app_action_list_php(&class_map);
+        let listed_classes: FxHashMap<String, ClassInfo> = class_map
+            .iter()
+            .filter(|(_, info)| {
+                !not_listed_module_paths
+                    .iter()
+                    .any(|root| info.path.starts_with(root))
+            })
+            .map(|(name, info)| (name.clone(), info.clone()))
+            .collect();
+        let app_action_list = generate_app_action_list_php(&listed_classes);
         let app_action_list_path = metadata_root.join("app_action_list.php");
-        let _ = write_if_changed(&app_action_list_path, &app_action_list);
-        let _ = std::fs::create_dir_all(&fp_dir);
-        let _ = std::fs::write(&fp_path, new_fp);
+        must_write(&app_action_list_path, &app_action_list);
+        if let Err(e) =
+            std::fs::create_dir_all(&fp_dir).and_then(|()| std::fs::write(&fp_path, new_fp))
+        {
+            stop_compile(&format!("Could not write {}: {e}", fp_path.display()));
+        }
     } // end 'phase7
     log_phase_elapsed("Phase 7", phase_7_started);
 
@@ -1701,6 +2100,290 @@ fn main() {
 
     // Clean up the temp PHP worker script.
     let _ = std::fs::remove_file(&worker_script_path);
+}
+
+/// `InterceptionConfigurationBuilder::getInterceptedMethods()` calls `get_class_methods()` on
+/// each plugin of the inherited list of a scanned concrete class. `PluginListGenerator` keeps
+/// disabled plugins in that list, so a disabled plugin whose class is gone is a TypeError.
+/// A row without a class is not in the list. Returns `(plugin class, owner)`.
+fn disabled_plugin_classes_of_intercepted_types(
+    metadata: &code_generator::PluginListMetadata,
+    class_map: &FxHashMap<String, ClassInfo>,
+    lookup: &FxHashMap<String, ClassInfo>,
+    om_config: &DiConfig,
+    setup_root: &Path,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (owner, plugins) in &metadata.inherited {
+        let Some(plugins) = plugins else {
+            continue;
+        };
+        let intercepted = class_map.get(owner.as_str()).is_some_and(|info| {
+            info.kind == ClassKind::Class
+                && !info.is_abstract
+                && !info.path.starts_with(setup_root)
+                && !owner.ends_with("\\Interceptor")
+                && !self_and_ancestors(owner, lookup)
+                    .contains("Magento\\Framework\\ObjectManager\\NoninterceptableInterface")
+        });
+        if !intercepted {
+            continue;
+        }
+        for plugin in plugins {
+            if plugin.disabled == Some(true) && !plugin.instance.is_empty() {
+                let class = om_config.get_instance_type(&plugin.instance);
+                if !class_map.contains_key(class.trim_start_matches('\\')) {
+                    found.push((class.trim_start_matches('\\').to_string(), owner.clone()));
+                }
+            }
+        }
+    }
+    found
+}
+
+fn stop_on_missing_disabled_plugin_classes(classes: &BTreeSet<(String, String)>) {
+    for (class, owner) in classes {
+        let answer = PHP_WORKER_POOL
+            .get()
+            .and_then(|pool| pool.request(&format!("class_like_exists:{class}")))
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok());
+        let message = match answer {
+            Some(serde_json::Value::Bool(true)) => continue,
+            Some(serde_json::Value::Bool(false)) => {
+                format!("Plugin class {class} doesn't exist (disabled plugin on {owner})")
+            }
+            Some(serde_json::Value::String(message)) => {
+                format!("Plugin class {class} cannot load (disabled plugin on {owner}): {message}")
+            }
+            // No PHP answer proves nothing, and a false stop blocks a working store.
+            _ => {
+                log::warn!("Could not check plugin class {class} in PHP");
+                continue;
+            }
+        };
+        stop_compile(&message);
+    }
+}
+
+/// The class and everything `class_parents()` and `class_implements()` give for it, as far as the
+/// lookup knows. Stops at a class named Interceptor, as `Config::_inheritInterception()` does.
+fn self_and_ancestors<'a>(
+    name: &'a str,
+    lookup: &'a FxHashMap<String, ClassInfo>,
+) -> FxHashSet<&'a str> {
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    let mut stack: Vec<&str> = vec![name];
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name) || name.rsplit('\\').next() == Some("Interceptor") {
+            continue;
+        }
+        if let Some(info) = lookup.get(name) {
+            stack.extend(info.extends.iter().map(|n| n.trim_start_matches('\\')));
+            stack.extend(info.implements.iter().map(|n| n.trim_start_matches('\\')));
+        }
+    }
+    seen
+}
+
+/// `InterceptionConfigurationBuilder::getInterceptedClasses()` picks every scanned concrete class
+/// with `Config::hasPlugins()` true, and the generated interceptor is loaded. For a final class
+/// that is a fatal error. `hasPlugins()` also counts a disabled plugin, and plugins of parents and
+/// interfaces. `setup/` is not part of `intercepted_paths`.
+fn final_class_with_plugins(
+    class_map: &FxHashMap<String, ClassInfo>,
+    lookup: &FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    setup_root: &Path,
+) -> Option<String> {
+    let has_plugins = |name: &str| di_config.plugins.get(name).is_some_and(|p| !p.is_empty());
+    let mut found: Vec<&String> = class_map
+        .iter()
+        .filter(|(fqcn, info)| {
+            if !info.is_final
+                || info.path.starts_with(setup_root)
+                || fqcn.ends_with("\\Interceptor")
+            {
+                return false;
+            }
+            let ancestors = self_and_ancestors(fqcn, lookup);
+            ancestors.iter().any(|name| has_plugins(name))
+                && !ancestors
+                    .contains("Magento\\Framework\\ObjectManager\\NoninterceptableInterface")
+        })
+        .map(|(fqcn, _)| fqcn)
+        .collect();
+    found.sort();
+    found.first().map(|fqcn| fqcn.to_string())
+}
+
+const GENERATED_CLASS_SUFFIXES: &[&str] = &[
+    "\\Proxy",
+    "\\Interceptor",
+    "\\ProxyDeferred",
+    "\\Remote",
+    "\\Logger",
+    "Factory",
+    "Mapper",
+    "Persistor",
+    "Repository",
+    "Converter",
+    "SearchResults",
+    "ExtensionInterface",
+    "Extension",
+];
+
+/// True for a class that exists, or that Magento's generator can make from a class that exists.
+fn generated_class_source_exists(class: &str, source_exists: &impl Fn(&str) -> bool) -> bool {
+    source_exists(class)
+        || GENERATED_CLASS_SUFFIXES.iter().any(|suffix| {
+            class.strip_suffix(suffix).is_some_and(|source| {
+                !source.is_empty()
+                    && (generated_class_source_exists(source, source_exists)
+                        || source_exists(&format!("{source}Interface")))
+            })
+        })
+}
+
+/// `Compiler\\Config\\Reader::generateCachePerScope()`, for every preference of every area. Its
+/// list of known classes grows per area, because `fillThirdPartyInterfaces()` adds the classes
+/// that have a preference. So an area can pass thanks to an earlier one, and the order counts.
+fn check_preference_targets(
+    compiled_areas: &[&str],
+    area_di_configs: &FxHashMap<String, std::sync::Arc<DiConfig>>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    generated_class_map: &FxHashMap<String, ClassInfo>,
+) -> Result<(), String> {
+    let mut known_with_preference: FxHashSet<&str> = FxHashSet::default();
+    let mut answers: FxHashMap<String, Option<String>> = FxHashMap::default();
+    for area in compiled_areas.iter().copied() {
+        let Some(config) = area_di_configs.get(area) else {
+            continue;
+        };
+        known_with_preference.extend(config.preferences.keys().map(String::as_str));
+        let mut instances: Vec<&String> = config.preferences.keys().collect();
+        instances.sort();
+        for instance in instances {
+            let target = final_preference(instance, config)?;
+            if target == *instance || config.virtual_types.contains_key(&target) {
+                continue;
+            }
+            let scanned = class_map.get(&target);
+            let known = scanned.is_some()
+                || generated_class_map.contains_key(&target)
+                || known_with_preference.contains(target.as_str());
+            if scanned.is_some_and(|info| {
+                matches!(info.kind, ClassKind::Class | ClassKind::AbstractClass)
+            }) {
+                continue;
+            }
+            let answer = answers
+                .entry(target.clone())
+                .or_insert_with(|| {
+                    PHP_WORKER_POOL
+                        .get()
+                        .and_then(|pool| pool.request(&format!("preference_target:{target}")))
+                        .and_then(|raw| serde_json::from_str::<String>(raw.trim()).ok())
+                })
+                .as_deref();
+            match answer {
+                Some("extension") => {}
+                Some("class") if known || is_generated_class_name(&target) => {}
+                Some("class") => {
+                    return Err(format!(
+                        "Preference declared for \"{instance}\" as \"{target}\", but the latter has not been included in dependency injection compilation."
+                    ));
+                }
+                Some("missing") => {
+                    return Err(format!(
+                        "Preference declared for \"{instance}\" as \"{target}\", but the latter does not exist."
+                    ));
+                }
+                Some(message) => {
+                    return Err(format!(
+                        "Preference declared for \"{instance}\" as \"{target}\" cannot load: {message}"
+                    ));
+                }
+                // No PHP answer proves nothing, and a false stop blocks a working store.
+                None => log::warn!("Could not check preference target {target} in PHP"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ObjectManager\\Config\\Config::getPreference()`.
+fn final_preference(instance: &str, config: &DiConfig) -> Result<String, String> {
+    let mut current = instance.to_string();
+    let mut path: FxHashSet<String> = FxHashSet::default();
+    while let Some(next) = config.preferences.get(&current) {
+        let next = next.trim_start_matches('\\').to_string();
+        if !path.insert(next.clone()) {
+            return Err(format!(
+                "Circular type preference: {current} relates to {next} and viceversa."
+            ));
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+fn is_generated_class_name(class: &str) -> bool {
+    GENERATED_CLASS_SUFFIXES
+        .iter()
+        .any(|suffix| class.ends_with(suffix))
+}
+
+static METADATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Ends a compile that Magento would stop too. `DiCompileCommand::execute()` empties
+/// `generated/metadata` first, so a failed compile never leaves old metadata for the store to use.
+/// Removing it at the end gives the same result, and a passing compile can still skip phase 7.
+fn stop_compile(message: &str) -> ! {
+    eprintln!("error: {message}");
+    if let Some(root) = METADATA_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+    std::process::exit(1);
+}
+
+/// `Mapper\\Dom::convert()` evaluates each argument after `Config\\Dom` merged the files of one
+/// scope, so a type from another file of the scope counts and one from another scope does not.
+fn stop_on_unreadable_argument<'a>(scope: impl Iterator<Item = &'a DiConfig>) {
+    let files: Vec<&DiConfig> = scope.collect();
+    if !files.iter().any(|config| config.has_unreadable_argument()) {
+        return;
+    }
+    let merged = merge_configs(files.into_iter().cloned().collect());
+    if let Some(failure) = merged.unreadable_argument_failure() {
+        stop_compile(&failure);
+    }
+}
+
+/// `Console\\GenerationDirectoryAccess::check()`: creates a missing folder and needs write access.
+/// A real write also notices what the mode bits do not show, such as an immutable folder.
+fn generated_folders_are_writable(generated_root: &Path) -> bool {
+    let probe_name = format!(".fast-di-write-check-{}", std::process::id());
+    [
+        generated_root.to_path_buf(),
+        generated_root.join("code"),
+        generated_root.join("metadata"),
+    ]
+    .iter()
+    .all(|folder| {
+        let probe = folder.join(&probe_name);
+        std::fs::create_dir_all(folder)
+            .and_then(|()| std::fs::write(&probe, b""))
+            .and_then(|()| std::fs::remove_file(&probe))
+            .is_ok()
+    })
+}
+
+/// Writes a generated file. Returns whether its content changed. A failed write stops the compile,
+/// because the store would run with a file missing or out of date.
+fn must_write(path: &Path, content: &str) -> bool {
+    write_if_changed(path, content).unwrap_or_else(|e| {
+        stop_compile(&format!("Could not write {}: {e}", path.display()));
+    })
 }
 
 fn progress_bar(len: u64, msg: &str) -> ProgressBar {
@@ -1811,6 +2494,8 @@ fn hash_di_argument(h: &mut impl std::hash::Hasher, arg: &di_xml_reader::Argumen
             h.write_u8(0);
             h.write_i32(*sort_order);
         }
+        // The compile stops on these before anything is hashed.
+        Argument::Untyped { .. } => {}
     }
 }
 
@@ -2010,8 +2695,12 @@ fn compute_phase7_fp(
             h.write_u8(0);
             h.write(p.type_name.as_bytes());
             h.write_u8(0);
-            h.write_i32(p.sort_order);
-            h.write_u8(p.disabled as u8);
+            h.write_i32(p.effective_sort_order());
+            h.write_u8(match p.disabled {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            });
         }
     }
 
@@ -2116,6 +2805,7 @@ fn compute_phase7_fp(
                 ResolvedConstValue::Bool(true) => (2u8, "true"),
                 ResolvedConstValue::Bool(false) => (3u8, "false"),
                 ResolvedConstValue::Null => (4u8, ""),
+                ResolvedConstValue::Array(json, _) => (5u8, json.as_str()),
             };
             (k.as_str(), tag, s)
         })
@@ -2152,382 +2842,14 @@ fn log_phase_elapsed(phase: &str, started: Instant) {
     );
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ConstructorIntegrityViolation {
-    class_name: String,
-    message: String,
-}
-
-impl std::fmt::Display for ConstructorIntegrityViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ParentCallArg {
-    name: Option<String>,
-    variable: Option<String>,
-}
-
-fn validate_constructor_integrity(
-    class_map: &FxHashMap<String, ClassInfo>,
-) -> Vec<ConstructorIntegrityViolation> {
-    let mut violations = Vec::new();
-
-    for info in class_map.values() {
-        let Some(parent_name) = info.extends.as_ref().map(|s| s.trim_start_matches('\\')) else {
-            continue;
-        };
-        let Some(parent_info) = class_map.get(parent_name) else {
-            continue;
-        };
-        let Some(parent_ctor) = parent_info.constructor.as_ref() else {
-            continue;
-        };
-        if parent_ctor.params.is_empty() {
-            continue;
-        }
-        // Guard: only read the child source file if the parent actually has an
-        // object/iterable param that needs validation. Rare in practice.
-        if !parent_ctor
-            .params
-            .iter()
-            .any(|p| is_magento_namespace_resolved_pseudo_type(p.type_hint.as_deref()))
-        {
-            continue;
-        }
-        let Some(child_ctor) = info.constructor.as_ref() else {
-            continue;
-        };
-        let Some(call_args) = extract_parent_constructor_call_args(info) else {
-            continue;
-        };
-
-        let child_params_by_name: FxHashMap<&str, &ConstructorParam> = child_ctor
-            .params
-            .iter()
-            .map(|param| (param.name.as_str(), param))
-            .collect();
-        let named_call_args: FxHashMap<&str, &ParentCallArg> = call_args
-            .iter()
-            .filter_map(|arg| arg.name.as_deref().map(|name| (name, arg)))
-            .collect();
-
-        for (index, required_arg) in parent_ctor.params.iter().enumerate() {
-            if !is_magento_namespace_resolved_pseudo_type(required_arg.type_hint.as_deref()) {
-                continue;
-            }
-            let call_arg = named_call_args
-                .get(required_arg.name.as_str())
-                .copied()
-                .or_else(|| call_args.get(index));
-            let Some(call_arg) = call_arg else {
-                if !required_arg.is_optional {
-                    violations.push(ConstructorIntegrityViolation {
-                        class_name: info.fqcn.clone(),
-                        message: format!(
-                            "Missed required argument {} in parent::__construct call. File: {}",
-                            required_arg.name,
-                            info.path.display()
-                        ),
-                    });
-                }
-                continue;
-            };
-            let Some(variable_name) = call_arg.variable.as_deref() else {
-                continue;
-            };
-            let required_type = magento_constructor_param_type(parent_info, required_arg);
-            let actual_type = child_params_by_name
-                .get(variable_name)
-                .and_then(|actual_arg| magento_constructor_param_type(info, actual_arg));
-
-            if constructor_types_compatible(
-                required_type.as_deref(),
-                actual_type.as_deref(),
-                class_map,
-            ) {
-                continue;
-            }
-
-            violations.push(ConstructorIntegrityViolation {
-                class_name: info.fqcn.clone(),
-                message: format!(
-                    "Incompatible argument type: Required type: {}. Actual type: {}; File: {}",
-                    required_type.as_deref().unwrap_or(""),
-                    actual_type.as_deref().unwrap_or(""),
-                    info.path.display()
-                ),
-            });
-        }
-    }
-
-    violations.sort_by(|a, b| {
-        a.class_name
-            .cmp(&b.class_name)
-            .then(a.message.cmp(&b.message))
-    });
-    violations
-}
-
-fn is_magento_namespace_resolved_pseudo_type(type_hint: Option<&str>) -> bool {
-    let Some(type_hint) = type_hint else {
-        return false;
-    };
-    let normalized = type_hint
-        .trim()
-        .trim_start_matches('?')
-        .trim_start_matches('\\');
-    matches!(normalized, "object" | "iterable")
-}
-
-// Mirrors Magento\Framework\Code\Reader\ScalarTypesProvider::getTypes()
-// in vendor/magento/framework/Code/Reader/ScalarTypesProvider.php.
-fn magento_supported_constructor_scalar_types() -> &'static [&'static str] {
-    &[
-        "array", "string", "int", "integer", "float", "bool", "boolean", "mixed", "callable",
-    ]
-}
-
-fn magento_constructor_param_type(
-    class_info: &ClassInfo,
-    param: &ConstructorParam,
-) -> Option<String> {
-    let raw = param.type_hint.as_deref()?.trim();
-    if raw.is_empty() || raw.contains('|') || raw.contains('&') {
-        return None;
-    }
-
-    let raw = raw.trim_start_matches('?').trim_start_matches('\\');
-    let lower = raw.to_ascii_lowercase();
-    if magento_supported_constructor_scalar_types().contains(&lower.as_str()) {
-        Some(lower)
-    } else if lower == "null" {
-        None
-    } else if raw.contains('\\') || class_info.namespace.is_empty() {
-        Some(raw.to_string())
-    } else {
-        Some(format!("{}\\{}", class_info.namespace, raw))
-    }
-}
-
-fn constructor_types_compatible(
-    required_type: Option<&str>,
-    actual_type: Option<&str>,
-    class_map: &FxHashMap<String, ClassInfo>,
-) -> bool {
-    let Some(required_type) = required_type.map(normalize_type_name) else {
-        return true;
-    };
-    let Some(actual_type) = actual_type.map(normalize_type_name) else {
-        return true;
-    };
-    if required_type == actual_type {
-        return true;
-    }
-    if required_type == "array" || actual_type == "array" {
-        return false;
-    }
-    if required_type == "mixed" || actual_type == "mixed" {
-        return true;
-    }
-
-    let mut seen = FxHashSet::default();
-    is_subtype_of(&actual_type, &required_type, class_map, &mut seen)
-}
-
-fn is_subtype_of(
-    actual_type: &str,
-    required_type: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-    seen: &mut FxHashSet<String>,
-) -> bool {
-    if actual_type == required_type {
-        return true;
-    }
-    if !seen.insert(actual_type.to_string()) {
-        return false;
-    }
-    let Some(info) = class_map.get(actual_type) else {
-        return false;
-    };
-
-    if let Some(parent) = info.extends.as_deref().map(normalize_type_name) {
-        if parent == required_type || is_subtype_of(&parent, required_type, class_map, seen) {
-            return true;
-        }
-    }
-    info.implements.iter().any(|implemented| {
-        let implemented = normalize_type_name(implemented);
-        implemented == required_type || is_subtype_of(&implemented, required_type, class_map, seen)
-    })
-}
-
-fn normalize_type_name(type_name: &str) -> String {
-    type_name.trim().trim_start_matches('\\').to_string()
-}
-
-fn extract_parent_constructor_call_args(info: &ClassInfo) -> Option<Vec<ParentCallArg>> {
-    let source = std::fs::read_to_string(&info.path).ok()?;
-    let marker = "parent::__construct";
-    let marker_pos = source.find(marker)?;
-    let after_marker = marker_pos + marker.len();
-    let open_paren = after_marker + source[after_marker..].find('(')?;
-    let close_paren = find_matching_paren(&source, open_paren)?;
-    let inner = &source[open_paren + 1..close_paren];
-    Some(
-        split_top_level_args(inner)
-            .into_iter()
-            .map(parse_parent_call_arg)
-            .collect(),
-    )
-}
-
-fn parse_parent_call_arg(raw: &str) -> ParentCallArg {
-    let raw = raw.trim();
-    let (name, value) = if let Some(colon) = find_top_level_colon(raw) {
-        (
-            Some(raw[..colon].trim().to_string()),
-            raw[colon + 1..].trim(),
-        )
-    } else {
-        (None, raw)
-    };
-
-    ParentCallArg {
-        name,
-        variable: extract_variable_name(value),
-    }
-}
-
-fn extract_variable_name(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = value.strip_prefix('$')?;
-    let name: String = value
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-        .collect();
-    (!name.is_empty()).then_some(name)
-}
-
-fn find_matching_paren(source: &str, open_paren: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
-    if bytes.get(open_paren) != Some(&b'(') {
-        return None;
-    }
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut i = open_paren;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\'' | b'"' => quote = Some(b),
-            b'(' => depth += 1,
-            b')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-fn split_top_level_args(source: &str) -> Vec<&str> {
-    let bytes = source.as_bytes();
-    let mut args = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\'' | b'"' => quote = Some(b),
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 => {
-                let arg = source[start..i].trim();
-                if !arg.is_empty() {
-                    args.push(arg);
-                }
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    let arg = source[start..].trim();
-    if !arg.is_empty() {
-        args.push(arg);
-    }
-    args
-}
-
-fn find_top_level_colon(source: &str) -> Option<usize> {
-    let bytes = source.as_bytes();
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\'' | b'"' => quote = Some(b),
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth = depth.saturating_sub(1),
-            b':' if depth == 0 && bytes.get(i + 1) != Some(&b':') => return Some(i),
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
 #[derive(Clone, Debug)]
 enum ResolvedConstValue {
     String(String),
     Number(String),
     Bool(bool),
     Null,
+    /// The JSON text, for the fingerprint, and the items.
+    Array(String, Vec<Argument>),
 }
 
 fn resolve_php_constants_in_config(
@@ -2581,12 +2903,64 @@ fn reflect_constant_value(
         return Some(ResolvedConstValue::Null);
     }
     let value: serde_json::Value = serde_json::from_str(json_trimmed).ok()?;
+    // `Interpreter\Constant::evaluate()` throws here, and that stops the compile.
+    if value.get("__fast_di_undefined_constant__").is_some() {
+        stop_compile(&format!(
+            "Constant \"{}\" is not defined.",
+            expr.trim().trim_start_matches('\\')
+        ));
+    }
     match value {
         serde_json::Value::String(s) => Some(ResolvedConstValue::String(s)),
         serde_json::Value::Number(n) => Some(ResolvedConstValue::Number(n.to_string())),
         serde_json::Value::Bool(b) => Some(ResolvedConstValue::Bool(b)),
         serde_json::Value::Null => Some(ResolvedConstValue::Null),
-        _ => None,
+        array => Some(ResolvedConstValue::Array(
+            json_trimmed.to_string(),
+            constant_array_items(&array),
+        )),
+    }
+}
+
+/// `Interpreter\Constant::evaluate()` returns the constant as it is, so also an array.
+fn constant_array_items(array: &serde_json::Value) -> Vec<Argument> {
+    let item = |name: String, value: &serde_json::Value| match value {
+        serde_json::Value::String(value) => Argument::String {
+            name,
+            value: value.clone(),
+            sort_order: 0,
+        },
+        serde_json::Value::Number(value) => Argument::Number {
+            name,
+            value: value.to_string(),
+            sort_order: 0,
+        },
+        serde_json::Value::Bool(value) => Argument::Boolean {
+            name,
+            value: *value,
+            sort_order: 0,
+        },
+        serde_json::Value::Null => Argument::Null {
+            name,
+            sort_order: 0,
+        },
+        nested => Argument::Array {
+            name,
+            items: constant_array_items(nested),
+            sort_order: 0,
+        },
+    };
+    match array {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| item(index.to_string(), value))
+            .collect(),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| item(key.clone(), value))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2634,6 +3008,11 @@ fn apply_resolved_constants_to_arguments(
                         },
                         ResolvedConstValue::Null => Argument::Null {
                             name: name.clone(),
+                            sort_order: so,
+                        },
+                        ResolvedConstValue::Array(_, items) => Argument::Array {
+                            name: name.clone(),
+                            items: items.clone(),
                             sort_order: so,
                         },
                     };
@@ -2768,7 +3147,8 @@ fn upsert_type_argument(di_config: &mut DiConfig, type_name: &str, argument: Arg
         | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
-        | Argument::Const { name, .. } => name,
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. } => name,
     };
 
     if let Some(existing) = tc.arguments.iter_mut().find(|a| match a {
@@ -2779,7 +3159,8 @@ fn upsert_type_argument(di_config: &mut DiConfig, type_name: &str, argument: Arg
         | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
-        | Argument::Const { name, .. } => name == arg_name,
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. } => name == arg_name,
     }) {
         *existing = argument;
     } else {
@@ -2953,7 +3334,12 @@ if ($root === '' || !is_file($root . '/app/bootstrap.php')) {
 }
 require $root . '/app/bootstrap.php';
 $registrar = new \Magento\Framework\Component\ComponentRegistrar();
-$modules = array_values($registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::MODULE));
+$statuses = (@include $root . '/app/etc/config.php')['modules'] ?? [];
+$modules = array_values(array_filter(
+    $registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::MODULE),
+    fn ($module) => ($statuses[$module] ?? 0) === 1,
+    ARRAY_FILTER_USE_KEY
+));
 $libraries = array_values($registrar->getPaths(\Magento\Framework\Component\ComponentRegistrar::LIBRARY));
 $setupPath = (new \Magento\Framework\App\Filesystem\DirectoryList($root))
     ->getPath(\Magento\Framework\App\Filesystem\DirectoryList::SETUP);
@@ -3029,12 +3415,12 @@ fn enrich_all_constructors_with_reflection(
     // kind: 0 = update ctor (allow empty), 1 = update ctor (skip empty), 2 = insert if missing
     let mut candidates: Vec<(String, u8)> = Vec::new();
 
-    // Pass 1: classes whose existing ctor has constant-reference defaults.
+    // Pass 1: classes whose existing ctor has a default that is not a plain literal.
     for (fqcn, info) in class_map.iter() {
         let needs = info
             .constructor
             .as_ref()
-            .map(|ctor| constructor_defaults_need_constant_reflection(&ctor.params))
+            .map(|ctor| constructor_defaults_need_reflection(&ctor.params))
             .unwrap_or(false);
         if needs {
             candidates.push((fqcn.clone(), 0));
@@ -3075,17 +3461,32 @@ fn enrich_all_constructors_with_reflection(
         return (0, 0, 0);
     }
 
+    let unreadable: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // Single par_iter over all candidates — one Rayon barrier instead of three.
     let reflected: Vec<(String, Vec<ConstructorParam>, u8)> = candidates
         .par_iter()
         .filter_map(|(fqcn, kind)| {
-            let params = reflect_constructor_params(fqcn, magento_root, php_bin)?;
+            let Some(params) = reflect_constructor_params(fqcn, magento_root, php_bin) else {
+                if *kind == 0 {
+                    unreadable.lock().unwrap().push(fqcn.clone());
+                }
+                return None;
+            };
             if *kind == 1 && params.is_empty() {
                 return None; // inherited no-arg ctor is not useful
             }
             Some((fqcn.clone(), params, *kind))
         })
         .collect();
+
+    // Source text is not a value: it would reach the constructor as a wrong string. Magento
+    // stops as well when a scanned class does not load.
+    let mut unreadable = unreadable.into_inner().unwrap();
+    if !unreadable.is_empty() && PHP_WORKER_POOL.get().is_some() {
+        unreadable.sort();
+        stop_compile(&format!("PHP could not load these classes, so the values of their constructor defaults are unknown:\n  {}",
+            unreadable.join("\n  ")));
+    }
 
     let (mut count0, mut count1, mut count2) = (0usize, 0usize, 0usize);
     for (fqcn, params, kind) in reflected {
@@ -3127,15 +3528,54 @@ fn synthetic_reflected_class_info(fqcn: &str, params: Vec<ConstructorParam>) -> 
         is_abstract: false,
         is_final: false,
         public_methods: vec![],
+        traits: Default::default(),
     }
 }
 
-fn constructor_defaults_need_constant_reflection(params: &[ConstructorParam]) -> bool {
+/// Magento's `EntityAbstract` cannot write an object as a default in generated code, and its
+/// compile stops. Written as is, it would be a PHP fatal error when the file loads.
+fn stop_on_object_default<'a>(class: &str, mut defaults: impl Iterator<Item = &'a str>) {
+    if defaults.any(|default| default.starts_with("__obj__:")) {
+        stop_compile(&format!("{class} has an object as parameter default and needs generated code, which PHP cannot express"));
+    }
+}
+
+/// `PluginListGenerator::inheritPlugins()` throws for an active plugin whose class fails
+/// `class_exists()`. An interface or a trait fails it too.
+fn stop_on_missing_plugin_classes(classes: &std::collections::BTreeSet<String>) {
+    let failures: Vec<String> = classes
+        .iter()
+        .filter_map(|class| plugin_class_failure(class))
+        .collect();
+    if !failures.is_empty() {
+        stop_compile(&failures.join("\nerror: "));
+    }
+}
+
+fn plugin_class_failure(class: &str) -> Option<String> {
+    let answer = PHP_WORKER_POOL
+        .get()
+        .and_then(|pool| pool.request(&format!("plugin_class_exists:{class}")))
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok());
+    match answer {
+        Some(serde_json::Value::Bool(true)) => None,
+        Some(serde_json::Value::Bool(false)) => Some(format!("Plugin class {class} doesn't exist")),
+        Some(serde_json::Value::String(message)) => {
+            Some(format!("Plugin class {class} cannot load: {message}"))
+        }
+        // No PHP answer proves nothing, and a false stop blocks a working store.
+        _ => {
+            log::warn!("Could not check plugin class {class} in PHP");
+            None
+        }
+    }
+}
+
+fn constructor_defaults_need_reflection(params: &[ConstructorParam]) -> bool {
     params.iter().any(|p| {
         p.default_value
             .as_deref()
-            .map(|dv| dv.contains("::"))
-            .unwrap_or(false)
+            .is_some_and(|dv| !is_plain_literal_default(dv))
     })
 }
 
@@ -3143,7 +3583,7 @@ fn extract_generated_class_map(code_root: &Path) -> FxHashMap<String, ClassInfo>
     if !code_root.is_dir() {
         return FxHashMap::default();
     }
-    let files = walk_php_files(&[code_root.to_path_buf()]);
+    let files = walk_generated_php_files(code_root);
     let extracted: Vec<(String, ClassInfo)> = files
         .par_iter()
         .filter_map(|path| match extract_file(path) {
@@ -3324,9 +3764,6 @@ fn build_interception_preference_overrides(
     let mut resolved_preferences: FxHashMap<String, String> = FxHashMap::default();
     for (from, to) in &di_config.preferences {
         let from_norm = normalize_fqcn(from);
-        if di_config.virtual_types.contains_key(&from_norm) {
-            continue;
-        }
         let resolved = resolve_preference_recursive(to, &di_config.preferences);
         let substituted = direct_interceptors
             .get(resolved.as_str())
@@ -3398,11 +3835,12 @@ fn build_interception_registry(
         .map(|spec| spec.fqcn.trim_start_matches('\\').to_string())
         .collect();
 
-    // Active plugin owners are intercepted even when no InterceptorSpec file is emitted
+    // Every plugin owner is intercepted, also when each entry is disabled or has no class
+    // (`Config::generateIntercepted()`), and when no InterceptorSpec file is emitted
     // (e.g. abstract classes/interfaces used only as plugin declaration owners).
     // Normalize the owner name to strip any leading backslash so it matches type_names.
     intercepted_targets.extend(di_config.plugins.iter().filter_map(|(owner, plugins)| {
-        if plugins.iter().any(|plugin| !plugin.disabled) {
+        if !plugins.is_empty() {
             Some(owner.trim_start_matches('\\').to_string())
         } else {
             None
@@ -4282,6 +4720,7 @@ fn synthetic_factory_class_info(factory_fqcn: &str) -> ClassInfo {
             is_static: false,
             returns_reference: false,
         }],
+        traits: Default::default(),
     }
 }
 
@@ -4405,22 +4844,7 @@ fn merge_plugins_for_interception(
                     None => {
                         owner_plugins.insert(plugin.name.clone(), plugin.clone());
                     }
-                    Some(existing) => {
-                        if plugin.type_name.is_empty() {
-                            // Disabled-only override: preserve type_name, update disabled flag.
-                            existing.disabled = plugin.disabled;
-                            if plugin.sort_order != 0 {
-                                existing.sort_order = plugin.sort_order;
-                            }
-                        } else {
-                            let was_disabled = existing.disabled;
-                            *existing = plugin.clone();
-                            // PHP sticky-disabled: once disabled, stays disabled.
-                            if was_disabled {
-                                existing.disabled = true;
-                            }
-                        }
-                    }
+                    Some(existing) => existing.merge_same_scope(plugin.clone()),
                 }
             }
         }
@@ -4431,8 +4855,17 @@ fn merge_plugins_for_interception(
         for (owner, plugins) in &cfg.plugins {
             let owner_plugins = merged.entry(owner.clone()).or_default();
             for plugin in plugins {
-                if plugin.disabled {
+                if plugin.is_disabled() {
                     // Area-specific disables do not remove globally active plugins.
+                    continue;
+                }
+                if plugin.type_name.is_empty() {
+                    // An override with no class only matters when it re-enables a plugin.
+                    if let Some(existing) = owner_plugins.get_mut(&plugin.name) {
+                        if plugin.disabled.is_some() {
+                            existing.disabled = plugin.disabled;
+                        }
+                    }
                     continue;
                 }
                 match owner_plugins.get_mut(&plugin.name) {
@@ -4440,7 +4873,7 @@ fn merge_plugins_for_interception(
                         owner_plugins.insert(plugin.name.clone(), plugin.clone());
                     }
                     Some(existing) => {
-                        if existing.disabled {
+                        if existing.is_disabled() {
                             // Plugin disabled globally but active in this area — re-enable.
                             *existing = plugin.clone();
                         }
@@ -4453,16 +4886,28 @@ fn merge_plugins_for_interception(
     let mut out = FxHashMap::default();
     for (owner, by_name) in merged {
         let mut plugins: Vec<Plugin> = by_name.into_values().collect();
-        plugins.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.name.cmp(&b.name)));
+        plugins.sort_by(|a, b| {
+            a.effective_sort_order()
+                .cmp(&b.effective_sort_order())
+                .then(a.name.cmp(&b.name))
+        });
         out.insert(owner, plugins);
     }
     out
+}
+
+fn composer_class_info(index: Option<&ComposerAutoloadIndex>, fqcn: &str) -> Option<ClassInfo> {
+    match extract_file(&index?.resolve_class_path(fqcn)?) {
+        ExtractResult::Ok(info) => Some(info),
+        _ => None,
+    }
 }
 
 fn augment_with_composer_plugin_owner_classes(
     class_map: &mut FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
     composer_index: Option<&ComposerAutoloadIndex>,
+    disabled_class_map: &FxHashMap<String, ClassInfo>,
 ) {
     let Some(index) = composer_index else {
         return;
@@ -4481,6 +4926,9 @@ fn augment_with_composer_plugin_owner_classes(
     }
     for plugins in di_config.plugins.values() {
         for plugin in plugins {
+            if plugin.type_name.is_empty() {
+                continue;
+            }
             let plugin_type = plugin.type_name.trim_start_matches('\\').to_string();
             if !class_map.contains_key(&plugin_type) {
                 candidates.insert(plugin_type.clone());
@@ -4493,13 +4941,158 @@ fn augment_with_composer_plugin_owner_classes(
     }
 
     for fqcn in candidates {
-        if class_map.contains_key(&fqcn) {
+        // Magento only intercepts classes it scanned, or parents of those.
+        if class_map.contains_key(&fqcn) || disabled_class_map.contains_key(&fqcn) {
             continue;
         }
         let Some(path) = index.resolve_class_path(&fqcn) else {
             continue;
         };
         if let ExtractResult::Ok(info) = extract_file(&path) {
+            class_map.insert(info.fqcn.clone(), info);
+        }
+    }
+}
+
+/// `PluginList::_loadScopedData()` runs `_inheritPlugins()` on every virtual type, which goes on to
+/// the class of that type. `InterceptionConfigurationBuilder` gives each result with plugins an
+/// Interceptor, without the scan or `InterceptableValidator`. So this also holds for a class of a
+/// disabled module and for a generated proxy.
+fn add_virtual_type_targets_with_plugins(
+    class_map: &mut FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    disabled_class_map: &FxHashMap<String, ClassInfo>,
+    proxies: &[di_resolver::ProxySpec],
+) {
+    let has_active_plugin = |class: &str| {
+        di_config
+            .plugins
+            .get(class)
+            .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.is_active()))
+    };
+    for virtual_type in di_config.virtual_types.keys() {
+        let target = di_config.get_instance_type(virtual_type);
+        if class_map.contains_key(&target) {
+            continue;
+        }
+        let info = disabled_class_map.get(&target).cloned().or_else(|| {
+            proxies
+                .iter()
+                .find(|spec| spec.proxy_fqcn == target)
+                .map(synthetic_proxy_class_info)
+        });
+        let Some(info) = info else {
+            continue;
+        };
+        // `class_parents()` and `class_implements()`, through the scan and disabled modules.
+        let mut found = has_active_plugin(&target);
+        let mut pending: Vec<String> = relations_of(&info);
+        let mut add = vec![info];
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            found = found || has_active_plugin(&name);
+            if let Some(known) = class_map.get(&name) {
+                pending.extend(relations_of(known));
+            } else if let Some(disabled) = disabled_class_map.get(&name) {
+                pending.extend(relations_of(disabled));
+                add.push(disabled.clone());
+            }
+        }
+        if found {
+            class_map.extend(add.into_iter().map(|info| (info.fqcn.clone(), info)));
+        }
+    }
+}
+
+fn relations_of(info: &ClassInfo) -> Vec<String> {
+    info.extends
+        .iter()
+        .chain(&info.implements)
+        .map(|name| name.trim_start_matches('\\').to_string())
+        .collect()
+}
+
+/// The class `Code\Generator\Proxy` writes, as far as an Interceptor needs it.
+fn synthetic_proxy_class_info(spec: &di_resolver::ProxySpec) -> ClassInfo {
+    let parameter =
+        |name: &str, type_hint: Option<&str>, default_value: Option<String>| ConstructorParam {
+            name: name.to_string(),
+            type_hint: type_hint.map(str::to_string),
+            is_optional: default_value.is_some(),
+            default_value,
+            is_primitive: type_hint.is_none(),
+            is_variadic: false,
+            is_promoted: false,
+        };
+    let mut info = synthetic_reflected_class_info(
+        &spec.proxy_fqcn,
+        vec![
+            parameter(
+                "objectManager",
+                Some("Magento\\Framework\\ObjectManagerInterface"),
+                None,
+            ),
+            parameter(
+                "instanceName",
+                None,
+                Some(format!(
+                    "'\\\\{}'",
+                    spec.target_fqcn
+                        .trim_start_matches('\\')
+                        .replace('\\', "\\\\")
+                )),
+            ),
+            parameter("shared", None, Some("true".to_string())),
+        ],
+    );
+    info.path = PathBuf::from("__generated__/proxy.php");
+    info.extends = Some(spec.target_fqcn.clone());
+    info
+}
+
+/// `PluginListGenerator` reaches classes through the autoloader. Add what the scan left out:
+/// plugin classes, plugin owners, classes of virtual types, and the parents and interfaces
+/// of known classes in libraries.
+fn add_library_classes_for_plugin_list(
+    class_map: &mut FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+    composer_index: Option<&ComposerAutoloadIndex>,
+) {
+    let Some(index) = composer_index else {
+        return;
+    };
+    fn relations(info: &ClassInfo) -> impl Iterator<Item = String> + '_ {
+        info.extends.iter().chain(&info.implements).cloned()
+    }
+    let mut work: Vec<String> = class_map.values().flat_map(relations).collect();
+    work.extend(
+        di_config
+            .plugins
+            .values()
+            .flatten()
+            .map(|plugin| plugin.type_name.clone()),
+    );
+    work.extend(di_config.plugins.keys().cloned());
+    work.extend(
+        di_config
+            .virtual_types
+            .values()
+            .map(|virtual_type| virtual_type.type_name.clone()),
+    );
+    let mut tried: FxHashSet<String> = FxHashSet::default();
+    while let Some(name) = work.pop() {
+        let name = name.trim_start_matches('\\').to_string();
+        if name.is_empty() || class_map.contains_key(&name) || !tried.insert(name.clone()) {
+            continue;
+        }
+        let Some(path) = index.resolve_class_path(&name) else {
+            continue;
+        };
+        if let ExtractResult::Ok(info) = extract_file(&path) {
+            work.extend(relations(&info));
             class_map.insert(info.fqcn.clone(), info);
         }
     }
@@ -4566,6 +5159,8 @@ fn collect_public_methods_with_inheritance(
                 methods.push(method.clone());
             }
         }
+        // A final or non-public method here means the parent's version is not what callers get.
+        seen_names.extend(info.traits.hidden_methods.iter().cloned());
 
         if let Some(parent) = &info.extends {
             stack.push(parent.clone());
@@ -4637,7 +5232,11 @@ fn enrich_interceptor_specs_with_reflection(
         .filter_map(|fqcn| {
             let mut methods = reflect_interceptable_methods(fqcn, magento_root, php_bin)?;
             for m in &mut methods {
-                normalize_reflected_method_signature(m, fqcn, class_map);
+                stop_on_object_default(
+                    fqcn,
+                    m.params.iter().filter_map(|p| p.default_value.as_deref()),
+                );
+                normalize_reflected_method_signature(m);
             }
             Some((fqcn.clone(), methods))
         })
@@ -4657,22 +5256,22 @@ fn enrich_interceptor_specs_with_reflection(
     // -----------------------------------------------------------------
     for spec in specs.iter_mut() {
         let needs_sig = interceptor_methods_need_reflection_normalization(&spec.public_methods);
-        let expected = if spec.plugins.is_empty() {
+        let mut expected = if spec.plugins.is_empty() {
             FxHashSet::default()
         } else {
             compute_expected_method_names(&spec.plugins, class_map, di_config, &plugin_method_map)
         };
+        expected.extend(methods_asked_beyond_the_scan(
+            &spec.fqcn, class_map, di_config,
+        ));
 
-        if spec.plugins.is_empty() && !needs_sig {
-            continue;
-        }
-        if !spec.plugins.is_empty() && expected.is_empty() && !needs_sig {
+        if expected.is_empty() && !needs_sig {
             continue;
         }
 
         let current: FxHashSet<String> =
             spec.public_methods.iter().map(|m| m.name.clone()).collect();
-        let missing_expected = !spec.plugins.is_empty() && !expected.is_subset(&current);
+        let missing_expected = !expected.is_subset(&current);
         if !missing_expected && !needs_sig {
             continue;
         }
@@ -4688,7 +5287,7 @@ fn enrich_interceptor_specs_with_reflection(
 
         if !missing_expected {
             // Keep resolver-selected method set/order; normalise signatures
-            // from reflection (self→concrete, static→concrete, union order, defaults).
+            // from reflection (self→declaring class, union order, defaults).
             spec.public_methods = spec
                 .public_methods
                 .iter()
@@ -4701,9 +5300,11 @@ fn enrich_interceptor_specs_with_reflection(
                 })
                 .collect();
         } else {
+            // `current` holds the methods for plugins on parents. `expected` only knows
+            // the plugins on this class itself.
             let filtered: Vec<MethodSignature> = reflected_methods
                 .iter()
-                .filter(|m| expected.contains(&m.name))
+                .filter(|m| expected.contains(&m.name) || current.contains(&m.name))
                 .cloned()
                 .collect();
             if !filtered.is_empty() {
@@ -4725,11 +5326,13 @@ fn spec_needs_reflection(
     if interceptor_methods_need_reflection_normalization(&spec.public_methods) {
         return true;
     }
-    if spec.plugins.is_empty() {
+    let beyond_scan = methods_asked_beyond_the_scan(&spec.fqcn, class_map, di_config);
+    if spec.plugins.is_empty() && beyond_scan.is_empty() {
         return false;
     }
-    let expected =
+    let mut expected =
         compute_expected_method_names(&spec.plugins, class_map, di_config, plugin_method_map);
+    expected.extend(beyond_scan);
     if expected.is_empty() {
         return false;
     }
@@ -4739,6 +5342,33 @@ fn spec_needs_reflection(
         .map(|m| m.name.as_str())
         .collect();
     !expected.iter().all(|e| current.contains(e.as_str()))
+}
+
+/// What the plugins on this class and its parents ask for, when a parent lies outside the scan.
+/// The scan cannot see the methods of such a parent, and Magento takes them from reflection.
+fn methods_asked_beyond_the_scan(
+    fqcn: &str,
+    class_map: &FxHashMap<String, ClassInfo>,
+    di_config: &DiConfig,
+) -> FxHashSet<String> {
+    let mut seen = FxHashSet::default();
+    let mut current = class_map.get(fqcn);
+    while let Some(info) = current {
+        let Some(parent) = info.extends.as_deref() else {
+            return FxHashSet::default();
+        };
+        let parent = parent.trim_start_matches('\\');
+        if !seen.insert(parent) {
+            return FxHashSet::default();
+        }
+        current = class_map.get(parent);
+        if current.is_none() {
+            return di_resolver::interceptor::derive_intercepted_methods_from_ancestor_plugins(
+                fqcn, class_map, di_config,
+            );
+        }
+    }
+    FxHashSet::default()
 }
 
 /// Compute the set of intercepted method names expected from a plugin list,
@@ -4763,8 +5393,8 @@ fn compute_expected_method_names(
         candidates.retain(|c| !c.is_empty());
 
         for candidate in &candidates {
-            if let Some(plugin_info) = class_map.get(candidate) {
-                for method in &plugin_info.public_methods {
+            if class_map.contains_key(candidate) {
+                for method in collect_public_methods_with_inheritance(candidate, class_map) {
                     if let Some(name) = plugin_method_to_intercepted(&method.name) {
                         names.insert(name);
                     }
@@ -4778,68 +5408,52 @@ fn compute_expected_method_names(
     names
 }
 
+/// `self`, `parent` or `static`, also when nullable. PHP keywords ignore case.
+fn is_relative_type(type_name: &str) -> bool {
+    let core = type_name.trim_start_matches('?');
+    ["self", "parent", "static"]
+        .iter()
+        .any(|keyword| core.eq_ignore_ascii_case(keyword))
+}
+
 fn interceptor_methods_need_reflection_normalization(methods: &[MethodSignature]) -> bool {
     methods.iter().any(|method| {
         method
             .return_type
             .as_deref()
-            .map(|rt| matches!(rt, "self" | "parent" | "static") || rt.contains('|'))
+            .map(|rt| is_relative_type(rt) || rt.contains('|'))
             .unwrap_or(false)
             || method.params.iter().any(|param| {
                 param
                     .type_hint
                     .as_deref()
-                    .map(|th| matches!(th, "self" | "parent" | "static") || th.contains('|'))
+                    .map(|th| is_relative_type(th) || th.contains('|'))
                     .unwrap_or(false)
                     || param
                         .default_value
                         .as_deref()
                         .map(|dv| {
-                            let t = dv.trim();
-                            t.contains("::")
-                                || t.eq_ignore_ascii_case("null")
-                                || t.starts_with("array (")
+                            dv.trim().eq_ignore_ascii_case("null") || !is_plain_literal_default(dv)
                         })
                         .unwrap_or(false)
             })
     })
 }
 
-fn normalize_reflected_method_signature(
-    method: &mut MethodSignature,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) {
+/// The PHP worker already resolved `self` and `parent` to the declaring class. Magento keeps
+/// `static`, because a class name in its place does not load.
+fn normalize_reflected_method_signature(method: &mut MethodSignature) {
     if let Some(rt) = method.return_type.as_mut() {
-        *rt = normalize_reflected_type_hint(rt, target_fqcn, class_map);
+        *rt = normalize_reflected_type_hint(rt);
     }
     for param in method.params.iter_mut() {
         if let Some(th) = param.type_hint.as_mut() {
-            *th = normalize_reflected_type_hint(th, target_fqcn, class_map);
+            *th = normalize_reflected_type_hint(th);
         }
     }
 }
 
-fn normalize_reflected_method_signature_for_proxy(
-    method: &mut MethodSignature,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) {
-    if let Some(rt) = method.return_type.as_mut() {
-        *rt = normalize_reflected_type_hint_for_proxy(rt, target_fqcn, class_map);
-    }
-    for param in method.params.iter_mut() {
-        if let Some(th) = param.type_hint.as_mut() {
-            *th = normalize_reflected_type_hint_for_proxy(th, target_fqcn, class_map);
-        }
-    }
-}
-
-fn normalize_reflected_type_hint(
-    raw: &str,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) -> String {
+fn normalize_reflected_type_hint(raw: &str) -> String {
     const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
         ("bool", 1),
         ("int", 2),
@@ -4858,93 +5472,13 @@ fn normalize_reflected_type_hint(
         ("never", 15),
     ];
 
-    let normalized_target = target_fqcn.trim_start_matches('\\');
-    let current_info = class_map.get(normalized_target);
-
     let (nullable, core) = if let Some(rest) = raw.strip_prefix('?') {
         ("?", rest)
     } else {
         ("", raw)
     };
 
-    let normalize_single = |part: &str| -> String {
-        match part {
-            "self" | "static" => normalized_target.to_string(),
-            "parent" => current_info
-                .and_then(|info| info.extends.clone())
-                .unwrap_or_else(|| "parent".to_string()),
-            _ => part.trim_start_matches('\\').to_string(),
-        }
-    };
-
-    if core.contains('|') {
-        let mut parts: Vec<String> = core
-            .split('|')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(normalize_single)
-            .collect();
-        let precedence_of = |value: &str| -> u8 {
-            let lower = value.to_ascii_lowercase();
-            BUILTIN_PRECEDENCE
-                .iter()
-                .find_map(|(name, rank)| (*name == lower).then_some(*rank))
-                .unwrap_or(0)
-        };
-        parts.sort_by(|a, b| {
-            precedence_of(a)
-                .cmp(&precedence_of(b))
-                .then_with(|| a.cmp(b))
-        });
-        return format!("{}{}", nullable, parts.join("|"));
-    }
-
-    format!("{}{}", nullable, normalize_single(core))
-}
-
-fn normalize_reflected_type_hint_for_proxy(
-    raw: &str,
-    target_fqcn: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-) -> String {
-    const BUILTIN_PRECEDENCE: &[(&str, u8)] = &[
-        ("bool", 1),
-        ("int", 2),
-        ("float", 3),
-        ("string", 4),
-        ("array", 5),
-        ("callable", 6),
-        ("iterable", 7),
-        ("object", 8),
-        ("static", 9),
-        ("mixed", 10),
-        ("void", 11),
-        ("false", 12),
-        ("true", 13),
-        ("null", 14),
-        ("never", 15),
-    ];
-
-    let normalized_target = target_fqcn.trim_start_matches('\\');
-    let current_info = class_map.get(normalized_target);
-
-    let (nullable, core) = if let Some(rest) = raw.strip_prefix('?') {
-        ("?", rest)
-    } else {
-        ("", raw)
-    };
-
-    let normalize_single = |part: &str| -> String {
-        match part {
-            // Keep proxy parity with Magento: `self` resolves to concrete target
-            // class name, while `static` remains `static`.
-            "self" => normalized_target.to_string(),
-            "parent" => current_info
-                .and_then(|info| info.extends.clone())
-                .unwrap_or_else(|| "parent".to_string()),
-            _ => part.trim_start_matches('\\').to_string(),
-        }
-    };
+    let normalize_single = |part: &str| -> String { part.trim_start_matches('\\').to_string() };
 
     if core.contains('|') {
         let mut parts: Vec<String> = core
@@ -4995,6 +5529,36 @@ fn build_case_index(class_map: &FxHashMap<String, ClassInfo>) -> FxHashMap<Strin
         }
     }
     case_index.into_iter().map(|(k, (v, _))| (k, v)).collect()
+}
+
+/// `ClassReader::getConstructor()` keeps `ReflectionClass::getName()`, the name the file declares.
+/// A library is not scanned, and PHP loads it under any spelling its PSR-4 map lists, so only the
+/// file says which name that is.
+fn add_declared_constructor_classes(
+    case_index: &mut FxHashMap<String, String>,
+    class_map: &FxHashMap<String, ClassInfo>,
+    composer_index: Option<&ComposerAutoloadIndex>,
+) {
+    let library_classes: FxHashSet<&str> = class_map
+        .values()
+        .filter_map(|info| info.constructor.as_ref())
+        .flat_map(|constructor| &constructor.params)
+        .filter(|param| !param.is_primitive)
+        .filter_map(|param| param.type_hint.as_deref())
+        .map(|hint| hint.trim_start_matches('?').trim_start_matches('\\'))
+        .filter(|name| !name.contains(['|', '&']))
+        .filter(|name| !case_index.contains_key(&name.to_ascii_lowercase()))
+        .collect();
+    let declared: Vec<String> = library_classes
+        .into_par_iter()
+        .filter_map(|name| {
+            let info = composer_class_info(composer_index, name)?;
+            info.fqcn.eq_ignore_ascii_case(name).then_some(info.fqcn)
+        })
+        .collect();
+    for fqcn in declared {
+        case_index.insert(fqcn.to_ascii_lowercase(), fqcn);
+    }
 }
 
 /// Apply a pre-built case index to an args map (shared across all areas).
@@ -5206,10 +5770,7 @@ fn constructor_params_need_reflection(params: &[ConstructorParam]) -> bool {
             || param
                 .default_value
                 .as_deref()
-                .map(|dv| {
-                    let t = dv.trim();
-                    t.contains("::") || t.eq_ignore_ascii_case("null") || t.starts_with("array (")
-                })
+                .map(|dv| dv.trim().eq_ignore_ascii_case("null") || !is_plain_literal_default(dv))
                 .unwrap_or(false)
     })
 }
@@ -5293,6 +5854,7 @@ fn synthetic_search_results_class_info(spec: &SearchResultsSpec) -> ClassInfo {
             is_static: false,
             returns_reference: false,
         }],
+        traits: Default::default(),
     }
 }
 
@@ -5318,6 +5880,7 @@ fn synthetic_proxy_deferred_class_info(spec: &ProxyDeferredSpec) -> ClassInfo {
         is_abstract: false,
         is_final: false,
         public_methods: vec![],
+        traits: Default::default(),
     }
 }
 
@@ -5341,6 +5904,7 @@ fn synthetic_proxy_target_info(target_fqcn: &str, kind: ClassKind) -> ClassInfo 
         is_abstract: false,
         is_final: false,
         public_methods: vec![],
+        traits: Default::default(),
     }
 }
 
@@ -5352,11 +5916,134 @@ fn plugin_list_cache_id(scope: &str) -> String {
     }
 }
 
-fn find_extension_attributes_files(magento_root: &Path, module_paths: &[PathBuf]) -> Vec<PathBuf> {
+/// Runs the store's own `PluginListGenerator::write()` with empty collaborators, in a temporary
+/// folder, and prints the file name it gives each scope. A composer patch can change that name, so
+/// the framework version says nothing about it. Prints `null` when the store has no such class.
+///
+/// Newer versions type their properties, and the collaborators are too many to imitate, so the
+/// class source is loaded without those types. Only framework classes are needed, so the store's
+/// Composer autoloader and its side effects stay out of this.
+const PLUGIN_LIST_NAMES_PHP: &str = r#"
+ob_start();
+$scopes = array_slice($argv, 2);
+$dir = sys_get_temp_dir() . '/fast-di-plugin-list-' . getmypid();
+$frameworks = [$argv[1] . '/vendor/magento/framework/', $argv[1] . '/lib/internal/Magento/Framework/'];
+$locate = function ($relative) use ($frameworks) {
+    foreach ($frameworks as $framework) {
+        if (is_file($framework . $relative)) {
+            return $framework . $relative;
+        }
+    }
+    return null;
+};
+spl_autoload_register(function ($class) use ($locate) {
+    if (strpos($class, 'Magento\\Framework\\') === 0) {
+        $file = $locate(str_replace('\\', '/', substr($class, 18)) . '.php');
+        if ($file !== null) {
+            require $file;
+        }
+    }
+});
+$names = null;
+try {
+    $source = $locate('Interception/PluginListGenerator.php');
+    if ($source !== null) {
+        $names = [];
+        mkdir($dir);
+        eval(preg_replace(
+            ['/^\s*<\?php/', '/^(\s*)(private|protected|public)(?:\s+readonly)?\s+(?!function\b|const\b|static\b)[^\s$]+\s+(\$\w+)/m'],
+            ['', '$1$2 $3'],
+            file_get_contents($source)
+        ));
+        $empty = new class($dir) {
+            private $dir;
+            public function __construct($dir) { $this->dir = $dir; }
+            public function __call($method, $arguments) { return $method === 'getPath' ? $this->dir : []; }
+        };
+        $reflection = new ReflectionClass('Magento\\Framework\\Interception\\PluginListGenerator');
+        $generator = $reflection->newInstanceWithoutConstructor();
+        foreach ($reflection->getProperties() as $property) {
+            $property->setAccessible(true);
+            $name = $property->getName();
+            if ($name === 'scopePriorityScheme') {
+                $property->setValue($generator, ['primary', 'global']);
+            } elseif (!$property->isStatic() && $property->getValue($generator) === null) {
+                $property->setValue($generator, in_array($name, ['pluginData', 'processed'], true) ? [] : $empty);
+            }
+        }
+        foreach ($scopes as $scope) {
+            $generator->write([$scope]);
+            $files = array_values(array_diff(scandir($dir), ['.', '..']));
+            if (count($files) === 1) {
+                $names[$scope] = basename($files[0], '.php');
+            }
+            foreach ($files as $file) {
+                unlink($dir . '/' . $file);
+            }
+        }
+    }
+} catch (\Throwable $e) {
+    $names = [];
+}
+if (is_dir($dir)) {
+    array_map('unlink', array_map(function ($file) use ($dir) { return $dir . '/' . $file; }, array_diff(scandir($dir), ['.', '..'])));
+    rmdir($dir);
+}
+ob_end_clean();
+echo json_encode($names === null ? null : (object) $names);
+"#;
+
+/// The metadata file name of each plugin scope, without `.php`. `PluginList` reads a compiled list
+/// only under the name the store's own generator uses, and otherwise rebuilds it from every di.xml.
+/// A scope without an answer gets the name of the unpatched generator.
+fn plugin_list_cache_ids(
+    magento_root: &Path,
+    php_bin: &str,
+    scopes: &[&str],
+) -> FxHashMap<String, String> {
+    let answer = Command::new(php_bin)
+        .args(["-d", "display_errors=0", "-r", PLUGIN_LIST_NAMES_PHP, "--"])
+        .arg(magento_root)
+        .args(scopes)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| {
+            serde_json::from_slice::<Option<FxHashMap<String, String>>>(&output.stdout).ok()
+        });
+    let names = match answer {
+        Some(names) => names,
+        None => {
+            log::warn!("Could not ask PluginListGenerator for its file names; using the defaults");
+            Some(FxHashMap::default())
+        }
+    };
+    scopes
+        .iter()
+        .map(|scope| {
+            let name = names.as_ref().and_then(|names| names.get(*scope)).cloned();
+            if name.is_none() && names.is_some() {
+                log::warn!(
+                    "PluginListGenerator gave no file name for scope {scope}; using the default"
+                );
+            }
+            (
+                scope.to_string(),
+                name.unwrap_or_else(|| plugin_list_cache_id(scope)),
+            )
+        })
+        .collect()
+}
+
+fn find_extension_attributes_files(
+    magento_root: &Path,
+    module_paths: &[PathBuf],
+    php_bin: &str,
+) -> Vec<PathBuf> {
     // Magento composes XML by module load order (app/etc/config.php), not by
     // filesystem path order. Preserve that so generated Extension* method order
     // matches PHP compile output.
-    let module_order = load_module_order_from_config_php(magento_root);
+    let module_order = load_module_order_from_config_php(magento_root, php_bin);
     let mut ordered_files: Vec<(usize, usize, PathBuf)> = Vec::new();
     for (discovery_idx, module_path) in module_paths.iter().enumerate() {
         let file = module_path.join("etc/extension_attributes.xml");
@@ -5427,7 +6114,41 @@ fn bootstrap_php_constants(php_bin: &str, magento_root: &Path) -> FxHashMap<Stri
     serde_json::from_slice(&out.stdout).unwrap_or_default()
 }
 
-fn load_module_order_from_config_php(magento_root: &Path) -> FxHashMap<String, usize> {
+/// The enabled modules, with their position in `app/etc/config.php`. PHP reads the file, because
+/// `DeploymentConfig` includes it, so any valid PHP counts. A disabled module also takes a position,
+/// so that when two modules have equal DI priority the module later in the file wins (TKT-048).
+fn load_module_order_from_config_php(
+    magento_root: &Path,
+    php_bin: &str,
+) -> FxHashMap<String, usize> {
+    let script = r#"
+$config = @include $argv[1] . '/app/etc/config.php';
+$rows = [];
+foreach (is_array($config) ? $config['modules'] ?? [] : [] as $module => $status) {
+    $rows[] = [$module, $status === 1];
+}
+echo json_encode($rows);
+"#;
+    let answer = Command::new(php_bin)
+        .args(["-d", "display_errors=0", "-r", script, "--"])
+        .arg(magento_root)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Vec<(String, bool)>>(&output.stdout).ok());
+    match answer {
+        Some(rows) => rows
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, enabled))| *enabled)
+            .map(|(position, (module, _))| (module, position))
+            .collect(),
+        None => read_module_order_without_php(magento_root),
+    }
+}
+
+fn read_module_order_without_php(magento_root: &Path) -> FxHashMap<String, usize> {
     let mut out = FxHashMap::default();
     let config_php = magento_root.join("app/etc/config.php");
     let Ok(content) = std::fs::read_to_string(config_php) else {
@@ -5502,6 +6223,32 @@ fn module_root_from_di_xml(di_xml: &Path) -> Option<&Path> {
     }
 }
 
+/// One parsed file on its own, for code that does not merge it.
+fn folded(mut config: DiConfig) -> DiConfig {
+    config.fold_spellings();
+    config
+}
+
+/// Merge the primary files and the module files in two phases, see Phase 3a.
+fn merge_global_di_configs(configs: &[(PathBuf, DiConfig)], magento_root: &Path) -> DiConfig {
+    let app_etc = magento_root.join("app/etc");
+    let (primary_configs, module_configs): (Vec<_>, Vec<_>) =
+        configs.iter().partition(|(p, _)| p.starts_with(&app_etc));
+    let primary_base = merge_configs(
+        primary_configs
+            .into_iter()
+            .map(|(_, c)| c.clone())
+            .collect(),
+    );
+    let module_merged = merge_configs(module_configs.into_iter().map(|(_, c)| c.clone()).collect());
+    // Magento loads primary and global in one step, so both their virtual types count.
+    let mut scope_virtual_types = primary_base.scope_virtual_types.clone();
+    let mut merged = apply_module_config_on_primary(primary_base, module_merged);
+    scope_virtual_types.append(&mut merged.scope_virtual_types);
+    merged.scope_virtual_types = scope_virtual_types;
+    merged
+}
+
 /// Vendor packages that must always be excluded from DI config regardless of
 /// whether they have a `registration.php`. These are test-only or dev-only
 /// frameworks that ship a di.xml but must never contribute to production DI.
@@ -5509,6 +6256,147 @@ fn module_root_from_di_xml(di_xml: &Path) -> Option<&Path> {
 /// TKT-051: explicit denylist prevents accidental inclusion of testing frameworks
 /// that may have a `registration.php` but are not production Magento modules.
 const EXCLUDED_PACKAGES: &[&str] = &["magento2-functional-testing-framework", "mftf"];
+
+/// The areas Magento compiles, with `global` first: `Operation\\Area::doOperation()` takes
+/// `AreaList::getCodes()`, the keys of the merged `areas` argument. A module can add one there.
+/// The standard names stay as a minimum.
+fn compiled_areas(di_config: &DiConfig) -> Vec<String> {
+    let mut areas: Vec<String> = AREAS.iter().map(|area| area.to_string()).collect();
+    let listed = di_config
+        .type_configs
+        .get("Magento\\Framework\\App\\AreaList")
+        .into_iter()
+        .flat_map(|config| &config.arguments)
+        .filter_map(|argument| match argument {
+            Argument::Array { name, items, .. } if name == "areas" => Some(items),
+            _ => None,
+        })
+        .flatten();
+    for item in listed {
+        let (Argument::Object { name, .. }
+        | Argument::String { name, .. }
+        | Argument::Boolean { name, .. }
+        | Argument::Number { name, .. }
+        | Argument::Null { name, .. }
+        | Argument::Array { name, .. }
+        | Argument::Init { name, .. }
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. }) = item;
+        if !areas.iter().any(|area| area == name) {
+            areas.push(name.clone());
+        }
+    }
+    areas
+}
+
+/// Two files in a module can declare one class, such as an old copy next to the real file.
+/// `ClassesScanner::includeClass()` asks the autoloader, so that file gives the constructor.
+/// Without an answer from Composer, the file named after the class wins, then the first path.
+fn class_map_preferring_autoloaded_files(
+    extracted: Vec<(String, ClassInfo)>,
+    composer: Option<&ComposerAutoloadIndex>,
+) -> FxHashMap<String, ClassInfo> {
+    let mut classes: FxHashMap<String, ClassInfo> = FxHashMap::default();
+    for (fqcn, info) in extracted {
+        let Some(earlier) = classes.get(&fqcn) else {
+            classes.insert(fqcn, info);
+            continue;
+        };
+        let autoloaded = composer
+            .and_then(|index| index.resolve_class_path(&fqcn))
+            .and_then(|path| path.canonicalize().ok());
+        let rank = |candidate: &ClassInfo| {
+            (
+                autoloaded.is_some() && candidate.path.canonicalize().ok() == autoloaded,
+                candidate.path.file_stem().and_then(|stem| stem.to_str())
+                    == Some(candidate.name.as_str()),
+                std::cmp::Reverse(candidate.path.clone()),
+            )
+        };
+        if rank(&info) > rank(earlier) {
+            classes.insert(fqcn, info);
+        }
+    }
+    classes
+}
+
+/// The parents, at any level, of the classes outside `folder`.
+fn scanned_parents_outside<'a>(
+    class_map: &'a FxHashMap<String, ClassInfo>,
+    folder: &Path,
+) -> FxHashSet<&'a str> {
+    let mut parents = FxHashSet::default();
+    for info in class_map.values() {
+        if info.path.starts_with(folder) {
+            continue;
+        }
+        let mut current = info;
+        while let Some((name, parent)) = current
+            .extends
+            .as_deref()
+            .map(|name| name.trim_start_matches('\\'))
+            .and_then(|name| class_map.get(name).map(|parent| (name, parent)))
+        {
+            if !parents.insert(name) {
+                break;
+            }
+            current = parent;
+        }
+    }
+    parents
+}
+
+/// Split the discovered paths into what the compiler scans and disabled modules.
+///
+/// `DiCompileCommand::execute()` compiles a module only when its status in
+/// `app/etc/config.php` is 1, so a module with status 0 or no status is out.
+/// Libraries, themes and the setup directory have no status and stay in the scan.
+/// A package can register as a library and still ship `etc/module.xml`.
+fn split_disabled_modules(
+    module_paths: Vec<PathBuf>,
+    enabled_modules: &FxHashMap<String, usize>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    // An unreadable config.php is no reason to compile nothing.
+    if enabled_modules.is_empty() {
+        return (module_paths, Vec::new());
+    }
+    module_paths.into_iter().partition(|path| {
+        read_module_name_from_module_xml(path)
+            .is_none_or(|name| enabled_modules.contains_key(&name))
+            || std::fs::read_to_string(path.join("registration.php"))
+                .is_ok_and(|registration| registration.contains("::LIBRARY"))
+    })
+}
+
+/// Classes from disabled modules that a scanned class inherits from.
+///
+/// Magento loads these through the autoloader while it scans. `PluginList` walks
+/// each intercepted class up through its parents, so a concrete parent with plugins
+/// gets an Interceptor even when its own module is disabled.
+fn collect_disabled_ancestors(
+    class_map: &FxHashMap<String, ClassInfo>,
+    disabled_class_map: &FxHashMap<String, ClassInfo>,
+) -> FxHashMap<String, ClassInfo> {
+    let parents_of = |info: &ClassInfo| -> Vec<String> {
+        info.extends
+            .iter()
+            .chain(info.implements.iter())
+            .map(|name| name.trim_start_matches('\\').to_string())
+            .collect()
+    };
+    let mut pending: Vec<String> = class_map.values().flat_map(&parents_of).collect();
+    let mut ancestors: FxHashMap<String, ClassInfo> = FxHashMap::default();
+    while let Some(name) = pending.pop() {
+        if class_map.contains_key(&name) || ancestors.contains_key(&name) {
+            continue;
+        }
+        if let Some(info) = disabled_class_map.get(&name) {
+            pending.extend(parents_of(info));
+            ancestors.insert(name, info.clone());
+        }
+    }
+    ancestors
+}
 
 /// Filter a list of di.xml paths, dropping files from disabled modules.
 ///
@@ -5619,6 +6507,9 @@ fn parse_extension_attributes_files(
                     if local_name(e.name().as_ref()) == "extension_attributes" {
                         current_for = event_attr(e, b"for")
                             .map(|v| v.trim().trim_start_matches('\\').to_string());
+                        if let Some(source_interface) = &current_for {
+                            out.entry(source_interface.clone()).or_default();
+                        }
                     } else if local_name(e.name().as_ref()) == "attribute" {
                         maybe_collect_extension_attribute(e, current_for.as_deref(), &mut out);
                     }
@@ -5626,6 +6517,12 @@ fn parse_extension_attributes_files(
                 Ok(Event::Empty(ref e)) => {
                     if local_name(e.name().as_ref()) == "attribute" {
                         maybe_collect_extension_attribute(e, current_for.as_deref(), &mut out);
+                    } else if local_name(e.name().as_ref()) == "extension_attributes" {
+                        // `ServiceDataAttributesScanner` takes the `for` of an empty node too.
+                        if let Some(source_interface) = event_attr(e, b"for") {
+                            out.entry(source_interface.trim().trim_start_matches('\\').to_string())
+                                .or_default();
+                        }
                     }
                 }
                 Ok(Event::End(ref e)) => {
@@ -5642,7 +6539,7 @@ fn parse_extension_attributes_files(
     }
 
     for attrs in out.values_mut() {
-        *attrs = dedupe_attributes_keep_last(attrs.clone());
+        *attrs = merge_redeclared_attributes(std::mem::take(attrs));
     }
 
     out
@@ -5673,15 +6570,20 @@ fn maybe_collect_extension_attribute(
         });
 }
 
-fn dedupe_attributes_keep_last(attrs: Vec<ExtensionAttributeSpec>) -> Vec<ExtensionAttributeSpec> {
-    let mut seen = FxHashSet::default();
-    let mut out = Vec::new();
-    for attr in attrs.into_iter().rev() {
-        if seen.insert(attr.code.clone()) {
-            out.push(attr);
+/// Merge attributes that more than one file declares, as `Magento\Framework\Config\Dom::_mergeNode()`
+/// does: the attribute keeps the place of its first declaration and takes the type of the last.
+fn merge_redeclared_attributes(attrs: Vec<ExtensionAttributeSpec>) -> Vec<ExtensionAttributeSpec> {
+    let mut index_by_code: FxHashMap<String, usize> = FxHashMap::default();
+    let mut out: Vec<ExtensionAttributeSpec> = Vec::new();
+    for attr in attrs {
+        match index_by_code.get(&attr.code) {
+            Some(&index) => out[index].php_type = attr.php_type,
+            None => {
+                index_by_code.insert(attr.code.clone(), out.len());
+                out.push(attr);
+            }
         }
     }
-    out.reverse();
     out
 }
 
@@ -5873,7 +6775,14 @@ impl ComposerAutoloadIndex {
             if install_path.is_empty() {
                 continue;
             }
-            let package_root = base_dir.join(install_path);
+            // PHP does not read `install-path` to load a class. A package moved with its vendor
+            // folder still loads, so the path must not decide what the compiler can find.
+            let mut package_root = base_dir.join(install_path);
+            if !package_root.is_dir() {
+                if let Some(name) = pkg.get("name").and_then(serde_json::Value::as_str) {
+                    package_root = base_dir.join("..").join(name);
+                }
+            }
             let autoload = match pkg.get("autoload").and_then(serde_json::Value::as_object) {
                 Some(a) => a,
                 None => continue,
@@ -5927,13 +6836,11 @@ impl ComposerAutoloadIndex {
 
         // PSR-0
         for (prefix, dirs) in &self.psr0_prefixes {
-            let Some(relative) = fqcn.strip_prefix(prefix) else {
-                continue;
-            };
-            if relative.is_empty() {
+            if !fqcn.starts_with(prefix.as_str()) {
                 continue;
             }
-            let rel_path = relative.replace(['\\', '_'], "/");
+            // PSR-0 keeps the prefix in the path, unlike PSR-4.
+            let rel_path = fqcn.replace(['\\', '_'], "/");
             for dir in dirs {
                 let candidate = dir.join(format!("{rel_path}.php"));
                 if candidate.is_file() {
@@ -6073,31 +6980,111 @@ mod tests {
             is_abstract,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 
-    fn ctor_param(name: &str, type_hint: Option<&str>, is_optional: bool) -> ConstructorParam {
-        ConstructorParam {
-            name: name.to_string(),
-            type_hint: type_hint.map(str::to_string),
-            is_optional,
-            default_value: None,
-            is_primitive: false,
-            is_variadic: false,
-            is_promoted: false,
-        }
+    #[test]
+    fn composer_psr0_keeps_the_prefix_in_the_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Acme/Db")).unwrap();
+        let file = tmp.path().join("Acme/Db/Expr.php");
+        std::fs::write(&file, "<?php\nclass Acme_Db_Expr {}\n").unwrap();
+        let index = super::ComposerAutoloadIndex {
+            psr4_prefixes: vec![],
+            psr0_prefixes: vec![("Acme_Db".to_string(), vec![tmp.path().to_path_buf()])],
+        };
+        assert_eq!(index.resolve_class_path("Acme_Db_Expr"), Some(file));
     }
 
-    fn class_info_with_ctor(
-        fqcn: &str,
-        extends: Option<&str>,
-        path: PathBuf,
-        params: Vec<ConstructorParam>,
-    ) -> ClassInfo {
-        let mut info = class_info_impl(fqcn, extends, false, vec![]);
-        info.path = path;
-        info.constructor = Some(Constructor { params });
-        info
+    #[test]
+    fn plugin_list_reads_library_classes_through_the_autoloader() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |file: &str, php: &str| std::fs::write(tmp.path().join(file), php).unwrap();
+        write(
+            "Base.php",
+            "<?php\nnamespace Lib;\nclass Base implements Contract {}\n",
+        );
+        write(
+            "Contract.php",
+            "<?php\nnamespace Lib;\ninterface Contract {}\n",
+        );
+        write("Plug.php", "<?php\nnamespace Lib;\nclass Plug {}\n");
+        write(
+            "Owned.php",
+            "<?php\nnamespace Lib;\nclass Owned implements OwnedContract {}\n",
+        );
+        write(
+            "OwnedContract.php",
+            "<?php\nnamespace Lib;\ninterface OwnedContract {}\n",
+        );
+        let index = super::ComposerAutoloadIndex {
+            psr4_prefixes: vec![("Lib\\".to_string(), vec![tmp.path().to_path_buf()])],
+            psr0_prefixes: vec![],
+        };
+        let mut class_map = FxHashMap::default();
+        let child = ClassInfo {
+            path: PathBuf::from("Child.php"),
+            namespace: String::new(),
+            name: "Child".to_string(),
+            fqcn: "Child".to_string(),
+            kind: ClassKind::Class,
+            extends: Some("Lib\\Base".to_string()),
+            implements: vec!["Unknown\\Nowhere".to_string()],
+            constructor: None,
+            is_abstract: false,
+            is_final: false,
+            public_methods: vec![],
+            traits: Default::default(),
+        };
+        class_map.insert("Child".to_string(), child);
+        let mut di_config = DiConfig::default();
+        di_config.virtual_types.insert(
+            "Virtual".to_string(),
+            di_xml_reader::VirtualType {
+                name: "Virtual".to_string(),
+                type_name: "Lib\\Owned".to_string(),
+            },
+        );
+        di_config.plugins.insert(
+            "Child".to_string(),
+            vec![di_xml_reader::Plugin {
+                name: "p".to_string(),
+                type_name: "\\Lib\\Plug".to_string(),
+                sort_order: None,
+                disabled: None,
+                disabled_after_type: false,
+            }],
+        );
+
+        super::add_library_classes_for_plugin_list(&mut class_map, &di_config, Some(&index));
+
+        assert!(class_map.contains_key("Lib\\Base"));
+        assert!(class_map.contains_key("Lib\\Contract"));
+        assert!(class_map.contains_key("Lib\\Plug"));
+        assert!(class_map.contains_key("Lib\\OwnedContract"));
+        assert!(!class_map.contains_key("Unknown\\Nowhere"));
+    }
+
+    #[test]
+    fn interception_keeps_a_plugin_an_area_disables_without_a_type() {
+        let parse = |xml: &str| {
+            di_xml_reader::parser::parse_di_xml_bytes(format!("<config>{xml}</config>").as_bytes())
+                .unwrap()
+        };
+        let global = [parse(
+            r#"<type name="Foo\Bar"><plugin name="x" type="Foo\Plugin" sortOrder="10"/></type>"#,
+        )];
+        let area = [parse(
+            r#"<type name="Foo\Bar"><plugin name="x" disabled="true"/></type>
+               <type name="Foo\Baz"><plugin name="y" sortOrder="5"/></type>"#,
+        )];
+
+        let merged = crate::merge_plugins_for_interception(&global, &area);
+
+        assert!(merged["Foo\\Bar"][0].is_active());
+        assert_eq!(merged["Foo\\Bar"][0].sort_order, Some(10));
+        assert!(merged["Foo\\Baz"].is_empty());
     }
 
     #[test]
@@ -6156,99 +7143,47 @@ mod tests {
     }
 
     #[test]
-    fn constructor_integrity_flags_object_parent_type_like_magento() {
+    fn primary_subfolder_di_xml_is_merged_as_primary_config() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let child_path = tmp.path().join("Child.php");
-        std::fs::write(
-            &child_path,
-            r#"<?php
-namespace Spmt\Probe\Model;
+        let root = tmp.path();
+        let write = |rel: &str, item: &str, arg: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!(
+                    r#"<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+                    <type name="Acme\Generator"><arguments>
+                    <argument name="{arg}" xsi:type="array">
+                    <item name="{item}" xsi:type="string">{item}</item>
+                    </argument></arguments></type></config>"#
+                ),
+            )
+            .unwrap();
+            let config = super::parse_di_xml_unfolded(&path).unwrap();
+            (path, config)
+        };
+        let configs = vec![
+            write("app/etc/di.xml", "fromPrimary", "entities"),
+            write("app/etc/extra/di.xml", "fromSubfolder", "entities"),
+            write("app/etc/other/di.xml", "fromOther", "replaced"),
+            write("vendor/acme/module/etc/di.xml", "fromModule", "replaced"),
+        ];
 
-class ChildWithConcreteInterface extends ParentWithObjectType
-{
-    public function __construct(\Magento\Framework\App\Config\ScopeConfigInterface $dependency)
-    {
-        parent::__construct($dependency);
-    }
-}
-"#,
-        )
-        .unwrap();
+        let merged = super::merge_global_di_configs(&configs, root);
 
-        let parent = class_info_with_ctor(
-            "Spmt\\Probe\\Model\\ParentWithObjectType",
-            None,
-            tmp.path().join("Parent.php"),
-            vec![ctor_param("dependency", Some("object"), false)],
-        );
-        let child = class_info_with_ctor(
-            "Spmt\\Probe\\Model\\ChildWithConcreteInterface",
-            Some("Spmt\\Probe\\Model\\ParentWithObjectType"),
-            child_path,
-            vec![ctor_param(
-                "dependency",
-                Some("Magento\\Framework\\App\\Config\\ScopeConfigInterface"),
-                false,
-            )],
-        );
-        let mut class_map = FxHashMap::default();
-        class_map.insert(parent.fqcn.clone(), parent);
-        class_map.insert(child.fqcn.clone(), child);
-
-        let violations = super::validate_constructor_integrity(&class_map);
-
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0]
-            .message
-            .contains("Required type: Spmt\\Probe\\Model\\object"));
-        assert!(violations[0]
-            .message
-            .contains("Actual type: Magento\\Framework\\App\\Config\\ScopeConfigInterface"));
-    }
-
-    #[test]
-    fn constructor_integrity_allows_mixed_parent_type() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let child_path = tmp.path().join("Child.php");
-        std::fs::write(
-            &child_path,
-            r#"<?php
-namespace Spmt\Probe\Model;
-
-class ChildWithConcreteInterface extends ParentWithMixedType
-{
-    public function __construct(\Magento\Framework\App\Config\ScopeConfigInterface $dependency)
-    {
-        parent::__construct($dependency);
-    }
-}
-"#,
-        )
-        .unwrap();
-
-        let parent = class_info_with_ctor(
-            "Spmt\\Probe\\Model\\ParentWithMixedType",
-            None,
-            tmp.path().join("Parent.php"),
-            vec![ctor_param("dependency", Some("mixed"), false)],
-        );
-        let child = class_info_with_ctor(
-            "Spmt\\Probe\\Model\\ChildWithConcreteInterface",
-            Some("Spmt\\Probe\\Model\\ParentWithMixedType"),
-            child_path,
-            vec![ctor_param(
-                "dependency",
-                Some("Magento\\Framework\\App\\Config\\ScopeConfigInterface"),
-                false,
-            )],
-        );
-        let mut class_map = FxHashMap::default();
-        class_map.insert(parent.fqcn.clone(), parent);
-        class_map.insert(child.fqcn.clone(), child);
-
-        let violations = super::validate_constructor_integrity(&class_map);
-
-        assert!(violations.is_empty());
+        let args = &merged.type_configs["Acme\\Generator"].arguments;
+        let items = |name: &str| {
+            let is_named = |a: &&super::Argument| matches!(a, super::Argument::Array { name: n, .. } if n == name);
+            let arg = args.iter().find(is_named).unwrap();
+            format!("{arg:?}")
+        };
+        // Primary files merge item by item with each other.
+        assert!(items("entities").contains("fromPrimary"));
+        assert!(items("entities").contains("fromSubfolder"));
+        // Modules replace a primary argument as a whole, also one from a subfolder.
+        assert!(items("replaced").contains("fromModule"));
+        assert!(!items("replaced").contains("fromOther"));
     }
 
     #[test]

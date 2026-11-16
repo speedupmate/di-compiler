@@ -194,7 +194,7 @@ fn normalize_doc_type(php_type: &str) -> String {
         }
         return format!("{base}[]");
     }
-    if t.contains('\\') {
+    if t.contains('\\') || php_type.trim().starts_with('\\') {
         return format!("\\{t}");
     }
     t.to_string()
@@ -220,7 +220,11 @@ fn setter_type_hint(php_type: &str) -> Option<String> {
     ) {
         return None;
     }
-    if t.contains('\\') {
+    // `TypeProcessor::isValidTypeDeclaration()` accepts all that is not simple, any or a list.
+    if lowered == "array" {
+        return Some("array".to_string());
+    }
+    if t.contains('\\') || php_type.trim().starts_with('\\') {
         return Some(format!("\\{t}"));
     }
     None
@@ -247,6 +251,18 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn test_setter_keeps_the_array_and_global_class_types() {
+        assert_eq!(setter_type_hint("array").as_deref(), Some("array"));
+        assert_eq!(
+            setter_type_hint("\\DateTime").as_deref(),
+            Some("\\DateTime")
+        );
+        assert_eq!(normalize_doc_type("\\DateTime"), "\\DateTime");
+        assert_eq!(setter_type_hint("string"), None);
+        assert_eq!(setter_type_hint("string[]"), None);
     }
 
     #[test]

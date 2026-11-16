@@ -86,4 +86,6 @@ pub enum ResolvedScalar {
     String(String),
     Number(String),
     Bool(bool),
+    /// A `var_export()` expression from PHP, written as is.
+    PhpExpression(String),
 }

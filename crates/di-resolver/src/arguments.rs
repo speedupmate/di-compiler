@@ -22,134 +22,6 @@ use crate::graph::{
 };
 use di_xml_reader::{Argument, DiConfig};
 
-type DependencyPairs = (Vec<(String, String)>, Vec<(String, String)>);
-
-/// For each type in `type_names`, compute which di.xml config keys are consulted
-/// during argument resolution, then build two reverse indexes:
-///
-/// - `hierarchy_rev[K]` → type names that access K in type_configs or virtual_types
-/// - `pref_rev[K]`      → type names that have K as a constructor type hint
-///
-/// Used by OPT-DELTA to compute the per-area affected set without running the full
-/// resolver 25K × 7 times.
-pub fn build_dependency_reverse_index(
-    type_names: &[String],
-    class_map: &FxHashMap<String, ClassInfo>,
-    di_config: &DiConfig,
-) -> (
-    FxHashMap<String, Vec<String>>,
-    FxHashMap<String, Vec<String>>,
-) {
-    // Compute per-type (key → owner) pairs in parallel, then merge serially.
-    // All inputs are shared references (Sync) so par_iter is safe.
-    let pairs: Vec<DependencyPairs> = type_names
-        .par_iter()
-        .map(|type_name| {
-            let owner = normalize(type_name);
-            let (h_keys, p_keys) = config_dependency_keys_for_type(&owner, class_map, di_config);
-            let h_pairs: Vec<(String, String)> =
-                h_keys.into_iter().map(|k| (k, owner.clone())).collect();
-            let p_pairs: Vec<(String, String)> =
-                p_keys.into_iter().map(|k| (k, owner.clone())).collect();
-            (h_pairs, p_pairs)
-        })
-        .collect();
-
-    let mut hierarchy_rev: FxHashMap<String, Vec<String>> = FxHashMap::default();
-    let mut pref_rev: FxHashMap<String, Vec<String>> = FxHashMap::default();
-    for (h_pairs, p_pairs) in pairs {
-        for (key, owner) in h_pairs {
-            hierarchy_rev.entry(key).or_default().push(owner);
-        }
-        for (key, owner) in p_pairs {
-            pref_rev.entry(key).or_default().push(owner);
-        }
-    }
-
-    (hierarchy_rev, pref_rev)
-}
-
-/// Compute the set of di.xml config keys a type accesses during argument resolution.
-/// Mirrors the hierarchy walk in `merged_di_arguments_for_type_name` but collects keys
-/// instead of building args.  Also collects constructor type hints for preference deps.
-fn config_dependency_keys_for_type(
-    type_name: &str,
-    class_map: &FxHashMap<String, ClassInfo>,
-    di_config: &DiConfig,
-) -> (FxHashSet<String>, FxHashSet<String>) {
-    let mut hierarchy_keys: FxHashSet<String> = FxHashSet::default();
-    let mut pref_keys: FxHashSet<String> = FxHashSet::default();
-
-    // Walk the VT chain; every step accesses virtual_types[entry].
-    let vchain = virtual_type_chain(type_name, di_config);
-    for entry in &vchain {
-        hierarchy_keys.insert(entry.clone());
-    }
-    let concrete = normalize(vchain.last().unwrap_or(&type_name.to_string()));
-
-    // Extends chain (root-ancestor-first), same as merged_di_arguments_for_type_name.
-    let mut extends_chain: Vec<String> = Vec::new();
-    {
-        let mut cursor = concrete.clone();
-        let mut seen: FxHashSet<String> = FxHashSet::default();
-        while !cursor.is_empty() && seen.insert(cursor.clone()) {
-            extends_chain.push(cursor.clone());
-            match class_map.get(&cursor).and_then(|i| i.extends.as_ref()) {
-                Some(parent) => cursor = normalize(parent),
-                None => break,
-            }
-        }
-        extends_chain.reverse();
-    }
-
-    // Build class_hierarchy with new interfaces inserted before each class.
-    let mut class_hierarchy: Vec<String> = Vec::new();
-    {
-        let mut parent_implements: FxHashSet<String> = FxHashSet::default();
-        for class_name in &extends_chain {
-            if let Some(info) = class_map.get(class_name) {
-                let class_implements: FxHashSet<String> =
-                    info.implements.iter().map(|i| normalize(i)).collect();
-                let mut new_ifaces: Vec<String> = class_implements
-                    .difference(&parent_implements)
-                    .cloned()
-                    .collect();
-                new_ifaces.sort();
-                class_hierarchy.extend(new_ifaces);
-                parent_implements = class_implements;
-            }
-            class_hierarchy.push(class_name.clone());
-        }
-    }
-    if normalize(type_name) != concrete {
-        class_hierarchy.push(normalize(type_name));
-    }
-
-    // For each hierarchy entry, walk its VT chain and record all entries as dependency keys.
-    for ancestor in &class_hierarchy {
-        for entry in virtual_type_chain(ancestor, di_config) {
-            hierarchy_keys.insert(entry);
-        }
-    }
-
-    // Collect preference keys: constructor type hints (conservatively includes optional params).
-    if let Some(info) = class_info_with_inherited_constructor(&concrete, class_map) {
-        if let Some(ctor) = &info.constructor {
-            for param in &ctor.params {
-                if let Some(type_hint) = param
-                    .type_hint
-                    .as_deref()
-                    .and_then(|h| first_non_null_class_type_hint_arm(h, &info.namespace))
-                {
-                    pref_keys.insert(type_hint);
-                }
-            }
-        }
-    }
-
-    (hierarchy_keys, pref_keys)
-}
-
 /// Resolve constructor arguments for all classes.
 ///
 /// Returns a map of FQCN → Vec<ResolvedArg>.
@@ -253,10 +125,7 @@ pub fn resolve_for_class(
     for param in &ctor.params {
         // Check if di.xml overrides this param
         if let Some(di_arg) = di_arg_map.get(param.name.as_str()) {
-            let type_hint = param
-                .type_hint
-                .as_deref()
-                .and_then(|hint| first_non_null_class_type_hint_arm(hint, &info.namespace));
+            let type_hint = param.type_hint.as_deref().and_then(parameter_class);
             resolved.push(ResolvedArg {
                 name: param.name.clone(),
                 resolved: if type_hint.is_some() {
@@ -278,14 +147,11 @@ pub fn resolve_for_class(
         // 2) required typed param => instance argument
         // 3) fallback => null
         let value = if param.is_variadic {
-            ResolvedArgValue::Null
+            // `ClassReader::getReflectionParameterDefaultValue()` gives a variadic `[]`.
+            ResolvedArgValue::PlainArray(Vec::new())
         } else if param.is_optional {
             resolve_non_object_default(param.default_value.as_deref(), const_map)
-        } else if let Some(type_hint) = param
-            .type_hint
-            .as_deref()
-            .and_then(|hint| first_non_null_class_type_hint_arm(hint, &info.namespace))
-        {
+        } else if let Some(type_hint) = param.type_hint.as_deref().and_then(parameter_class) {
             let concrete = di_config.get_preference(&type_hint);
             // PHP's ArgumentsResolver.getInstanceArgument() calls isShared() on the
             // TYPE HINT as-is (not the resolved concrete). So TransactionManagerInterface
@@ -494,24 +360,115 @@ fn merged_di_arguments_for_type_name(
     //    semantics) rather than replacing — this is critical for arguments like `commands`
     //    that are contributed by many di.xml files across many modules.
     let mut merged: Vec<Argument> = Vec::new();
-    let mut by_name: FxHashMap<String, usize> = FxHashMap::default();
 
     for ancestor in &class_hierarchy {
         let chain = virtual_type_chain(ancestor, di_config);
         for current in chain.iter().rev() {
-            for arg in di_config.get_arguments(current) {
-                let name = argument_name(arg).to_string();
-                if let Some(idx) = by_name.get(&name).copied() {
-                    merge_argument_into(&mut merged[idx], arg);
+            // What a type inherits has been through `sortItems()` once before its own arguments.
+            sort_items_after_merge(&mut merged);
+            let own = di_config.get_arguments(current);
+            if own.is_empty() {
+                continue;
+            }
+            let inherits = !merged.is_empty();
+            for arg in own {
+                let arg = with_items_sorted_as_read(arg);
+                let name = argument_name(&arg);
+                if let Some(existing) = merged.iter_mut().find(|a| argument_name(a) == name) {
+                    merge_argument_into(existing, &arg);
                 } else {
-                    by_name.insert(name, merged.len());
-                    merged.push(arg.clone());
+                    merged.push(arg);
                 }
+            }
+            if inherits {
+                sort_items_after_merge(&mut merged);
             }
         }
     }
 
+    for arg in &mut merged {
+        clear_sort_orders(arg);
+    }
     merged
+}
+
+/// `ArrayType::evaluate()` sorts array items when it reads the merged di.xml of one scope, with
+/// equal values in their own order. After that only an object item still has its `sortOrder`,
+/// because `Interpreter\\DataObject` copies it.
+fn with_items_sorted_as_read(arg: &Argument) -> Argument {
+    let mut arg = arg.clone();
+    sort_items_as_read(&mut arg);
+    arg
+}
+
+fn sort_items_as_read(arg: &mut Argument) {
+    if let Argument::Array { items, .. } = arg {
+        items.sort_by_key(argument_sort_order);
+        for item in items.iter_mut() {
+            sort_items_as_read(item);
+            if !matches!(item, Argument::Object { .. }) {
+                clear_sort_order(item);
+            }
+        }
+    }
+}
+
+/// `SortItems::sortItems()` as `Config::_collectConfiguration()` calls it, on all arguments of a
+/// type. `isMultiSortOrder()` keeps overwriting one flag, so the last entry of the last argument
+/// that is an array decides whether anything happens: an object item with a `sortOrder`. If so, it
+/// sorts the entries of all arguments as one list and rebuilds the arguments in the order of that
+/// list, so the next merge can have another last argument.
+fn sort_items_after_merge(args: &mut [Argument]) {
+    let last_entry_has_sort_order = args
+        .iter()
+        .rev()
+        .find_map(|arg| match arg {
+            Argument::Array { items, .. } if items.is_empty() => None,
+            Argument::Array { items, .. } => items.last().map(|item| {
+                matches!(item, Argument::Object { .. }) && argument_sort_order(item) != 0
+            }),
+            Argument::Object { .. } | Argument::Init { .. } => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if !last_entry_has_sort_order {
+        return;
+    }
+    for arg in args.iter_mut() {
+        if let Argument::Array { items, .. } = arg {
+            items.sort_by_key(argument_sort_order);
+        }
+    }
+    // The argument with the entry that sorts first goes first. A scalar has no entries to sort.
+    let first_entry = |arg: &Argument| match arg {
+        Argument::Array { items, .. } => items.first().map(argument_sort_order),
+        Argument::Object { .. } | Argument::Init { .. } => Some(0),
+        _ => None,
+    };
+    args.sort_by_key(|arg| first_entry(arg).unwrap_or(i32::MAX));
+}
+
+fn clear_sort_orders(arg: &mut Argument) {
+    clear_sort_order(arg);
+    if let Argument::Array { items, .. } = arg {
+        for item in items {
+            clear_sort_orders(item);
+        }
+    }
+}
+
+fn clear_sort_order(arg: &mut Argument) {
+    match arg {
+        Argument::Object { sort_order, .. }
+        | Argument::String { sort_order, .. }
+        | Argument::Boolean { sort_order, .. }
+        | Argument::Number { sort_order, .. }
+        | Argument::Null { sort_order, .. }
+        | Argument::Array { sort_order, .. }
+        | Argument::Init { sort_order, .. }
+        | Argument::Const { sort_order, .. }
+        | Argument::Untyped { sort_order, .. } => *sort_order = 0,
+    }
 }
 
 /// Merge `src` into `dst`.
@@ -536,7 +493,16 @@ fn merge_argument_into(dst: &mut Argument, src: &Argument) {
                 }
             }
         }
-        (dst, src) => *dst = src.clone(),
+        (dst, src) => {
+            // `array_replace_recursive` keeps a `sortOrder` that the later value does not set.
+            let earlier = argument_sort_order(dst);
+            *dst = src.clone();
+            if let (Argument::Object { sort_order, .. }, true) = (dst, earlier != 0) {
+                if *sort_order == 0 {
+                    *sort_order = earlier;
+                }
+            }
+        }
     }
 }
 
@@ -565,26 +531,31 @@ fn normalize(s: &str) -> String {
     s.trim().trim_start_matches('\\').to_string()
 }
 
-fn first_non_null_class_type_hint_arm(type_hint: &str, namespace: &str) -> Option<String> {
+/// `GetParameterClassTrait::getParameterClass()`. A union has no `isBuiltin()`, so it has no
+/// class. PHP reflects `A|null` as a named type, so that one does. A builtin type has none.
+fn parameter_class(type_hint: &str) -> Option<String> {
     const NON_CLASS_TYPES: &[&str] = &[
-        "null", "false", "true", "int", "float", "string", "bool", "array", "callable", "mixed",
-        "void", "never", "self", "parent", "static",
+        "false", "true", "int", "float", "string", "bool", "array", "callable", "mixed", "void",
+        "never", "object", "iterable", "self", "parent", "static",
     ];
 
-    type_hint
+    if type_hint.contains('&') {
+        return None;
+    }
+
+    let mut arms = type_hint
         .split('|')
-        .map(str::trim)
-        .map(|arm| arm.trim_start_matches('?').trim_start_matches('\\'))
-        .find(|arm| !arm.is_empty() && !NON_CLASS_TYPES.contains(arm))
-        .map(|arm| {
-            // Magento's ScalarTypesProvider does not include PHP's object/iterable
-            // pseudo-types. ArgumentsReader therefore namespace-resolves them.
-            if matches!(arm, "object" | "iterable") && !namespace.is_empty() {
-                format!("{namespace}\\{arm}")
-            } else {
-                arm.to_string()
-            }
-        })
+        .map(|arm| arm.trim().trim_start_matches('?').trim_start_matches('\\'))
+        .filter(|arm| !arm.is_empty() && !arm.eq_ignore_ascii_case("null"));
+    let arm = arms.next()?;
+    if arms.next().is_some()
+        || NON_CLASS_TYPES
+            .iter()
+            .any(|builtin| arm.eq_ignore_ascii_case(builtin))
+    {
+        return None;
+    }
+    Some(arm.to_string())
 }
 
 fn resolve_di_argument(
@@ -606,19 +577,24 @@ fn resolve_di_argument(
                     .contains_key(&name.to_ascii_lowercase());
             // For real class / interface references, apply the full preference chain
             // (including interception preferences so intercepted concretes become \Interceptor).
+            // `ArgumentsResolver::getInstanceArgument()` calls `isShared()` on the argument
+            // as di.xml names it. Preferences, the Interceptor among them, replace the name
+            // only afterwards (`InterceptorSubstitution`, `PreferencesResolving`), so they
+            // never change the shared decision.
+            let is_shared = shared.unwrap_or_else(|| di_config.is_shared(&name));
             let concrete = if is_virtual_type && !has_explicit_preference {
                 name
             } else {
                 di_config.get_preference(value)
             };
-            let is_shared = shared.unwrap_or_else(|| di_config.is_shared(&concrete));
             if is_shared {
                 ResolvedArgValue::SharedInstance(concrete)
             } else {
                 ResolvedArgValue::NonSharedInstance(concrete)
             }
         }
-        Argument::String { value, .. } => {
+        // `Untyped` never gets here: the compile stops on it after the merge.
+        Argument::String { value, .. } | Argument::Untyped { value, .. } => {
             ResolvedArgValue::Scalar(ResolvedScalar::String(value.clone()))
         }
         Argument::Boolean { value, .. } => ResolvedArgValue::Scalar(ResolvedScalar::Bool(*value)),
@@ -749,6 +725,13 @@ fn resolve_non_object_default(
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
             return ResolvedArgValue::PlainArray(json_to_plain_array_items(&v));
         }
+    }
+    // Values only PHP can write, such as enum cases and objects.
+    if let Some(expr) = trimmed
+        .strip_prefix("__php__:")
+        .or_else(|| trimmed.strip_prefix("__obj__:"))
+    {
+        return ResolvedArgValue::Scalar(ResolvedScalar::PhpExpression(expr.to_string()));
     }
     if let Some(items) = parse_php_array_default(trimmed) {
         return ResolvedArgValue::PlainArray(items);
@@ -1079,7 +1062,8 @@ fn value_to_php_array_key(value: &ResolvedArrayValue) -> Option<String> {
         ResolvedArrayValue::Scalar(ResolvedScalar::Bool(true)) => Some("1".to_string()),
         ResolvedArrayValue::Scalar(ResolvedScalar::Bool(false)) => Some("0".to_string()),
         ResolvedArrayValue::Null => Some(String::new()),
-        ResolvedArrayValue::Array(_) => None,
+        ResolvedArrayValue::Scalar(ResolvedScalar::PhpExpression(_))
+        | ResolvedArrayValue::Array(_) => None,
     }
 }
 
@@ -1122,7 +1106,7 @@ fn is_configured_argument_array(items: &[Argument]) -> bool {
 
 fn resolve_plain_array_value(arg: &Argument) -> ResolvedArrayValue {
     match arg {
-        Argument::String { value, .. } => {
+        Argument::String { value, .. } | Argument::Untyped { value, .. } => {
             ResolvedArrayValue::Scalar(ResolvedScalar::String(value.clone()))
         }
         Argument::Boolean { value, .. } => ResolvedArrayValue::Scalar(ResolvedScalar::Bool(*value)),
@@ -1162,7 +1146,8 @@ fn argument_name(arg: &Argument) -> &str {
         | Argument::Null { name, .. }
         | Argument::Array { name, .. }
         | Argument::Init { name, .. }
-        | Argument::Const { name, .. } => name.as_str(),
+        | Argument::Const { name, .. }
+        | Argument::Untyped { name, .. } => name.as_str(),
     }
 }
 
@@ -1175,7 +1160,8 @@ fn argument_sort_order(arg: &Argument) -> i32 {
         | Argument::Null { sort_order, .. }
         | Argument::Array { sort_order, .. }
         | Argument::Init { sort_order, .. }
-        | Argument::Const { sort_order, .. } => *sort_order,
+        | Argument::Const { sort_order, .. }
+        | Argument::Untyped { sort_order, .. } => *sort_order,
     }
 }
 
@@ -1220,6 +1206,7 @@ mod tests {
             is_abstract: false,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 
@@ -1242,6 +1229,7 @@ mod tests {
             is_abstract: false,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 
@@ -1407,20 +1395,17 @@ mod tests {
     }
 
     #[test]
-    fn test_union_with_primitive_uses_class_arm() {
+    fn test_intersection_type_has_no_class_like_magento() {
         let mut class_map = FxHashMap::default();
         class_map.insert(
             "App\\Service".to_string(),
-            make_class("App\\Service", vec![("dep", Some("string|App\\Dep"))]),
+            make_class("App\\Service", vec![("dep", Some("App\\First&Second"))]),
         );
 
         let di_config = DiConfig::default();
         let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
-        assert!(matches!(
-            &args[0].resolved,
-            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\Dep"
-        ));
+        assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
     }
 
     #[test]
@@ -1435,40 +1420,6 @@ mod tests {
         let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
         let args = &map["App\\Service"];
         assert!(matches!(&args[0].resolved, ResolvedArgValue::Null));
-    }
-
-    #[test]
-    fn test_object_type_hint_matches_magento_namespace_resolution_limit() {
-        let mut class_map = FxHashMap::default();
-        class_map.insert(
-            "App\\Service".to_string(),
-            make_class("App\\Service", vec![("dep", Some("object"))]),
-        );
-
-        let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
-        let args = &map["App\\Service"];
-        assert!(matches!(
-            &args[0].resolved,
-            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\object"
-        ));
-    }
-
-    #[test]
-    fn test_iterable_type_hint_matches_magento_namespace_resolution_limit() {
-        let mut class_map = FxHashMap::default();
-        class_map.insert(
-            "App\\Service".to_string(),
-            make_class("App\\Service", vec![("items", Some("iterable"))]),
-        );
-
-        let di_config = DiConfig::default();
-        let map = resolve_all_arguments(&class_map, &di_config, &FxHashMap::default());
-        let args = &map["App\\Service"];
-        assert!(matches!(
-            &args[0].resolved,
-            ResolvedArgValue::SharedInstance(fqcn) if fqcn == "App\\iterable"
-        ));
     }
 
     #[test]
@@ -1578,6 +1529,79 @@ mod tests {
             Some(ResolvedArgValue::SharedInstance(v))
             if v == "Magento\\Backend\\App\\Request\\BackendValidator"
         ));
+    }
+
+    #[test]
+    fn test_variadic_parameter_gets_an_empty_array() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class_with_constructor(
+                "App\\Service",
+                vec![ConstructorParam {
+                    name: "rest".to_string(),
+                    type_hint: Some("App\\Dep".to_string()),
+                    is_optional: true,
+                    default_value: None,
+                    is_primitive: false,
+                    is_variadic: true,
+                    is_promoted: false,
+                }],
+            ),
+        );
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &FxHashMap::default());
+        assert!(matches!(
+            &map["App\\Service"][0].resolved,
+            ResolvedArgValue::PlainArray(items) if items.is_empty()
+        ));
+    }
+
+    fn resolve_one_param(hint: &str) -> ResolvedArgValue {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "App\\Service".to_string(),
+            make_class("App\\Service", vec![("dep", Some(hint))]),
+        );
+        let map = resolve_all_arguments(&class_map, &DiConfig::default(), &FxHashMap::default());
+        map["App\\Service"][0].resolved.clone()
+    }
+
+    #[test]
+    fn test_builtin_object_and_iterable_are_not_classes() {
+        for hint in ["object", "?object", "object|null", "iterable", "?iterable"] {
+            assert!(
+                matches!(resolve_one_param(hint), ResolvedArgValue::Null),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_union_of_two_types_has_no_class() {
+        for hint in [
+            "App\\A|App\\B",
+            "App\\A|false",
+            "?App\\A|App\\B",
+            "App\\A|int",
+        ] {
+            assert!(
+                matches!(resolve_one_param(hint), ResolvedArgValue::Null),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_class_with_null_is_a_class() {
+        for hint in ["?App\\A", "App\\A|null", "null|App\\A", "App\\A"] {
+            assert!(
+                matches!(
+                    resolve_one_param(hint),
+                    ResolvedArgValue::SharedInstance(ref name) if name == "App\\A"
+                ),
+                "{hint}"
+            );
+        }
     }
 
     #[test]

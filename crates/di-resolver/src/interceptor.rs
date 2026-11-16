@@ -3,7 +3,9 @@
 //! A class needs an interceptor when ANY of the following hold:
 //!   1. It has at least one active (non-disabled) plugin registered in di.xml, OR
 //!   2. It is a non-abstract, non-final concrete class that inherits (directly or
-//!      transitively) from a class that needs an interceptor.
+//!      transitively) from a class that needs an interceptor, OR
+//!   3. It is a concrete class whose own plugin entries have no class at all. Its
+//!      interceptor has no methods and its children inherit nothing from it.
 //!
 //! Phase 2 (inheritance propagation) ensures that when a parent class is intercepted,
 //! all concrete subclasses are also intercepted so the plugin system fires correctly
@@ -28,7 +30,8 @@ pub fn detect_interceptors(
     let mut directly_intercepted: FxHashSet<String> = FxHashSet::default();
 
     for (owner_name, plugins) in &di_config.plugins {
-        let active: Vec<&di_xml_reader::Plugin> = plugins.iter().filter(|p| !p.disabled).collect();
+        let active: Vec<&di_xml_reader::Plugin> =
+            plugins.iter().filter(|p| p.is_active()).collect();
         if active.is_empty() {
             continue;
         }
@@ -57,25 +60,7 @@ pub fn detect_interceptors(
         // Skip Proxy-suffix NoninterceptableInterface implementors (generated proxy wrappers);
         // other source classes that implement NoninterceptableInterface (e.g. StructureLazy)
         // still get interceptors per PHP truth.
-        let is_concrete = match info {
-            None => false, // class not found on disk → skip
-            Some(info) => {
-                use php_extractor::types::ClassKind;
-                let short = owner_name
-                    .split('\\')
-                    .next_back()
-                    .unwrap_or(owner_name.as_str());
-                let is_proxy_noninterceptable = short.ends_with("Proxy")
-                    && info.implements.iter().any(|iface| {
-                        iface.trim_start_matches('\\')
-                            == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
-                    });
-                !info.is_abstract
-                    && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
-                    && !is_proxy_noninterceptable
-            }
-        };
-        if !is_concrete {
+        if !info.is_some_and(|info| is_concrete_owner(owner_name, info)) {
             continue;
         }
 
@@ -101,7 +86,7 @@ pub fn detect_interceptors(
             .map(|p| PluginRef {
                 name: p.name.clone(),
                 type_name: p.type_name.clone(),
-                sort_order: p.sort_order,
+                sort_order: p.effective_sort_order(),
             })
             .collect();
         plugin_refs.sort_by_key(|p| p.sort_order);
@@ -189,8 +174,47 @@ pub fn detect_interceptors(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 3: Owners that only hold overrides with no class
+    //
+    // `PluginListGenerator::inheritPlugins()` gives such an owner an empty list instead
+    // of null, so `InterceptionConfigurationBuilder` generates an Interceptor with no
+    // methods. Its children inherit nothing from this.
+    // -----------------------------------------------------------------------
+    let with_spec: FxHashSet<String> = specs.iter().map(|spec| spec.fqcn.clone()).collect();
+    for (owner_name, plugins) in &di_config.plugins {
+        let only_overrides = !plugins.iter().any(|p| p.is_active())
+            && plugins.iter().any(|p| p.type_name.is_empty());
+        if !only_overrides || with_spec.contains(owner_name) {
+            continue;
+        }
+        let Some(info) = class_map.get(owner_name) else {
+            continue;
+        };
+        if !info.is_final && is_concrete_owner(owner_name, info) {
+            specs.push(InterceptorSpec {
+                fqcn: owner_name.clone(),
+                plugins: vec![],
+                public_methods: vec![],
+            });
+        }
+    }
+
     specs.sort_by(|a, b| a.fqcn.cmp(&b.fqcn));
     specs
+}
+
+fn is_concrete_owner(owner_name: &str, info: &ClassInfo) -> bool {
+    use php_extractor::types::ClassKind;
+    let short = owner_name.split('\\').next_back().unwrap_or(owner_name);
+    let is_proxy_noninterceptable = short.ends_with("Proxy")
+        && info.implements.iter().any(|iface| {
+            iface.trim_start_matches('\\')
+                == "Magento\\Framework\\ObjectManager\\NoninterceptableInterface"
+        });
+    !info.is_abstract
+        && !matches!(info.kind, ClassKind::Interface | ClassKind::Trait)
+        && !is_proxy_noninterceptable
 }
 
 fn select_interceptor_methods(
@@ -244,6 +268,8 @@ fn collect_public_methods_with_inheritance(
                 result.push(method.clone());
             }
         }
+        // A final or non-public method here means the parent's version is not what callers get.
+        seen.extend(info.traits.hidden_methods.iter().cloned());
         cursor = info.extends.clone();
     }
 
@@ -266,7 +292,8 @@ fn derive_intercepted_methods_from_plugins(
             continue;
         };
 
-        for method in &plugin_info.public_methods {
+        // `Definition\Runtime::getMethodList()` uses `get_class_methods()`, so inherited count.
+        for method in collect_public_methods_with_inheritance(&plugin_info.fqcn, class_map) {
             if let Some(intercepted_method) = plugin_method_to_intercepted(&method.name) {
                 methods.insert(intercepted_method);
             }
@@ -276,7 +303,7 @@ fn derive_intercepted_methods_from_plugins(
     methods
 }
 
-fn derive_intercepted_methods_from_ancestor_plugins(
+pub fn derive_intercepted_methods_from_ancestor_plugins(
     fqcn: &str,
     class_map: &FxHashMap<String, ClassInfo>,
     di_config: &DiConfig,
@@ -293,11 +320,11 @@ fn derive_intercepted_methods_from_ancestor_plugins(
         if let Some(plugins) = di_config.plugins.get(&current) {
             let plugin_refs: Vec<PluginRef> = plugins
                 .iter()
-                .filter(|p| !p.disabled)
+                .filter(|p| p.is_active())
                 .map(|p| PluginRef {
                     name: p.name.clone(),
                     type_name: p.type_name.clone(),
-                    sort_order: p.sort_order,
+                    sort_order: p.effective_sort_order(),
                 })
                 .collect();
             if !plugin_refs.is_empty() {
@@ -426,6 +453,7 @@ mod tests {
             is_abstract: false,
             is_final,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 
@@ -433,8 +461,9 @@ mod tests {
         Plugin {
             name: name.to_string(),
             type_name: type_name.to_string(),
-            sort_order,
-            disabled,
+            sort_order: Some(sort_order),
+            disabled: Some(disabled),
+            disabled_after_type: false,
         }
     }
 
@@ -487,6 +516,25 @@ mod tests {
         );
         let specs = detect_interceptors(&class_map, &di_config);
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn test_owner_with_only_an_override_gets_an_empty_interceptor() {
+        let mut child = make_class("Foo\\Child", false);
+        child.extends = Some("Foo\\Bar".to_string());
+        let mut class_map = FxHashMap::default();
+        class_map.insert("Foo\\Bar".to_string(), make_class("Foo\\Bar", false));
+        class_map.insert("Foo\\Child".to_string(), child);
+        let mut di_config = DiConfig::default();
+        di_config
+            .plugins
+            .insert("Foo\\Bar".to_string(), vec![make_plugin("p", "", 0, true)]);
+
+        let specs = detect_interceptors(&class_map, &di_config);
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].fqcn, "Foo\\Bar");
+        assert!(specs[0].public_methods.is_empty());
     }
 
     #[test]

@@ -190,6 +190,7 @@ fn parse_class_json(json: &str, path: &Path) -> Result<Option<ClassInfo>, String
         is_abstract,
         is_final,
         public_methods: Vec::new(), // Tier 3 doesn't extract methods
+        traits: Default::default(),
     }))
 }
 

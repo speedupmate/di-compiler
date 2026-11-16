@@ -98,6 +98,14 @@ By default the output goes to `generated/code` and `generated/metadata` in your 
 | `--verbose` | Show detailed logs and timings. |
 | `--help` | List all options. |
 
+### Modules it does not support
+
+The compiler stops with exit code 1, before it changes any output, when one of these packages is installed, enabled or disabled, or when `app/etc/config.php` enables one of these modules. A disabled module counts because Magento 2.4.8 still reads its configuration, so Magento's output would differ from this compiler's. Remove the package with composer, or use `bin/magento setup:di:compile` for that store.
+
+| Module | Package | Reason |
+| --- | --- | --- |
+| `Creatuity_Interception` | `creatuity/magento2-interceptors` | It replaces Magento's Interceptor generator and this compiler does not generate its format. |
+
 ## How it works under the hood
 
 The compiler is written in Rust. Rust scans Magento PHP files, reads `di.xml`, resolves dependencies, and writes generated code and metadata.

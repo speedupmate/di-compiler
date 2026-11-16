@@ -73,15 +73,16 @@ impl DiConfig {
             .unwrap_or(true)
     }
 
-    /// Get active (non-disabled) plugins for a type, sorted by sort_order then name.
+    /// Get active (non-disabled) plugins for a type, sorted by sort_order. Plugins with
+    /// equal sort_order keep merge order, as PHP's stable uasort does.
     pub fn get_active_plugins(&self, fqcn: &str) -> Vec<&Plugin> {
         let name = normalize(fqcn);
         let mut plugins: Vec<&Plugin> = self
             .plugins
             .get(&name)
-            .map(|ps| ps.iter().filter(|p| !p.disabled).collect())
+            .map(|ps| ps.iter().filter(|p| p.is_active()).collect())
             .unwrap_or_default();
-        plugins.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.name.cmp(&b.name)));
+        plugins.sort_by_key(|plugin| plugin.effective_sort_order());
         plugins
     }
 
@@ -93,16 +94,16 @@ impl DiConfig {
 
     /// Walk all di.xml files for a Magento install in correct merge order.
     ///
-    /// Order: app/etc (primary) → vendor/magento → vendor/* (non-magento) → app/code
+    /// Order: app/etc (primary), then modules in `app/etc/config.php` order.
     pub fn load_from_magento_root(
         magento_root: &std::path::Path,
     ) -> Result<DiConfig, crate::Error> {
-        use crate::parser::parse_di_xml_impl;
+        use crate::parser::parse_di_xml_unfolded;
 
         let mut configs = Vec::new();
         let di_xml_paths = find_di_xml_files(magento_root, &FxHashMap::default());
         for path in di_xml_paths {
-            match parse_di_xml_impl(&path) {
+            match parse_di_xml_unfolded(&path) {
                 Ok(c) => configs.push(c),
                 Err(e) => {
                     log::warn!("Failed to parse {}: {e}", path.display());
@@ -139,9 +140,9 @@ fn type_config_case_insensitive<'a>(
 /// Collect **global-only** di.xml files in Magento merge order.
 ///
 /// Only includes `etc/di.xml` files (not area-specific `etc/{area}/di.xml`).
-/// Merge order: app/etc (primary) → vendor/magento/* → vendor/*/* → app/code/*/*
-/// Within each priority tier, files are ordered by Magento module load order
-/// from `app/etc/config.php` (the `module_order` map), then by path.
+/// Merge order: app/etc (primary), then modules by load order from `app/etc/config.php`
+/// (the `module_order` map), wherever the module lives, then by path. This is
+/// `Module\Dir\Reader::getFiles()` walking `ModuleList::getNames()`.
 pub fn find_di_xml_files(
     magento_root: &std::path::Path,
     module_order: &FxHashMap<String, usize>,
@@ -170,16 +171,8 @@ pub fn find_di_xml_files_for_area(
 pub fn find_all_di_xml_files(
     magento_root: &std::path::Path,
     module_order: &FxHashMap<String, usize>,
+    areas: &[&str],
 ) -> Vec<std::path::PathBuf> {
-    const AREAS: &[&str] = &[
-        "global",
-        "frontend",
-        "adminhtml",
-        "crontab",
-        "webapi_rest",
-        "webapi_soap",
-        "graphql",
-    ];
     let mut seen = FxHashSet::default();
     let mut result = Vec::new();
     // Global first
@@ -189,7 +182,7 @@ pub fn find_all_di_xml_files(
         }
     }
     // Then each area overlay
-    for area in AREAS {
+    for area in areas {
         for p in collect_di_xml_files(magento_root, Some(area), module_order) {
             if seen.insert(p.clone()) {
                 result.push(p);
@@ -201,9 +194,8 @@ pub fn find_all_di_xml_files(
 
 /// Internal: collect di.xml files with optional area overlay.
 ///
-/// Each entry is `(priority, module_idx, path)` where priority controls the
-/// broad merge tier and module_idx is the Magento module load order index from
-/// `app/etc/config.php`, providing deterministic tie-breaking within each tier.
+/// Each entry is `(priority, module_idx, path)` where priority puts the primary files
+/// first and module_idx is the Magento module load order index from `app/etc/config.php`.
 fn collect_di_xml_files(
     magento_root: &std::path::Path,
     area: Option<&str>,
@@ -218,14 +210,16 @@ fn collect_di_xml_files(
         area: Option<&str>,
         out: &mut Vec<(u8, usize, std::path::PathBuf)>,
     ) {
-        let global = module_root.join("etc/di.xml");
-        if global.exists() {
-            out.push((priority, module_idx, global));
-        }
-        if let Some(a) = area {
-            let area_di = module_root.join(format!("etc/{}/di.xml", a));
-            if area_di.exists() {
-                out.push((priority, module_idx, area_di));
+        for root in registered_component_roots(module_root) {
+            let global = root.join("etc/di.xml");
+            if global.exists() {
+                out.push((priority, module_idx, global));
+            }
+            if let Some(a) = area {
+                let area_di = root.join(format!("etc/{}/di.xml", a));
+                if area_di.exists() {
+                    out.push((priority, module_idx, area_di));
+                }
             }
         }
     }
@@ -341,13 +335,24 @@ fn collect_di_xml_files(
         roots
     }
 
-    // Priority 0: app/etc/di.xml (primary scope)
+    // Priority 0: app/etc/di.xml and app/etc/*/di.xml (primary scope)
     let app_etc_di = magento_root.join("app/etc/di.xml");
     if app_etc_di.exists() {
         paths.push((0, 0, app_etc_di));
     }
+    // Then app/etc/*/di.xml, like the glob `{di.xml,*/di.xml}` in Magento's FileResolver.
+    // The glob's `*` does not match hidden folders.
+    if let Ok(entries) = std::fs::read_dir(magento_root.join("app/etc")) {
+        for entry in entries.flatten() {
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            let di_xml = entry.path().join("di.xml");
+            if !hidden && di_xml.exists() {
+                paths.push((0, 1, di_xml));
+            }
+        }
+    }
 
-    // Priority 1: vendor/magento/*
+    // Priority 1, all modules. vendor/magento/*
     collect_vendor(
         &magento_root.join("vendor/magento"),
         1,
@@ -357,7 +362,7 @@ fn collect_di_xml_files(
         false,
     );
 
-    // Priority 2: other vendor/vendor/* (non-magento)
+    // Other vendor/vendor/* (non-magento)
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("vendor")) {
         for vendor in vendors.flatten() {
             if vendor
@@ -368,11 +373,26 @@ fn collect_di_xml_files(
             {
                 continue;
             }
-            collect_vendor(&vendor.path(), 2, area, module_order, &mut paths, true);
+            collect_vendor(&vendor.path(), 1, area, module_order, &mut paths, true);
         }
     }
 
-    // Priority 3: app/code/*/*/etc/di.xml
+    // Modules that Composer registers from a folder the search above skips.
+    let found: FxHashSet<std::path::PathBuf> = paths.iter().map(|(_, _, p)| p.clone()).collect();
+    for module_root in composer_registered_module_roots(magento_root) {
+        let module_idx = cached_module_name(&module_root)
+            .and_then(|n| module_order.get(&n).copied())
+            .unwrap_or(usize::MAX);
+        let mut module_paths = Vec::new();
+        push_module_di_paths(&module_root, 1, module_idx, area, &mut module_paths);
+        paths.extend(
+            module_paths
+                .into_iter()
+                .filter(|(_, _, path)| !found.contains(path)),
+        );
+    }
+
+    // app/code/*/*/etc/di.xml
     if let Ok(vendors) = std::fs::read_dir(magento_root.join("app/code")) {
         for vendor in vendors.flatten() {
             if let Ok(modules) = std::fs::read_dir(vendor.path()) {
@@ -380,16 +400,7 @@ fn collect_di_xml_files(
                     let module_idx = cached_module_name(&module.path())
                         .and_then(|n| module_order.get(&n).copied())
                         .unwrap_or(usize::MAX);
-                    let global = module.path().join("etc/di.xml");
-                    if global.exists() {
-                        paths.push((3, module_idx, global));
-                    }
-                    if let Some(a) = area {
-                        let area_di = module.path().join(format!("etc/{}/di.xml", a));
-                        if area_di.exists() {
-                            paths.push((3, module_idx, area_di));
-                        }
-                    }
+                    push_module_di_paths(&module.path(), 1, module_idx, area, &mut paths);
                 }
             }
         }
@@ -400,6 +411,58 @@ fn collect_di_xml_files(
     paths.into_iter().map(|(_, _, p)| p).collect()
 }
 
+/// The folders that the `registration.php` in `folder` registers. `ComponentRegistrar::register()`
+/// takes any path, for example `__DIR__ . '/src'`. Only that form is read here, a computed path
+/// counts as the folder itself. Without a `registration.php` the answer is the folder itself.
+pub fn registered_component_roots(folder: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(registration) = std::fs::read_to_string(folder.join("registration.php")) {
+        for (at, _) in registration.match_indices("__DIR__") {
+            let rest = registration[at + "__DIR__".len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('.') else {
+                // A bare `__DIR__` registers the folder itself, next to any `__DIR__ . '/...'` path.
+                if !roots.iter().any(|root| root == folder) {
+                    roots.push(folder.to_path_buf());
+                }
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') else {
+                continue;
+            };
+            let Some((relative, _)) = rest[1..].split_once(quote) else {
+                continue;
+            };
+            let root = folder.join(relative.trim_start_matches('/'));
+            if root.is_dir() {
+                roots.push(root);
+            }
+        }
+    }
+    if roots.is_empty() {
+        roots.push(folder.to_path_buf());
+    }
+    roots
+}
+
+/// The folders of the `registration.php` files in `vendor/composer/autoload_files.php`.
+/// Composer loads these on every request, which is how Magento learns about these modules.
+pub fn composer_registered_module_roots(magento_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let vendor = magento_root.join("vendor");
+    let Ok(list) = std::fs::read_to_string(vendor.join("composer/autoload_files.php")) else {
+        return Vec::new();
+    };
+    list.lines()
+        .filter_map(|line| {
+            let (_, path) = line.split_once("$vendorDir . '/")?;
+            let (path, _) = path.split_once('\'')?;
+            path.strip_suffix("/registration.php")
+        })
+        .map(|package_path| vendor.join(package_path))
+        .filter(|module_root| module_root.is_dir())
+        .collect()
+}
+
 fn normalize(s: &str) -> String {
     s.trim().trim_start_matches('\\').to_string()
 }
@@ -408,7 +471,9 @@ fn normalize(s: &str) -> String {
 ///
 /// Returns `None` if the file doesn't exist or has no `name="..."` attribute.
 fn module_name_from_module_xml(module_root: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(module_root.join("etc/module.xml")).ok()?;
+    let content = registered_component_roots(module_root)
+        .iter()
+        .find_map(|root| std::fs::read_to_string(root.join("etc/module.xml")).ok())?;
     let name_pos = content.find("name=\"")?;
     let rest = &content[name_pos + 6..];
     let end_pos = rest.find('"')?;
@@ -508,20 +573,23 @@ mod tests {
                 Plugin {
                     name: "c".into(),
                     type_name: "TC".into(),
-                    sort_order: 30,
-                    disabled: false,
+                    sort_order: Some(30),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
                 Plugin {
                     name: "b".into(),
                     type_name: "TB".into(),
-                    sort_order: 10,
-                    disabled: false,
+                    sort_order: Some(10),
+                    disabled: Some(false),
+                    disabled_after_type: false,
                 },
                 Plugin {
                     name: "a".into(),
                     type_name: "TA".into(),
-                    sort_order: 10,
-                    disabled: true,
+                    sort_order: Some(10),
+                    disabled: Some(true),
+                    disabled_after_type: false,
                 },
             ],
         );
@@ -529,6 +597,24 @@ mod tests {
         assert_eq!(active.len(), 2); // 'a' is disabled
         assert_eq!(active[0].name, "b"); // lower sort_order first
         assert_eq!(active[1].name, "c");
+    }
+
+    #[test]
+    fn test_get_active_plugins_equal_sort_order_keeps_merge_order() {
+        let plugin = |name: &str| Plugin {
+            name: name.into(),
+            type_name: "T".into(),
+            sort_order: Some(10),
+            disabled: None,
+            disabled_after_type: false,
+        };
+        let mut config = DiConfig::default();
+        config
+            .plugins
+            .insert("Foo".into(), vec![plugin("z"), plugin("a")]);
+        let active = config.get_active_plugins("Foo");
+        assert_eq!(active[0].name, "z");
+        assert_eq!(active[1].name, "a");
     }
 
     #[test]
@@ -555,6 +641,33 @@ mod tests {
 
         let frontend = super::find_di_xml_files_for_area(root, "frontend", &empty_order);
         assert!(frontend.contains(&module_root.join("etc/frontend/di.xml")));
+    }
+
+    #[test]
+    fn test_find_di_xml_files_includes_module_registered_with_bare_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let module_root = root.join("vendor/acme/pkg/src");
+        fs::create_dir_all(module_root.join("etc")).unwrap();
+        fs::create_dir_all(root.join("vendor/acme/pkg/dist")).unwrap();
+        fs::write(
+            module_root.join("registration.php"),
+            "<?php\nComponentRegistrar::register(ComponentRegistrar::MODULE, 'Acme_Pkg', __DIR__);\n\
+             ComponentRegistrar::register(ComponentRegistrar::LIBRARY, 'Acme_Pkg', __DIR__ . '/../dist');\n",
+        )
+        .unwrap();
+        fs::write(
+            module_root.join("etc/di.xml"),
+            r#"<?xml version="1.0"?><config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"></config>"#,
+        )
+        .unwrap();
+
+        let roots = super::registered_component_roots(&module_root);
+        assert!(roots.contains(&module_root));
+        assert!(roots.contains(&module_root.join("../dist")));
+
+        let global = super::find_di_xml_files(root, &FxHashMap::default());
+        assert!(global.contains(&module_root.join("etc/di.xml")));
     }
 
     #[test]
@@ -603,5 +716,69 @@ mod tests {
         assert_eq!(vendor_paths.len(), 2);
         assert_eq!(vendor_paths[0], &module_b.join("etc/di.xml"));
         assert_eq!(vendor_paths[1], &module_a.join("etc/di.xml"));
+    }
+
+    #[test]
+    fn test_find_di_xml_files_uses_config_php_order_wherever_the_module_lives() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let modules = [
+            ("app/code/Acme/Local", "Acme_Local"),
+            ("vendor/acme/module-other", "Acme_Other"),
+            ("vendor/magento/module-core", "Magento_Core"),
+        ];
+        let mut module_order = FxHashMap::default();
+        for (idx, (dir, name)) in modules.iter().enumerate() {
+            fs::create_dir_all(root.join(dir).join("etc")).unwrap();
+            fs::write(root.join(dir).join("etc/di.xml"), "<config/>").unwrap();
+            fs::write(
+                root.join(dir).join("etc/module.xml"),
+                format!(r#"<config><module name="{name}"/></config>"#),
+            )
+            .unwrap();
+            module_order.insert(name.to_string(), idx);
+        }
+        fs::create_dir_all(root.join("app/etc")).unwrap();
+        fs::write(root.join("app/etc/di.xml"), "<config/>").unwrap();
+
+        let paths = super::find_di_xml_files(root, &module_order);
+
+        assert_eq!(
+            paths,
+            vec![
+                root.join("app/etc/di.xml"),
+                root.join("app/code/Acme/Local/etc/di.xml"),
+                root.join("vendor/acme/module-other/etc/di.xml"),
+                root.join("vendor/magento/module-core/etc/di.xml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_di_xml_files_reads_app_etc_subfolders_after_app_etc_di_xml() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let empty = r#"<?xml version="1.0"?><config></config>"#;
+        for dir in ["app/etc", "app/etc/aaa", "app/etc/zzz", "app/etc/.hidden"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("di.xml"), empty).unwrap();
+        }
+        // Two levels deep is not matched by Magento's `*/di.xml`.
+        fs::create_dir_all(root.join("app/etc/aaa/deep")).unwrap();
+        fs::write(root.join("app/etc/aaa/deep/di.xml"), empty).unwrap();
+        // A folder without a di.xml is ignored.
+        fs::create_dir_all(root.join("app/etc/nothing")).unwrap();
+
+        let paths = super::find_di_xml_files(root, &FxHashMap::default());
+
+        // Same order as the glob `{di.xml,*/di.xml}` in FileResolver.
+        assert_eq!(
+            paths,
+            vec![
+                root.join("app/etc/di.xml"),
+                root.join("app/etc/aaa/di.xml"),
+                root.join("app/etc/zzz/di.xml"),
+            ]
+        );
     }
 }

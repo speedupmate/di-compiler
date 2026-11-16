@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+indexmap.workspace = true
 log.workspace = true
 quick-xml.workspace = true
 rustc-hash.workspace = true

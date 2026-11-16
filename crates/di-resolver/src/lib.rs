@@ -7,7 +7,7 @@ pub mod proxy;
 pub use arguments::{
     resolve_all_arguments, resolve_all_arguments_for_named_types, resolve_for_class,
 };
-pub use factory::{detect_factories, detect_factories_from_configs};
+pub use factory::{detect_factories, detect_factories_from_configs, detect_named_factories};
 pub use graph::{
     FactorySpec, InterceptorSpec, PluginRef, ProxySpec, ResolvedArg, ResolvedArgValue,
     ResolvedArrayItem, ResolvedArrayValue, ResolvedGraph, ResolvedScalar, ResolvedType,
@@ -15,4 +15,5 @@ pub use graph::{
 pub use interceptor::detect_interceptors;
 pub use proxy::{
     detect_proxies, detect_proxies_from_configs, detect_proxies_from_configs_with_existing,
+    proxy_targets_from_constructors,
 };

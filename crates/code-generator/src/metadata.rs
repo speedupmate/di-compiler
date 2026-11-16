@@ -255,6 +255,7 @@ pub(crate) fn render_scalar(val: &ResolvedScalar) -> String {
                 "false".to_string()
             }
         }
+        ResolvedScalar::PhpExpression(v) => v.clone(),
         ResolvedScalar::Number(v) => {
             if is_safe_php_numeric_literal(v) {
                 v.clone()
