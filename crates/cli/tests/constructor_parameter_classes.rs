@@ -129,6 +129,23 @@ fn factory_and_proxy_of_an_existing_class_compile() {
     assert_compiles(&output);
 }
 
+// Magento reads constructors once every scanned class has loaded, and PHP finds a loaded class
+// in any case. Magento's own `setup/` names `FileSystem\Directory\ReadFactory` this way.
+#[test]
+fn parameter_class_in_another_case_compiles_without_a_second_pass() {
+    let source =
+        thing("class Apparatus { public function __construct(\\Acme\\On\\MODEL\\Gadget $g) {} }");
+    let Some(output) = compile_with(&[("app/code/Acme/On/Model/Apparatus.php", &source)]) else {
+        return;
+    };
+    assert_compiles(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("passes when everything else has loaded"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn union_type_with_a_missing_class_compiles_because_magento_skips_unions() {
     let source = thing("class Thing { public function __construct(Gone|Gadget $either) {} }");
