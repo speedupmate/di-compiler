@@ -131,7 +131,7 @@ if (class_exists('Magento\\Framework\\App\\ObjectManager') && class_exists('Mage
 
 const CLASS_CHECK_HEAD_PHP: &str = r#"
 ini_set('display_errors', '0');
-[, $mode, $root, $generated, $validate] = $argv;
+[, $mode, $root, $generated, $validate, $classList] = $argv;
 $entries = [];
 foreach (file('php://stdin', FILE_IGNORE_NEW_LINES) as $line) {
     $entries[] = explode("\t", $line);
@@ -187,11 +187,37 @@ $readConstructor = static function (string $class) use ($reader): void {
 $validator = 'Magento\\Framework\\Code\\Validator\\ConstructorIntegrity';
 $validator = $validate === '1' && class_exists($validator) ? new $validator() : null;
 $setup = $root . '/setup/';
-$check = static function (string $class, string $file) use ($load, $readConstructor, $validator, $setup): void {
+// Magento reads constructors once every scanned class has loaded, and PHP finds a loaded class
+// in any case. A worker has loaded only its own block, so while it reads a constructor it loads
+// the scanned class that a name in another case points to.
+$anyCase = false;
+$byLowerName = null;
+spl_autoload_register(static function (string $class) use (&$anyCase, &$byLowerName, $classList): void {
+    if (!$anyCase) {
+        return;
+    }
+    if ($byLowerName === null) {
+        $byLowerName = [];
+        foreach (is_file($classList) ? file($classList, FILE_IGNORE_NEW_LINES) : [] as $line) {
+            [$name, $file] = explode("\t", $line, 2) + [1 => ''];
+            $byLowerName[strtolower($name)] = $file;
+        }
+    }
+    $file = $byLowerName[strtolower(ltrim($class, '\\'))] ?? '';
+    if ($file !== '') {
+        require_once $file;
+    }
+});
+$check = static function (string $class, string $file) use ($load, $readConstructor, $validator, $setup, &$anyCase): void {
     $load($class, $file);
-    $readConstructor($class);
-    if ($validator !== null && !str_starts_with($file, $setup)) {
-        $validator->validate($class);
+    $anyCase = true;
+    try {
+        $readConstructor($class);
+        if ($validator !== null && !str_starts_with($file, $setup)) {
+            $validator->validate($class);
+        }
+    } finally {
+        $anyCase = false;
     }
 };
 $describe = static function (\Throwable $e): string {
@@ -279,6 +305,11 @@ struct Failure {
     message: String,
 }
 
+/// Every scanned class and its file, for the workers. `stop_compile` removes it as well.
+pub(crate) fn class_list_path() -> PathBuf {
+    std::env::temp_dir().join(format!("fast-di-classes-{}.txt", std::process::id()))
+}
+
 pub(crate) struct ClassChecks {
     entries: Vec<ScannedFile>,
     shards: Vec<JoinHandle<Result<Vec<Failure>, String>>>,
@@ -286,6 +317,7 @@ pub(crate) struct ClassChecks {
     code_root: PathBuf,
     php_bin: String,
     validate: bool,
+    class_list: PathBuf,
 }
 
 fn entry_line(entry: &ScannedFile, failed: bool) -> String {
@@ -311,6 +343,16 @@ impl ClassChecks {
             entries.clear();
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let class_list = class_list_path();
+        let list: String = entries
+            .iter()
+            .filter(|e| !e.class.is_empty())
+            .map(|e| format!("{}\t{}\n", e.class, e.path.display()))
+            .collect();
+        // Without the list a worker only misses classes named in another case.
+        if let Err(e) = std::fs::write(&class_list, list) {
+            log::warn!("Could not write {}: {e}", class_list.display());
+        }
         // Neighbours share parents, so a block of neighbours loads fewer classes than a spread.
         let size = entries.len().div_ceil(jobs.max(1)).max(1);
         let mut shards = Vec::new();
@@ -320,8 +362,17 @@ impl ClassChecks {
             let root = root.to_path_buf();
             let code_root = code_root.to_path_buf();
             let php_bin = php_bin.to_string();
+            let class_list = class_list.clone();
             shards.push(std::thread::spawn(move || {
-                run_shard(&lines, offset, &root, &code_root, &php_bin, validate)
+                run_shard(
+                    &lines,
+                    offset,
+                    &root,
+                    &code_root,
+                    &php_bin,
+                    validate,
+                    &class_list,
+                )
             }));
         }
         Self {
@@ -331,11 +382,19 @@ impl ClassChecks {
             code_root: code_root.to_path_buf(),
             php_bin: php_bin.to_string(),
             validate,
+            class_list,
         }
     }
 
     /// Waits for the workers. The error is the message Magento stops with.
     pub(crate) fn finish(self) -> Result<(), String> {
+        let class_list = self.class_list.clone();
+        let result = self.wait();
+        let _ = std::fs::remove_file(&class_list);
+        result
+    }
+
+    fn wait(self) -> Result<(), String> {
         let mut failures = Vec::new();
         for shard in self.shards {
             failures.extend(
@@ -355,6 +414,7 @@ impl ClassChecks {
             &self.code_root,
             &self.php_bin,
             self.validate,
+            &self.class_list,
         )
     }
 }
@@ -371,6 +431,7 @@ fn run_php(
     code_root: &Path,
     php_bin: &str,
     validate: bool,
+    class_list: &Path,
 ) -> Result<Run, String> {
     let spawned = Command::new(php_bin)
         .args(["-d", "display_errors=0", "-r"])
@@ -381,6 +442,7 @@ fn run_php(
         .arg(root)
         .arg(code_root)
         .arg(if validate { "1" } else { "0" })
+        .arg(class_list)
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -418,6 +480,7 @@ fn run_shard(
     code_root: &Path,
     php_bin: &str,
     validate: bool,
+    class_list: &Path,
 ) -> Result<Vec<Failure>, String> {
     let mut failures = Vec::new();
     let mut start = 0;
@@ -429,6 +492,7 @@ fn run_shard(
             code_root,
             php_bin,
             validate,
+            class_list,
         )?;
         let Run::Rows(rows, code) = run else {
             return Ok(failures);
@@ -465,6 +529,7 @@ fn confirm(
     code_root: &Path,
     php_bin: &str,
     validate: bool,
+    class_list: &Path,
 ) -> Result<(), String> {
     let is_failed = |index: usize| failures.iter().any(|failure| failure.index == index);
     let mut order: Vec<usize> = (0..entries.len()).filter(|i| !is_failed(*i)).collect();
@@ -475,7 +540,9 @@ fn confirm(
         .enumerate()
         .map(|(position, index)| entry_line(&entries[*index], position >= passed))
         .collect();
-    let Run::Rows(rows, code) = run_php("confirm", &input, root, code_root, php_bin, validate)?
+    let Run::Rows(rows, code) = run_php(
+        "confirm", &input, root, code_root, php_bin, validate, class_list,
+    )?
     else {
         return Ok(());
     };

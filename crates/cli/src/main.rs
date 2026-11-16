@@ -510,9 +510,12 @@ fn stop_when_php_cannot_start(php_bin: &str, magento_root: &Path) {
     ));
 }
 
+fn worker_script_path() -> PathBuf {
+    std::env::temp_dir().join(format!("fast-di-worker-{}.php", std::process::id()))
+}
+
 fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) -> PathBuf {
-    let script_path =
-        std::env::temp_dir().join(format!("fast-di-worker-{}.php", std::process::id()));
+    let script_path = worker_script_path();
     std::fs::write(
         &script_path,
         WORKER_PHP.replace("// OBJECT MANAGER", class_checks::OBJECT_MANAGER_PHP),
@@ -1301,6 +1304,7 @@ fn main() {
             &all_fqcns_phase5,
         );
         log_phase_elapsed("Total", total_started);
+        let _ = std::fs::remove_file(&worker_script_path);
         return;
     }
 
@@ -2343,6 +2347,8 @@ fn stop_compile(message: &str) -> ! {
     if let Some(root) = METADATA_ROOT.get() {
         let _ = std::fs::remove_dir_all(root);
     }
+    let _ = std::fs::remove_file(worker_script_path());
+    let _ = std::fs::remove_file(class_checks::class_list_path());
     std::process::exit(1);
 }
 
