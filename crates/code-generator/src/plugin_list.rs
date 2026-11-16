@@ -333,8 +333,9 @@ fn inherit_plugins(
     plugin_methods_cache: &mut FxHashMap<String, IndexMap<String, u8>>,
 ) -> Option<Vec<PluginConfig>> {
     let type_name = normalize(type_name);
-    if let Some(existing) = inherited.get(&type_name) {
-        return existing.clone();
+    // `isset($inherited[$type])`: a null entry is visited again.
+    if let Some(Some(existing)) = inherited.get(&type_name) {
+        return Some(existing.clone());
     }
 
     let real_type = normalize(&di_config.get_instance_type(&type_name));
@@ -916,6 +917,37 @@ mod tests {
         assert!(!compiled.processed.contains_key("Foo\\Child_run___self"));
         let plugin = inherited_plugin(&compiled, "Foo\\Child", "x").unwrap();
         assert_eq!(plugin.instance, "Foo\\Plugin");
+    }
+
+    // `isset($inherited[$type])` is false for a null entry, so Magento visits such a type
+    // again. By then its parent may hold a disabled plugin in `$inherited`, which the type
+    // takes over on that second visit.
+    #[test]
+    fn a_type_without_plugins_is_visited_again_and_takes_a_disabled_parent_plugin() {
+        let mut class_map = FxHashMap::default();
+        for (fqcn, extends) in [
+            ("A\\Leaf", Some("C\\Mid")),
+            ("B\\Child", Some("A\\Leaf")),
+            ("C\\Mid", Some("D\\Base")),
+            ("D\\Base", None),
+        ] {
+            class_map.insert(fqcn.to_string(), class_info(fqcn, extends, &[], &["run"]));
+        }
+        let mut di = DiConfig::default();
+        di.plugins.insert(
+            "D\\Base".to_string(),
+            vec![plugin("x", "Foo\\Plugin", 10, true)],
+        );
+        let classes: Vec<String> = class_map.keys().cloned().collect();
+
+        let compiled = compile_scope_plugin_list(&di, &di, &class_map, &classes, &[]);
+
+        // Leaf: first visit through its own name while Mid was not built yet, so null.
+        // Child visits Leaf again, now Mid holds the disabled plugin and Leaf takes it.
+        let leaf = inherited_plugin(&compiled, "A\\Leaf", "x").expect("Leaf holds x");
+        assert!(leaf.is_disabled());
+        assert_eq!(compiled.inherited.get("B\\Child"), Some(&None));
+        assert!(compiled.processed.is_empty());
     }
 
     fn section_keys<V>(section: &IndexMap<String, V>) -> Vec<&str> {
