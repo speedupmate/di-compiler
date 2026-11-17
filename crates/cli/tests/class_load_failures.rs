@@ -272,9 +272,14 @@ const ERROR_HANDLER: &str =
      if (($number & error_reporting()) === 0) {\n            return false;\n        }\n        \
      throw new \\Exception($text . ' in ' . $file);\n    }\n}\n";
 
+// Magento's `app/bootstrap.php` reports every error, whatever the `php.ini` of the host says.
+const BOOTSTRAP: &str =
+    "<?php\nerror_reporting(E_ALL);\nrequire dirname(__DIR__) . '/vendor/autoload.php';\n";
+
 #[test]
 fn warning_while_a_class_file_loads_stops_the_compile_as_bin_magento_turns_it_into_an_exception() {
     let Some(output) = compile_with(&[
+        ("app/bootstrap.php", BOOTSTRAP),
         (
             "app/code/Magento/Framework/App/ErrorHandler.php",
             ERROR_HANDLER,
@@ -294,6 +299,7 @@ fn warning_while_a_class_file_loads_stops_the_compile_as_bin_magento_turns_it_in
 #[test]
 fn deprecation_while_a_class_file_compiles_stops_the_compile() {
     let Some(output) = compile_with(&[
+        ("app/bootstrap.php", BOOTSTRAP),
         (
             "app/code/Magento/Framework/App/ErrorHandler.php",
             ERROR_HANDLER,
@@ -311,6 +317,7 @@ fn deprecation_while_a_class_file_compiles_stops_the_compile() {
 #[test]
 fn suppressed_warning_in_a_class_file_compiles() {
     let Some(output) = compile_with(&[
+        ("app/bootstrap.php", BOOTSTRAP),
         (
             "app/code/Magento/Framework/App/ErrorHandler.php",
             ERROR_HANDLER,
