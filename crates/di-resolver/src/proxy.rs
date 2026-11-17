@@ -4,6 +4,7 @@
 //!   1. di.xml `<preference type="...\Proxy" />`
 //!   2. di.xml `<argument|item xsi:type="object">...\Proxy</...>`
 //!   3. di.xml `<virtualType type="...\Proxy" />`
+//!   4. constructor type hints, which `ClassReader::getConstructor()` reflects
 //!
 //! A proxy is generated only when:
 //!   - proxy class does not already exist
@@ -13,6 +14,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use php_extractor::{types::ClassKind, ClassInfo};
 
+use crate::factory::first_non_null_type_hint_arm;
 use crate::graph::ProxySpec;
 use di_xml_reader::{Argument, DiConfig};
 
@@ -30,16 +32,18 @@ pub fn detect_proxies_from_configs(
     class_map: &FxHashMap<String, ClassInfo>,
     scanner_di_configs: &[DiConfig],
 ) -> Vec<ProxySpec> {
-    let extra_existing_types = FxHashSet::default();
-    detect_proxies_from_configs_with_existing(class_map, scanner_di_configs, &extra_existing_types)
+    let none = FxHashSet::default();
+    detect_proxies_from_configs_with_existing(class_map, scanner_di_configs, &none, &none)
 }
 
 /// Detect proxies with an explicit set of additional loadable class/interface
-/// names that are not present in `class_map` (e.g. Composer-only libraries).
+/// names that are not present in `class_map` (e.g. Composer-only libraries), and
+/// additional proxy names that compile asks for.
 pub fn detect_proxies_from_configs_with_existing(
     class_map: &FxHashMap<String, ClassInfo>,
     scanner_di_configs: &[DiConfig],
     extra_existing_types: &FxHashSet<String>,
+    extra_candidates: &FxHashSet<String>,
 ) -> Vec<ProxySpec> {
     let mut specs: Vec<ProxySpec> = Vec::new();
     let mut seen: FxHashSet<String> = FxHashSet::default();
@@ -96,8 +100,35 @@ pub fn detect_proxies_from_configs_with_existing(
         }
     }
 
+    // Path 4: constructor type hints
+    for hint in constructor_type_hints(class_map) {
+        if let Some(candidate) = first_non_null_type_hint_arm(hint) {
+            emit(candidate);
+        }
+    }
+
+    for candidate in extra_candidates {
+        emit(candidate.clone());
+    }
+
     specs.sort_by(|a, b| a.proxy_fqcn.cmp(&b.proxy_fqcn));
     specs
+}
+
+fn constructor_type_hints(class_map: &FxHashMap<String, ClassInfo>) -> impl Iterator<Item = &str> {
+    class_map
+        .values()
+        .filter_map(|info| info.constructor.as_ref())
+        .flat_map(|ctor| &ctor.params)
+        .filter_map(|param| param.type_hint.as_deref())
+}
+
+/// The class names behind proxy type hints in constructors.
+pub fn proxy_targets_from_constructors(class_map: &FxHashMap<String, ClassInfo>) -> Vec<String> {
+    constructor_type_hints(class_map)
+        .filter_map(first_non_null_type_hint_arm)
+        .filter_map(|hint| hint.strip_suffix("\\Proxy").map(str::to_string))
+        .collect()
 }
 
 fn collect_proxy_candidates_from_args(args: &[Argument], out: &mut Vec<String>) {
@@ -130,7 +161,7 @@ fn class_or_interface_exists(
 mod tests {
     use super::*;
     use di_xml_reader::{Argument, DiConfig, TypeConfig, VirtualType};
-    use php_extractor::types::{ClassInfo, ClassKind, Constructor};
+    use php_extractor::types::{ClassInfo, ClassKind, Constructor, ConstructorParam};
     use std::path::PathBuf;
 
     fn make_class(fqcn: &str, kind: ClassKind) -> ClassInfo {
@@ -152,6 +183,7 @@ mod tests {
             is_abstract: false,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 
@@ -355,9 +387,75 @@ mod tests {
         let mut extra = FxHashSet::default();
         extra.insert("Psr\\Log\\LoggerInterface".to_string());
 
-        let specs = detect_proxies_from_configs_with_existing(&class_map, &[di_config], &extra);
+        let specs = detect_proxies_from_configs_with_existing(
+            &class_map,
+            &[di_config],
+            &extra,
+            &FxHashSet::default(),
+        );
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].proxy_fqcn, "Psr\\Log\\LoggerInterface\\Proxy");
         assert_eq!(specs[0].target_fqcn, "Psr\\Log\\LoggerInterface");
+    }
+
+    fn class_with_ctor_hint(fqcn: &str, hint: &str) -> ClassInfo {
+        let mut info = make_class(fqcn, ClassKind::Class);
+        info.constructor = Some(Constructor {
+            params: vec![ConstructorParam {
+                name: "dep".to_string(),
+                type_hint: Some(hint.to_string()),
+                is_optional: false,
+                default_value: None,
+                is_primitive: false,
+                is_variadic: false,
+                is_promoted: false,
+            }],
+        });
+        info
+    }
+
+    #[test]
+    fn test_proxy_from_constructor_type() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Foo\\Baz".to_string(),
+            make_class("Foo\\Baz", ClassKind::Class),
+        );
+        class_map.insert(
+            "Foo\\Service".to_string(),
+            class_with_ctor_hint("Foo\\Service", "?Foo\\Baz\\Proxy"),
+        );
+        let specs = detect_proxies(&class_map, &DiConfig::default());
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].proxy_fqcn, "Foo\\Baz\\Proxy");
+    }
+
+    #[test]
+    fn test_proxy_from_constructor_type_needs_its_target() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Foo\\Service".to_string(),
+            class_with_ctor_hint("Foo\\Service", "Foo\\Gone\\Proxy"),
+        );
+        assert!(detect_proxies(&class_map, &DiConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn test_proxy_from_extra_candidate() {
+        let mut class_map = FxHashMap::default();
+        class_map.insert(
+            "Foo\\Baz".to_string(),
+            make_class("Foo\\Baz", ClassKind::Class),
+        );
+        let mut candidates = FxHashSet::default();
+        candidates.insert("Foo\\Baz\\Proxy".to_string());
+        let specs = detect_proxies_from_configs_with_existing(
+            &class_map,
+            &[],
+            &FxHashSet::default(),
+            &candidates,
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].proxy_fqcn, "Foo\\Baz\\Proxy");
     }
 }

@@ -23,7 +23,10 @@ pub use extension::{
 pub use factory::{factory_path, generate_factory};
 pub use interceptor::{generate_interceptor, interceptor_path};
 pub use metadata::{serialize_arguments_php, serialize_interception_php};
-pub use plugin_list::{compile_plugin_list, generate_plugin_list_php, serialize_plugin_list_php};
+pub use plugin_list::{
+    compile_plugin_list, compile_scope_plugin_list, generate_plugin_list_php,
+    serialize_plugin_list_php, PluginListMetadata,
+};
 pub use proxy::{generate_proxy, proxy_path};
 pub use proxy_deferred::{generate_proxy_deferred, proxy_deferred_path};
 pub use search_results::{generate_search_results, search_results_path};
@@ -40,6 +43,9 @@ pub fn render_php_default(default_value: &str) -> std::borrow::Cow<'_, str> {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
             return std::borrow::Cow::Owned(json_value_to_php_literal(&v));
         }
+    }
+    if let Some(expr) = default_value.strip_prefix("__php__:") {
+        return std::borrow::Cow::Borrowed(expr);
     }
     std::borrow::Cow::Borrowed(default_value)
 }

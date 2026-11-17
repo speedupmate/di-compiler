@@ -1,14 +1,19 @@
 use std::path::Path;
 
-use crate::lexer::Lexer;
+use crate::lexer::{Lexer, ScanFacts};
 use crate::tier2::extract_tier2;
 use crate::tier3::extract_tier3;
 use crate::types::{ExtractResult, LexError};
 
 /// Try Tier 1 → Tier 2 → Tier 3 extraction.
 pub fn extract_file(path: &Path) -> ExtractResult {
-    match Lexer::extract(path) {
-        Ok(info) => ExtractResult::Ok(info),
+    extract_file_with_class_check(path).0
+}
+
+/// Like [`extract_file`], and also says what Tier 1 saw around the class declaration.
+pub fn extract_file_with_class_check(path: &Path) -> (ExtractResult, ScanFacts) {
+    let result = match Lexer::extract_with_facts(path) {
+        Ok((info, facts)) => return (ExtractResult::Ok(info), facts),
         Err(LexError::Io(e)) => ExtractResult::PhpFallbackFailed(format!("IO: {e}")),
         Err(LexError::Unsupported(ref reason)) if reason == "no_class" => ExtractResult::NoClass,
         Err(LexError::Unsupported(ref reason)) if reason == "enum" => ExtractResult::NoClass,
@@ -32,5 +37,6 @@ pub fn extract_file(path: &Path) -> ExtractResult {
                 }
             }
         }
-    }
+    };
+    (result, ScanFacts::default())
 }

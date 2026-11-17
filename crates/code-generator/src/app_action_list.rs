@@ -28,9 +28,39 @@ fn collect_action_entries(class_map: &FxHashMap<String, ClassInfo>) -> BTreeMap<
         if is_framework_library_class(&info.path) {
             continue;
         }
-        out.insert(fqcn.to_ascii_lowercase(), fqcn.clone());
+        out.insert(
+            fqcn.to_ascii_lowercase(),
+            spelled_as_on_disk(fqcn, &info.path),
+        );
     }
     out
+}
+
+/// `Dir\Reader::getActionFiles()` builds the class name from the file path, so the value has the
+/// spelling of the disk. `ActionList` loads the class by that name, and on a case-sensitive file
+/// system the autoloader only finds that spelling.
+fn spelled_as_on_disk(fqcn: &str, path: &std::path::Path) -> String {
+    let mut on_disk: Vec<String> = Vec::new();
+    if let Some(stem) = path.file_stem() {
+        on_disk.push(stem.to_string_lossy().to_string());
+    }
+    let folders = path
+        .parent()
+        .into_iter()
+        .flat_map(|folder| folder.components().rev());
+    on_disk.extend(folders.map(|part| part.as_os_str().to_string_lossy().to_string()));
+    let mut parts: Vec<String> = fqcn.split('\\').map(str::to_string).collect();
+    for (part, disk) in parts.iter_mut().rev().zip(on_disk) {
+        if !part.eq_ignore_ascii_case(&disk) {
+            break;
+        }
+        let stop = disk.eq_ignore_ascii_case("Controller");
+        *part = disk;
+        if stop {
+            break;
+        }
+    }
+    parts.join("\\")
 }
 
 fn is_controller_file_path(path: &std::path::Path) -> bool {
@@ -66,6 +96,23 @@ mod tests {
     use php_extractor::types::{ClassInfo, ClassKind};
     use std::path::PathBuf;
 
+    #[test]
+    fn value_has_the_spelling_of_the_file_on_disk() {
+        let mut classes = FxHashMap::default();
+        classes.insert(
+            "Acme\\On\\Controller\\Main\\Index".to_string(),
+            class_info(
+                "Acme\\On\\Controller\\Main\\Index",
+                "/store/vendor/acme/on/Controller/Main/index.php",
+            ),
+        );
+        let entries = collect_action_entries(&classes);
+        assert_eq!(
+            entries["acme\\on\\controller\\main\\index"],
+            "Acme\\On\\Controller\\Main\\index"
+        );
+    }
+
     fn class_info(fqcn: &str, path: &str) -> ClassInfo {
         let parts: Vec<&str> = fqcn.rsplitn(2, '\\').collect();
         let (name, namespace) = if parts.len() == 2 {
@@ -85,6 +132,7 @@ mod tests {
             is_abstract: false,
             is_final: false,
             public_methods: vec![],
+            traits: Default::default(),
         }
     }
 

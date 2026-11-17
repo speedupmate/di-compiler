@@ -7,15 +7,71 @@ use std::path::Path;
 
 use crate::types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, LexError, MethodParam, MethodSignature,
+    TraitData, TraitMethod, TraitRule,
 };
 
 pub struct Lexer;
 
+/// What the scan of a class file saw around the class declaration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanFacts {
+    /// A `class_exists()` or sibling comes before the declaration.
+    pub class_check: bool,
+    /// The declaration is inside a block, such as `if`. A braced namespace does not count.
+    /// `FileClassScanner::extract()` does not see such a class.
+    pub inside_block: bool,
+}
+
 impl Lexer {
     pub fn extract(path: &Path) -> Result<ClassInfo, LexError> {
+        Self::extract_with_class_check(path).map(|(info, _)| info)
+    }
+
+    /// Also says whether the file calls `class_exists()` or a sibling before the
+    /// class declaration. Such a file only gives a final answer when PHP runs it.
+    pub fn extract_with_class_check(path: &Path) -> Result<(ClassInfo, bool), LexError> {
+        Self::extract_with_facts(path).map(|(info, facts)| (info, facts.class_check))
+    }
+
+    /// Also says what the scan of the file saw around the class declaration.
+    pub fn extract_with_facts(path: &Path) -> Result<(ClassInfo, ScanFacts), LexError> {
         let bytes = std::fs::read(path)?;
         let mut s = Scanner::new(&bytes);
+        let info = s.extract_class(path)?;
+        let facts = ScanFacts {
+            class_check: s.class_check_seen,
+            inside_block: s.block_depth > 0,
+        };
+        Ok((info, facts))
+    }
+
+    /// Reads the declaration on a 1-based line, for a file that declares a class
+    /// more than once and where PHP said which declaration it took.
+    pub fn extract_declared_at(path: &Path, line: usize) -> Result<ClassInfo, LexError> {
+        let bytes = std::fs::read(path)?;
+        let mut s = Scanner::new(&bytes);
+        s.declaration_from = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .nth(line.saturating_sub(2))
+            .map_or(0, |(at, _)| at + 1);
         s.extract_class(path)
+    }
+
+    /// Reads the text of one trait `use` statement, for the tree-sitter tier.
+    pub(crate) fn read_trait_use_text(
+        text: &str,
+        namespace: &str,
+        use_map: &rustc_hash::FxHashMap<String, String>,
+        traits: &mut TraitData,
+    ) -> Result<(), LexError> {
+        let mut s = Scanner::new(text.as_bytes());
+        s.namespace = namespace.to_string();
+        s.use_map = use_map.clone();
+        s.skip_noise();
+        s.read_word();
+        s.read_trait_use(traits)
     }
 }
 
@@ -26,6 +82,12 @@ struct Scanner<'a> {
     namespace: String,
     /// File-level `use` imports: short alias → fully-qualified class name.
     use_map: rustc_hash::FxHashMap<String, String>,
+    /// A `class_exists()` or sibling was seen before the class declaration.
+    class_check_seen: bool,
+    /// Class declarations before this byte offset are skipped.
+    declaration_from: usize,
+    /// Open braces before the class declaration, not counting a braced namespace.
+    block_depth: u32,
 }
 
 impl<'a> Scanner<'a> {
@@ -35,6 +97,9 @@ impl<'a> Scanner<'a> {
             pos: 0,
             namespace: String::new(),
             use_map: rustc_hash::FxHashMap::default(),
+            class_check_seen: false,
+            declaration_from: 0,
+            block_depth: 0,
         }
     }
 
@@ -105,10 +170,13 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Stops right after the closing label, so the caller still sees what ends the statement.
+    /// The label may be indented, and any character that cannot be part of a name ends it.
     fn skip_heredoc(&mut self) {
         self.skip_ws();
-        let nowdoc = self.peek() == b'\'';
-        if nowdoc {
+        let quote = self.peek();
+        let quoted = quote == b'\'' || quote == b'"';
+        if quoted {
             self.advance(1);
         }
         let label_start = self.pos;
@@ -116,7 +184,7 @@ impl<'a> Scanner<'a> {
             self.advance(1);
         }
         let label = self.src[label_start..self.pos].to_vec();
-        if nowdoc && self.peek() == b'\'' {
+        if quoted && self.peek() == quote {
             self.advance(1);
         }
         while !self.is_eof() && self.peek() != b'\n' {
@@ -126,21 +194,16 @@ impl<'a> Scanner<'a> {
             if self.is_eof() {
                 return;
             }
-            if self.peek() == b'\n' {
+            // At the newline before the next line.
+            self.advance(1);
+            while self.peek() == b' ' || self.peek() == b'\t' {
                 self.advance(1);
             }
-            if self.src.len() >= self.pos + label.len() {
-                let candidate = &self.src[self.pos..self.pos + label.len()];
-                if candidate == label.as_slice() {
-                    let after = self.pos + label.len();
-                    let next = self.src.get(after).copied().unwrap_or(0);
-                    if next == b';' || next == b'\n' || next == b'\r' || next == 0 {
-                        self.advance(label.len());
-                        if self.peek() == b';' {
-                            self.advance(1);
-                        }
-                        return;
-                    }
+            if self.src[self.pos..].starts_with(&label) {
+                let next = self.at(label.len());
+                if !is_ident_char(next) {
+                    self.advance(label.len());
+                    return;
                 }
             }
             while !self.is_eof() && self.peek() != b'\n' {
@@ -224,11 +287,28 @@ impl<'a> Scanner<'a> {
             }
             let b = self.peek();
             if !is_word_start(b) {
+                match b {
+                    b'{' => self.block_depth += 1,
+                    b'}' => self.block_depth = self.block_depth.saturating_sub(1),
+                    _ => {}
+                }
                 self.advance(1);
                 continue;
             }
             let word = self.read_word();
-            match word {
+            if is_class_check(word) {
+                self.class_check_seen = true;
+            }
+            let is_import =
+                word.eq_ignore_ascii_case(b"namespace") || word.eq_ignore_ascii_case(b"use");
+            if !is_import
+                && (self.pos <= self.declaration_from
+                    || self.follows_double_colon(self.pos - word.len()))
+            {
+                // `Foo::class` is a constant, not a declaration.
+                continue;
+            }
+            match word.to_ascii_lowercase().as_slice() {
                 b"namespace" => {
                     namespace = self.read_namespace_decl()?;
                     self.namespace = namespace.clone();
@@ -298,7 +378,11 @@ impl<'a> Scanner<'a> {
                     break;
                 }
                 b"enum" => {
-                    return Err(LexError::Unsupported("enum".into()));
+                    // `enum` is a keyword only in front of a name. `Enum` can also be a type.
+                    self.skip_noise();
+                    if is_word_start(self.peek()) {
+                        return Err(LexError::Unsupported("enum".into()));
+                    }
                 }
                 _ => {}
             }
@@ -315,7 +399,8 @@ impl<'a> Scanner<'a> {
             format!("{}\\{}", namespace, name)
         };
 
-        let (constructor, public_methods) = self.parse_class_body()?;
+        let (constructor, public_methods, traits) =
+            self.parse_class_body(matches!(kind, ClassKind::Trait))?;
 
         Ok(ClassInfo {
             path: path.to_path_buf(),
@@ -329,7 +414,12 @@ impl<'a> Scanner<'a> {
             is_abstract,
             is_final,
             public_methods,
+            traits: Box::new(traits),
         })
+    }
+
+    fn follows_double_colon(&self, at: usize) -> bool {
+        self.src[..at].trim_ascii_end().ends_with(b"::")
     }
 
     fn find_php_open_tag(&mut self) {
@@ -386,7 +476,7 @@ impl<'a> Scanner<'a> {
         let saved = self.pos;
         if is_word_start(self.peek()) {
             let w = self.read_word();
-            if w == b"function" || w == b"const" {
+            if w.eq_ignore_ascii_case(b"function") || w.eq_ignore_ascii_case(b"const") {
                 self.skip_to_semicolon();
                 return;
             }
@@ -479,7 +569,7 @@ impl<'a> Scanner<'a> {
             return None;
         }
         let w = self.read_word();
-        if w == b"as" {
+        if w.eq_ignore_ascii_case(b"as") {
             self.skip_noise();
             if is_word_start(self.peek()) {
                 let alias = self.read_word();
@@ -504,7 +594,7 @@ impl<'a> Scanner<'a> {
     fn resolve_type(&self, raw: &str) -> String {
         // Primitives stay as-is — they are never FQCNs.
         if is_primitive_type(raw) {
-            return raw.to_string();
+            return raw.to_ascii_lowercase();
         }
         // The first segment determines whether there's a use-import match.
         let first = raw.split('\\').next().unwrap_or(raw);
@@ -551,7 +641,7 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             let word = self.read_word();
-            match word {
+            match word.to_ascii_lowercase().as_slice() {
                 b"extends" => {
                     let fqn = self.read_fqn()?;
                     if extends.is_none() {
@@ -623,11 +713,111 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
+    /// `use A, B;` or `use A, B { A::run insteadof B; B::run as walk; }`. The keyword is read.
+    fn read_trait_use(&mut self, traits: &mut TraitData) -> Result<(), LexError> {
+        self.read_fqn_list(&mut traits.uses)?;
+        self.skip_noise();
+        if self.peek() != b'{' {
+            self.skip_to_semicolon();
+            return Ok(());
+        }
+        self.advance(1);
+        loop {
+            self.skip_noise();
+            if self.is_eof() {
+                return Err(LexError::UnexpectedEof);
+            }
+            match self.peek() {
+                b'}' => {
+                    self.advance(1);
+                    return Ok(());
+                }
+                b';' => self.advance(1),
+                _ => self.read_trait_rule(traits)?,
+            }
+        }
+    }
+
+    fn read_trait_rule(&mut self, traits: &mut TraitData) -> Result<(), LexError> {
+        let absolute = self.peek() == b'\\';
+        let mut name = String::new();
+        loop {
+            let b = self.peek();
+            if is_word_char(b) {
+                name.push_str(std::str::from_utf8(self.read_word()).unwrap_or(""));
+            } else if b == b'\\' {
+                name.push('\\');
+                self.advance(1);
+            } else {
+                break;
+            }
+        }
+        self.skip_noise();
+        let (trait_name, method) = if self.peek() == b':' && self.at(1) == b':' {
+            self.advance(2);
+            self.skip_noise();
+            let method = std::str::from_utf8(self.read_word())
+                .unwrap_or("")
+                .to_string();
+            let name = name.trim_start_matches('\\');
+            let trait_name = if absolute {
+                name.to_string()
+            } else {
+                self.resolve_type(name)
+            };
+            (Some(trait_name), method)
+        } else {
+            (None, name)
+        };
+
+        self.skip_noise();
+        if !is_word_start(self.peek()) {
+            return Err(LexError::Unsupported("trait_rule".into()));
+        }
+        let keyword = self.read_word();
+        if keyword.eq_ignore_ascii_case(b"insteadof") {
+            let mut excluded = Vec::new();
+            self.read_fqn_list(&mut excluded)?;
+            traits.rules.push(TraitRule::InsteadOf { method, excluded });
+            return Ok(());
+        }
+        if !keyword.eq_ignore_ascii_case(b"as") {
+            return Err(LexError::Unsupported("trait_rule".into()));
+        }
+
+        let mut alias = None;
+        let mut is_public = None;
+        let mut is_final = false;
+        loop {
+            self.skip_noise();
+            if !is_word_start(self.peek()) {
+                break;
+            }
+            let word = self.read_word();
+            match word.to_ascii_lowercase().as_slice() {
+                b"public" if alias.is_none() => is_public = Some(true),
+                b"protected" | b"private" if alias.is_none() => is_public = Some(false),
+                b"final" if alias.is_none() => is_final = true,
+                _ => alias = Some(std::str::from_utf8(word).unwrap_or("").to_string()),
+            }
+        }
+        traits.rules.push(TraitRule::Alias {
+            trait_name,
+            method,
+            alias,
+            is_public,
+            is_final,
+        });
+        Ok(())
+    }
+
     fn parse_class_body(
         &mut self,
-    ) -> Result<(Option<Constructor>, Vec<MethodSignature>), LexError> {
+        is_trait: bool,
+    ) -> Result<(Option<Constructor>, Vec<MethodSignature>, TraitData), LexError> {
         let mut constructor: Option<Constructor> = None;
         let mut public_methods: Vec<MethodSignature> = Vec::new();
+        let mut traits = TraitData::default();
         let mut depth: u32 = 1;
 
         loop {
@@ -703,13 +893,18 @@ impl<'a> Scanner<'a> {
 
             let mut is_abstract_method = false;
             let mut is_final_method = false;
-            let mut is_public = false;
+            // A method without a visibility keyword is public.
+            let mut is_public = true;
             let mut is_static = false;
             let mut saw_function = false;
 
             let first_word = self.read_word();
+            if first_word.eq_ignore_ascii_case(b"use") {
+                self.read_trait_use(&mut traits)?;
+                continue;
+            }
             let is_modifier = matches!(
-                first_word,
+                first_word.to_ascii_lowercase().as_slice(),
                 b"abstract"
                     | b"final"
                     | b"public"
@@ -726,11 +921,11 @@ impl<'a> Scanner<'a> {
 
             let mut current = first_word;
             loop {
-                match current {
+                match current.to_ascii_lowercase().as_slice() {
                     b"abstract" => is_abstract_method = true,
                     b"final" => is_final_method = true,
-                    b"public" => is_public = true,
-                    b"private" | b"protected" => {}
+                    b"public" => {}
+                    b"private" | b"protected" => is_public = false,
                     b"static" => is_static = true,
                     b"readonly" => {}
                     b"function" => {
@@ -775,9 +970,12 @@ impl<'a> Scanner<'a> {
             }
             self.advance(1);
 
-            if method_name == "__construct" {
+            if method_name.eq_ignore_ascii_case("__construct") {
                 let params = self.parse_param_list()?;
-                constructor = Some(Constructor { params });
+                // An abstract constructor in a trait only asks for one. It is not one.
+                if !(is_trait && is_abstract_method) {
+                    constructor = Some(Constructor { params });
+                }
                 self.skip_noise();
                 if self.peek() == b':' {
                     self.advance(1);
@@ -785,7 +983,7 @@ impl<'a> Scanner<'a> {
                     self.skip_type_hint()?;
                 }
                 self.skip_method_body_braces(&mut depth);
-            } else if is_public && !is_final_method {
+            } else if is_trait || (is_public && !is_final_method) {
                 let params = self.parse_method_params()?;
                 self.skip_noise();
                 let return_type = if self.peek() == b':' {
@@ -796,15 +994,28 @@ impl<'a> Scanner<'a> {
                     None
                 };
                 self.skip_method_body_braces(&mut depth);
-                let _ = is_abstract_method;
-                public_methods.push(MethodSignature {
+                let signature = MethodSignature {
                     name: method_name,
                     params,
                     return_type,
                     is_static,
                     returns_reference,
-                });
+                };
+                if is_trait {
+                    traits.methods.push(TraitMethod {
+                        signature: signature.clone(),
+                        is_public,
+                        is_final: is_final_method,
+                        is_abstract: is_abstract_method,
+                    });
+                }
+                if is_public && !is_final_method {
+                    public_methods.push(signature);
+                } else {
+                    traits.hidden_methods.push(signature.name);
+                }
             } else {
+                traits.hidden_methods.push(method_name);
                 self.skip_to_matching_paren();
                 self.skip_noise();
                 if self.peek() == b':' {
@@ -816,7 +1027,7 @@ impl<'a> Scanner<'a> {
             }
         }
 
-        Ok((constructor, public_methods))
+        Ok((constructor, public_methods, traits))
     }
 
     fn skip_to_stmt_end(&mut self, depth: &mut u32) {
@@ -905,30 +1116,30 @@ impl<'a> Scanner<'a> {
         Ok(params)
     }
 
-    fn parse_one_ctor_param(&mut self) -> Result<Option<ConstructorParam>, LexError> {
-        self.skip_noise();
-        let mut is_promoted = false;
-        let mut is_readonly = false;
-
-        if is_word_start(self.peek()) {
+    /// Skips promotion modifiers, which PHP accepts in any order and any case.
+    /// Returns whether there was at least one. `Private\Foo` is a type, not a modifier.
+    fn skip_param_modifiers(&mut self) -> bool {
+        let mut found = false;
+        loop {
+            self.skip_noise();
+            if !is_word_start(self.peek()) {
+                return found;
+            }
             let saved = self.pos;
             let word = self.read_word();
-            match word {
-                b"public" | b"private" | b"protected" => {
-                    is_promoted = true;
-                    self.skip_noise();
-                    if self.peek_word_eq(b"readonly") {
-                        self.read_word();
-                        is_readonly = true;
-                    }
-                }
-                word if word.eq_ignore_ascii_case(b"readonly") => {
-                    is_readonly = true;
-                }
-                _ => self.pos = saved,
+            let is_modifier = [&b"public"[..], b"private", b"protected", b"readonly"]
+                .iter()
+                .any(|modifier| word.eq_ignore_ascii_case(modifier));
+            if !is_modifier || self.peek() == b'\\' {
+                self.pos = saved;
+                return found;
             }
+            found = true;
         }
-        let _ = is_readonly;
+    }
+
+    fn parse_one_ctor_param(&mut self) -> Result<Option<ConstructorParam>, LexError> {
+        let is_promoted = self.skip_param_modifiers();
 
         let type_hint = self.try_read_type_hint()?;
 
@@ -981,15 +1192,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn parse_one_method_param(&mut self) -> Result<Option<MethodParam>, LexError> {
-        self.skip_noise();
-        if is_word_start(self.peek()) {
-            let saved = self.pos;
-            let word = self.read_word();
-            match word {
-                b"public" | b"private" | b"protected" | b"readonly" => {}
-                _ => self.pos = saved,
-            }
-        }
+        self.skip_param_modifiers();
         let type_hint = self.try_read_type_hint()?;
 
         self.skip_noise();
@@ -1146,6 +1349,10 @@ impl<'a> Scanner<'a> {
                     self.advance(1);
                     self.skip_dq_string();
                 }
+                b'<' if self.at(1) == b'<' && self.at(2) == b'<' => {
+                    self.advance(3);
+                    self.skip_heredoc();
+                }
                 b'/' if self.at(1) == b'/' => {
                     // Line comment ends the meaningful part of the default value.
                     // Break here leaving pos at `//`; the outer loop's skip_noise handles it.
@@ -1200,6 +1407,10 @@ impl<'a> Scanner<'a> {
                 b'"' => {
                     self.advance(1);
                     self.skip_dq_string();
+                }
+                b'<' if self.at(1) == b'<' && self.at(2) == b'<' => {
+                    self.advance(3);
+                    self.skip_heredoc();
                 }
                 b'(' | b'[' => {
                     depth += 1;
@@ -1319,6 +1530,17 @@ impl<'a> Scanner<'a> {
     }
 }
 
+fn is_class_check(word: &[u8]) -> bool {
+    [
+        &b"class_exists"[..],
+        b"interface_exists",
+        b"trait_exists",
+        b"enum_exists",
+    ]
+    .iter()
+    .any(|check| word.eq_ignore_ascii_case(check))
+}
+
 fn is_word_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
@@ -1339,16 +1561,18 @@ fn is_primitive_type(t: &str) -> bool {
     is_primitive_base(t)
 }
 
+/// PHP reads a reserved type name in any case. `integer`, `double` and `boolean` are not reserved,
+/// so `Boolean` can be a class. Those three keep their exact spelling here.
 fn is_primitive_base(t: &str) -> bool {
+    if matches!(t, "integer" | "double" | "boolean") {
+        return true;
+    }
     matches!(
-        t,
+        t.to_ascii_lowercase().as_str(),
         "int"
-            | "integer"
             | "float"
-            | "double"
             | "string"
             | "bool"
-            | "boolean"
             | "array"
             | "callable"
             | "iterable"
@@ -1370,6 +1594,91 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn temp_php(php: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(php.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn test_reserved_type_names_are_builtin_in_any_case() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Baz\n{\n    public function __construct(Array $a, OBJECT $b, ?String $c, Int|Null $d, Boolean $e) {}\n}\n",
+        )
+        .unwrap();
+        let hints: Vec<_> = info
+            .constructor
+            .unwrap()
+            .params
+            .iter()
+            .map(|param| (param.type_hint.clone().unwrap(), param.is_primitive))
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                ("array".to_string(), true),
+                ("object".to_string(), true),
+                ("?string".to_string(), true),
+                ("int|null".to_string(), true),
+                ("Foo\\Boolean".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_class_constant_before_the_declaration_does_not_hide_the_class() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nuse Bar\\DepFactory as Dep;\nif (class_exists(Dep::class)):\n    class Baz\n    {\n        public function __construct(Dep $dep) {}\n    }\nendif;\n",
+        )
+        .unwrap();
+        assert_eq!(info.fqcn, "Foo\\Baz");
+        let ctor = info.constructor.unwrap();
+        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Bar\\DepFactory"));
+    }
+
+    #[test]
+    fn test_anonymous_class_before_the_declaration_still_stops_the_scan() {
+        assert!(extract_str("<?php\n$x = new class {};\nclass Foo {}\n").is_err());
+    }
+
+    #[test]
+    fn test_file_level_class_check_is_reported() {
+        for check in [
+            "class_exists",
+            "INTERFACE_exists",
+            "trait_exists",
+            "enum_exists",
+        ] {
+            let f = temp_php(&format!(
+                "<?php\nnamespace Foo;\nif ({check}('Bar')) {{ }}\nclass Baz {{}}\n"
+            ));
+            let (info, checked) = Lexer::extract_with_class_check(f.path()).unwrap();
+            assert_eq!(info.fqcn, "Foo\\Baz");
+            assert!(checked, "{check}");
+        }
+    }
+
+    #[test]
+    fn test_class_check_inside_a_method_is_not_a_file_level_check() {
+        let f = temp_php(
+            "<?php\nnamespace Foo;\nclass Baz\n{\n    public function run()\n    {\n        return class_exists('Bar');\n    }\n}\n",
+        );
+        let (_, checked) = Lexer::extract_with_class_check(f.path()).unwrap();
+        assert!(!checked);
+    }
+
+    #[test]
+    fn test_extract_declared_at_reads_the_declaration_on_that_line() {
+        let f = temp_php(
+            "<?php\nnamespace Foo;\nuse Bar\\Dep;\nif (class_exists(Dep::class)) {\n    class Baz\n    {\n        public function __construct(Dep $first) {}\n    }\n} else {\n    final class Baz extends Dep\n    {\n        public function __construct(Dep $second) {}\n    }\n}\n",
+        );
+        let info = Lexer::extract_declared_at(f.path(), 10).unwrap();
+        assert_eq!(info.fqcn, "Foo\\Baz");
+        assert!(info.is_final);
+        assert_eq!(info.extends.as_deref(), Some("Bar\\Dep"));
+        assert_eq!(info.constructor.unwrap().params[0].name, "second");
+    }
 
     fn extract_str(php: &str) -> Result<ClassInfo, LexError> {
         let mut f = NamedTempFile::new().unwrap();
@@ -1476,6 +1785,118 @@ class Bar {
     }
 
     #[test]
+    fn test_constructor_modifiers_in_any_order() {
+        for modifiers in [
+            "readonly private",
+            "private readonly",
+            "readonly protected",
+            "readonly public",
+            "READONLY PRIVATE",
+            "readonly /* comment */ private",
+            "readonly",
+            "private",
+        ] {
+            let php = format!(
+                "<?php\nnamespace Foo;\nclass A {{\n    public function __construct({modifiers} Bar $x, int $y = 1) {{}}\n}}"
+            );
+            let info = extract_str(&php).unwrap();
+            let ctor = info.constructor.unwrap();
+            assert_eq!(ctor.params.len(), 2, "{modifiers}");
+            assert_eq!(ctor.params[0].name, "x", "{modifiers}");
+            assert_eq!(
+                ctor.params[0].type_hint.as_deref(),
+                Some("Foo\\Bar"),
+                "{modifiers}"
+            );
+            assert!(ctor.params[0].is_promoted, "{modifiers}");
+            assert!(!ctor.params[1].is_promoted, "{modifiers}");
+        }
+    }
+
+    #[test]
+    fn test_type_with_a_modifier_as_namespace_segment_is_not_a_modifier() {
+        let php = "<?php\nnamespace Foo;\nclass A {\n    public function __construct(Private\\Bar $x, public Readonly\\Baz $y) {}\n}";
+        let ctor = extract_str(php).unwrap().constructor.unwrap();
+        assert_eq!(
+            ctor.params[0].type_hint.as_deref(),
+            Some("Foo\\Private\\Bar")
+        );
+        assert!(!ctor.params[0].is_promoted);
+        assert_eq!(
+            ctor.params[1].type_hint.as_deref(),
+            Some("Foo\\Readonly\\Baz")
+        );
+        assert!(ctor.params[1].is_promoted);
+    }
+
+    #[test]
+    fn test_method_params_with_modifiers_in_any_order() {
+        for modifiers in [
+            "readonly private",
+            "private readonly",
+            "readonly",
+            "private",
+        ] {
+            let php = format!(
+                "<?php\nnamespace Foo;\nclass A {{\n    public function run({modifiers} Bar $x) {{}}\n}}"
+            );
+            let info = extract_str(&php).unwrap();
+            let params = &info.public_methods[0].params;
+            assert_eq!(params.len(), 1, "{modifiers}");
+            assert_eq!(params[0].name, "x", "{modifiers}");
+            assert_eq!(
+                params[0].type_hint.as_deref(),
+                Some("Foo\\Bar"),
+                "{modifiers}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_class_keywords_in_any_case() {
+        let php = "<?php\nNAMESPACE Foo;\nUSE Other\\Dep AS Alias;\nCLASS Bar EXTENDS Base IMPLEMENTS Face\n{\n    Public Function __CONSTRUCT(Alias $dep) {}\n    PUBLIC STATIC FUNCTION run() {}\n    Private Function hidden() {}\n}";
+        let info = extract_str(php).unwrap();
+        assert_eq!(info.fqcn, "Foo\\Bar");
+        assert!(matches!(info.kind, ClassKind::Class));
+        assert_eq!(info.extends.as_deref(), Some("Foo\\Base"));
+        assert_eq!(info.implements, vec!["Foo\\Face"]);
+        let ctor = info.constructor.unwrap();
+        assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Other\\Dep"));
+        assert_eq!(info.public_methods.len(), 1);
+        assert_eq!(info.public_methods[0].name, "run");
+        assert!(info.public_methods[0].is_static);
+    }
+
+    #[test]
+    fn test_class_like_declarations_in_any_case() {
+        let info = extract_str("<?php\nnamespace Foo;\nInterface Bar {}").unwrap();
+        assert!(matches!(info.kind, ClassKind::Interface));
+
+        let info = extract_str("<?php\nnamespace Foo;\nTrait Bar {}").unwrap();
+        assert!(matches!(info.kind, ClassKind::Trait));
+
+        let info = extract_str("<?php\nnamespace Foo;\nAbstract Class Bar {}").unwrap();
+        assert!(info.is_abstract);
+
+        let info = extract_str("<?php\nnamespace Foo;\nFINAL Class Bar {}").unwrap();
+        assert!(info.is_final);
+
+        let info = extract_str("<?php\nnamespace Foo;\nReadonly Class Bar {}").unwrap();
+        assert_eq!(info.fqcn, "Foo\\Bar");
+
+        assert!(matches!(
+            extract_str("<?php\nnamespace Foo;\nEnum Bar {}"),
+            Err(LexError::Unsupported(reason)) if reason == "enum"
+        ));
+    }
+
+    #[test]
+    fn test_enum_as_a_type_name_does_not_hide_the_class() {
+        let php = "<?php\nnamespace Foo;\nfunction make(): Enum {}\nclass Bar {}";
+        assert_eq!(extract_str(php).unwrap().fqcn, "Foo\\Bar");
+    }
+
+    #[test]
     fn test_public_methods() {
         let info = extract_str(
             r#"<?php
@@ -1550,6 +1971,61 @@ class Bar {
         assert_eq!(m.params[1].type_hint.as_deref(), Some("Foo\\D|Foo\\E"));
         assert!(m.params[1].has_default);
         assert_eq!(m.return_type.as_deref(), Some("X\\Y|Foo\\Z|null"));
+    }
+
+    fn method_names(info: &ClassInfo) -> Vec<&str> {
+        info.public_methods
+            .iter()
+            .map(|method| method.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_nowdoc_constant_does_not_hide_the_constructor() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    private const SCRIPT = <<<'LUA'\nif (x) { return 1; }\n}\nLUA;\n    public function __construct(\\Foo\\Dep $dep) {}\n    public function run() {}\n}",
+        )
+        .unwrap();
+        assert_eq!(method_names(&info), ["run"]);
+        assert_eq!(info.constructor.unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_quoted_heredoc_with_indented_closing_label() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public $text = <<<\"TXT\"\n        a { b ; }\n        TXT;\n    public function __construct(\\Foo\\Dep $dep) {}\n}",
+        )
+        .unwrap();
+        assert_eq!(info.constructor.unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_heredoc_in_a_method_body_does_not_hide_later_methods() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public function first() {\n        call(<<<SQL\n            SELECT 1 }\n            SQL, 2);\n    }\n    public function second() {}\n}",
+        )
+        .unwrap();
+        assert_eq!(method_names(&info), ["first", "second"]);
+    }
+
+    #[test]
+    fn test_word_starting_with_the_label_does_not_close_a_heredoc() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    const A = <<<END\nENDING }\nEND;\n    public function __construct(\\Foo\\Dep $dep) {}\n}",
+        )
+        .unwrap();
+        assert_eq!(info.constructor.unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_heredoc_as_constructor_default_keeps_later_parameters() {
+        let info = extract_str(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public function __construct(string $text = <<<TXT\n        a, b) c\n        TXT, ?\\Foo\\Dep $dep = null) {}\n}",
+        )
+        .unwrap();
+        let params = info.constructor.unwrap().params;
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[1].name, "dep");
     }
 
     #[test]

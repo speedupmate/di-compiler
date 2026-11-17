@@ -15,6 +15,46 @@ pub struct ClassInfo {
     pub is_final: bool,
     /// Public non-final methods (needed for InterceptorSpec)
     pub public_methods: Vec<MethodSignature>,
+    /// Trait use. `traits::apply_traits` turns it into members of this class.
+    pub traits: Box<TraitData>,
+}
+
+/// What PHP's trait rules need. A class only has its real members once every trait is known.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraitData {
+    /// Traits named in `use` statements in the class body.
+    pub uses: Vec<String>,
+    pub rules: Vec<TraitRule>,
+    /// Filled for a trait only: all its methods, because `as public` can change what counts.
+    pub methods: Vec<TraitMethod>,
+    /// Methods of this class that `public_methods` leaves out: not public, or final.
+    pub hidden_methods: Vec<String>,
+}
+
+/// One line of the `{ ... }` block of a trait `use` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraitRule {
+    /// `A::run insteadof B, C;`
+    InsteadOf {
+        method: String,
+        excluded: Vec<String>,
+    },
+    /// `A::run as protected walk;`, where the trait, the visibility and the new name are optional.
+    Alias {
+        trait_name: Option<String>,
+        method: String,
+        alias: Option<String>,
+        is_public: Option<bool>,
+        is_final: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitMethod {
+    pub signature: MethodSignature,
+    pub is_public: bool,
+    pub is_final: bool,
+    pub is_abstract: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -258,6 +258,7 @@ mod tests {
                 is_static: false,
                 returns_reference: false,
             }],
+            traits: Default::default(),
         };
 
         let out =

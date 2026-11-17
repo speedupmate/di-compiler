@@ -1,3 +1,4 @@
 /target/
 tests/corpus/
 *.snap.new
+.plans/

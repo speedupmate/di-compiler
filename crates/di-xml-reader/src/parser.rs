@@ -19,6 +19,18 @@ pub fn parse_di_xml_impl(path: &Path) -> Result<DiConfig, Error> {
 }
 
 pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
+    let mut config = parse_di_xml_bytes_unfolded(content)?;
+    config.fold_spellings();
+    Ok(config)
+}
+
+/// Parse one file for a later merge. Types stay under the spelling from the file, because
+/// Magento merges `\\X` and `X` as separate DOM nodes. `merge_configs` folds them.
+pub fn parse_di_xml_unfolded(path: &Path) -> Result<DiConfig, Error> {
+    parse_di_xml_bytes_unfolded(&std::fs::read(path)?)
+}
+
+pub fn parse_di_xml_bytes_unfolded(content: &[u8]) -> Result<DiConfig, Error> {
     let mut reader = Reader::from_reader(content);
     reader.config_mut().trim_text(true);
     reader.config_mut().check_end_names = false;
@@ -47,9 +59,10 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "type" if !in_arguments => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
-                        if !name.is_empty() {
+                        let name = spelled_name(&attrs);
+                        if !normalize(&name).is_empty() {
                             current_virtual = None;
+                            config.type_nodes.insert(name.clone());
                             let entry = config.type_configs.entry(name).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
@@ -59,17 +72,23 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "virtualType" => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
+                        let spelled = spelled_name(&attrs);
+                        let name = normalize(&spelled);
                         let type_name = normalize(&attrs.get("type").cloned().unwrap_or_default());
                         if !name.is_empty() {
-                            config.virtual_types.insert(
-                                name.clone(),
-                                VirtualType {
-                                    name: name.clone(),
-                                    type_name,
-                                },
-                            );
-                            let entry = config.type_configs.entry(name).or_default();
+                            // Magento's Mapper\Dom sets `type` only when the attribute exists.
+                            // Without it the entry only holds settings for the named class.
+                            if !type_name.is_empty() {
+                                config.virtual_types.insert(
+                                    name.clone(),
+                                    VirtualType {
+                                        name: name.clone(),
+                                        type_name,
+                                    },
+                                );
+                            }
+                            config.type_nodes.insert(spelled.clone());
+                            let entry = config.type_configs.entry(spelled).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
                             }
@@ -79,20 +98,19 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         let owner = current_type.as_ref().or(current_virtual.as_ref());
                         if let Some(owner) = owner.cloned() {
                             let name = attrs.get("name").cloned().unwrap_or_default();
-                            let plugin_type =
-                                normalize(&attrs.get("type").cloned().unwrap_or_default());
-                            let sort_order: i32 = attrs
-                                .get("sortOrder")
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            let disabled =
-                                attrs.get("disabled").map(|s| s == "true").unwrap_or(false);
-                            if !name.is_empty() && (!plugin_type.is_empty() || disabled) {
+                            if !name.is_empty() {
                                 config.plugins.entry(owner).or_default().push(Plugin {
                                     name,
-                                    type_name: plugin_type,
-                                    sort_order,
-                                    disabled,
+                                    type_name: normalize(
+                                        &attrs.get("type").cloned().unwrap_or_default(),
+                                    ),
+                                    sort_order: attrs
+                                        .get("sortOrder")
+                                        .map(|s| s.parse().unwrap_or(0)),
+                                    disabled: attrs
+                                        .get("disabled")
+                                        .map(|s| s == "true" || s == "1"),
+                                    disabled_after_type: false,
                                 });
                             }
                         }
@@ -100,11 +118,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                     "argument" if in_arguments => {
                         // Self-closing argument (e.g. xsi:type="null") — push and immediately pop
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let shared = attrs.get("shared").map(|s| s != "false");
                         let ctx = ArgContext {
                             name: arg_name,
@@ -129,11 +143,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                     "item" if !arg_stack.is_empty() => {
                         // Self-closing item — push and immediately pop into parent
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let sort_order: i32 = attrs
                             .get("sortOrder")
                             .and_then(|s| s.parse().ok())
@@ -141,7 +151,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         let ctx = ArgContext {
                             name: arg_name,
                             xsi_type,
-                            shared: None,
+                            shared: attrs.get("shared").map(|s| s != "false"),
                             sort_order,
                             text: String::new(),
                             items: Vec::new(),
@@ -170,10 +180,11 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "type" if !in_arguments => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
-                        if !name.is_empty() {
+                        let name = spelled_name(&attrs);
+                        if !normalize(&name).is_empty() {
                             current_type = Some(name.clone());
                             current_virtual = None;
+                            config.type_nodes.insert(name.clone());
                             let entry = config.type_configs.entry(name).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
@@ -181,19 +192,25 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         }
                     }
                     "virtualType" => {
-                        let name = normalize(&attrs.get("name").cloned().unwrap_or_default());
+                        let spelled = spelled_name(&attrs);
+                        let name = normalize(&spelled);
                         let type_name = normalize(&attrs.get("type").cloned().unwrap_or_default());
                         if !name.is_empty() {
-                            current_virtual = Some(name.clone());
+                            current_virtual = Some(spelled.clone());
                             current_type = None;
-                            config.virtual_types.insert(
-                                name.clone(),
-                                VirtualType {
-                                    name: name.clone(),
-                                    type_name,
-                                },
-                            );
-                            let entry = config.type_configs.entry(name).or_default();
+                            // Magento's Mapper\Dom sets `type` only when the attribute exists.
+                            // Without it the entry only holds settings for the named class.
+                            if !type_name.is_empty() {
+                                config.virtual_types.insert(
+                                    name.clone(),
+                                    VirtualType {
+                                        name: name.clone(),
+                                        type_name,
+                                    },
+                                );
+                            }
+                            config.type_nodes.insert(spelled.clone());
+                            let entry = config.type_configs.entry(spelled).or_default();
                             if let Some(shared_str) = attrs.get("shared") {
                                 entry.shared = Some(shared_str != "false");
                             }
@@ -203,20 +220,19 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         let owner = current_type.as_ref().or(current_virtual.as_ref());
                         if let Some(owner) = owner.cloned() {
                             let name = attrs.get("name").cloned().unwrap_or_default();
-                            let plugin_type =
-                                normalize(&attrs.get("type").cloned().unwrap_or_default());
-                            let sort_order: i32 = attrs
-                                .get("sortOrder")
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            let disabled =
-                                attrs.get("disabled").map(|s| s == "true").unwrap_or(false);
-                            if !name.is_empty() && (!plugin_type.is_empty() || disabled) {
+                            if !name.is_empty() {
                                 config.plugins.entry(owner).or_default().push(Plugin {
                                     name,
-                                    type_name: plugin_type,
-                                    sort_order,
-                                    disabled,
+                                    type_name: normalize(
+                                        &attrs.get("type").cloned().unwrap_or_default(),
+                                    ),
+                                    sort_order: attrs
+                                        .get("sortOrder")
+                                        .map(|s| s.parse().unwrap_or(0)),
+                                    disabled: attrs
+                                        .get("disabled")
+                                        .map(|s| s == "true" || s == "1"),
+                                    disabled_after_type: false,
                                 });
                             }
                         }
@@ -226,11 +242,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                     }
                     "argument" if in_arguments => {
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let shared = attrs.get("shared").map(|s| s != "false");
                         arg_stack.push(ArgContext {
                             name: arg_name,
@@ -243,11 +255,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                     }
                     "item" if !arg_stack.is_empty() => {
                         let arg_name = attrs.get("name").cloned().unwrap_or_default();
-                        let xsi_type = attrs
-                            .get("xsi:type")
-                            .or_else(|| attrs.get("type"))
-                            .cloned()
-                            .unwrap_or_default();
+                        let xsi_type = attrs.get("xsi:type").cloned().unwrap_or_default();
                         let sort_order: i32 = attrs
                             .get("sortOrder")
                             .and_then(|s| s.parse().ok())
@@ -255,7 +263,7 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
                         arg_stack.push(ArgContext {
                             name: arg_name,
                             xsi_type,
-                            shared: None,
+                            shared: attrs.get("shared").map(|s| s != "false"),
                             sort_order,
                             text: String::new(),
                             items: Vec::new(),
@@ -342,6 +350,14 @@ pub fn parse_di_xml_bytes(content: &[u8]) -> Result<DiConfig, Error> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The `name` attribute as the file spells it, so with any leading backslash.
+fn spelled_name(attrs: &FxHashMap<String, String>) -> String {
+    attrs
+        .get("name")
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default()
+}
+
 struct ArgContext {
     name: String,
     xsi_type: String,
@@ -371,15 +387,17 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
             value: ctx.text,
             sort_order: so,
         },
-        "boolean" => Argument::Boolean {
-            name,
-            value: ctx.text == "true" || ctx.text == "1",
-            sort_order: so,
-        },
+        "boolean" if matches!(ctx.text.as_str(), "" | "true" | "1" | "false" | "0") => {
+            Argument::Boolean {
+                name,
+                value: ctx.text == "true" || ctx.text == "1",
+                sort_order: so,
+            }
+        }
         // PHP's Number::evaluate() returns the raw XML string (not cast to int/float).
         // var_export() then quotes it as a string in metadata. Use Argument::String so
         // render_scalar outputs it quoted, matching PHP truth.
-        "number" => Argument::String {
+        "number" if ctx.text.is_empty() || is_php_numeric(&ctx.text) => Argument::String {
             name,
             value: ctx.text,
             sort_order: so,
@@ -407,13 +425,22 @@ fn ctx_to_argument(ctx: ArgContext) -> Option<Argument> {
             value: ctx.text,
             sort_order: so,
         },
-        _ => Argument::String {
+        _ => Argument::Untyped {
             name,
+            xsi_type: ctx.xsi_type,
             value: ctx.text,
+            items: ctx.items.into_iter().map(|(_, arg)| arg).collect(),
             sort_order: so,
         },
     };
     Some(arg)
+}
+
+/// PHP 8's `is_numeric()`: a decimal number with optional exponent and surrounding whitespace.
+fn is_php_numeric(text: &str) -> bool {
+    let number = text.trim_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let digits = number.strip_prefix(['+', '-']).unwrap_or(number);
+    digits.starts_with(|c: char| c.is_ascii_digit() || c == '.') && digits.parse::<f64>().is_ok()
 }
 
 fn local_name(name: &[u8]) -> String {
@@ -477,8 +504,29 @@ mod tests {
         let plugins = config.plugins.get("Foo\\Bar").unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "myPlugin");
-        assert_eq!(plugins[0].sort_order, 10);
-        assert!(!plugins[0].disabled);
+        assert_eq!(plugins[0].sort_order, Some(10));
+        assert_eq!(plugins[0].disabled, Some(false));
+    }
+
+    #[test]
+    fn test_parse_plugin_keeps_overrides_without_type() {
+        let xml = br#"<?xml version="1.0"?>
+<config>
+    <type name="Foo\Bar">
+        <plugin name="sorted" sortOrder="5"/>
+        <plugin name="off" disabled="1"/>
+        <plugin name="on" disabled="false"></plugin>
+    </type>
+</config>"#;
+        let config = parse_di_xml_bytes(xml).unwrap();
+        let plugins = config.plugins.get("Foo\\Bar").unwrap();
+        assert_eq!(plugins.len(), 3);
+        assert_eq!(plugins[0].sort_order, Some(5));
+        assert_eq!(plugins[0].disabled, None);
+        assert!(plugins[0].type_name.is_empty());
+        assert_eq!(plugins[1].sort_order, None);
+        assert!(plugins[1].is_disabled());
+        assert_eq!(plugins[2].disabled, Some(false));
     }
 
     #[test]
@@ -491,7 +539,7 @@ mod tests {
 </config>"#;
         let config = parse_di_xml_bytes(xml).unwrap();
         let plugins = config.plugins.get("Foo\\Bar").unwrap();
-        assert!(plugins[0].disabled);
+        assert!(plugins[0].is_disabled());
     }
 
     #[test]
@@ -506,6 +554,50 @@ mod tests {
             config.virtual_types["MyVirtual"].type_name,
             "Concrete\\Class"
         );
+    }
+
+    #[test]
+    fn test_virtual_type_without_type_is_only_a_type_config() {
+        let xml = br#"<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <virtualType name="Acme\RealClass" shared="false">
+        <arguments>
+            <argument name="path" xsi:type="string">some/path</argument>
+        </arguments>
+    </virtualType>
+    <virtualType name="Acme\SelfClosing"/>
+</config>"#;
+        let config = parse_di_xml_bytes(xml).unwrap();
+
+        assert!(!config.virtual_types.contains_key("Acme\\RealClass"));
+        assert!(!config.virtual_types.contains_key("Acme\\SelfClosing"));
+        let type_config = &config.type_configs["Acme\\RealClass"];
+        assert_eq!(type_config.arguments.len(), 1);
+        assert_eq!(type_config.shared, Some(false));
+    }
+
+    #[test]
+    fn test_virtual_type_without_type_keeps_type_from_earlier_scope() {
+        let global = parse_di_xml_bytes(
+            br#"<config><virtualType name="Acme\Virtual" type="Acme\Base"/></config>"#,
+        )
+        .unwrap();
+        let area = parse_di_xml_bytes(
+            br#"<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <virtualType name="Acme\Virtual">
+        <arguments><argument name="path" xsi:type="string">area</argument></arguments>
+    </virtualType>
+</config>"#,
+        )
+        .unwrap();
+
+        let merged = crate::merger::apply_module_config_on_primary(global, area);
+
+        assert_eq!(
+            merged.virtual_types["Acme\\Virtual"].type_name,
+            "Acme\\Base"
+        );
+        assert_eq!(merged.type_configs["Acme\\Virtual"].arguments.len(), 1);
     }
 
     #[test]

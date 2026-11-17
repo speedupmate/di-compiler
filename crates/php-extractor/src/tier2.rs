@@ -7,7 +7,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
-    MethodSignature,
+    MethodSignature, TraitData, TraitMethod,
 };
 
 pub fn extract_tier2(path: &Path) -> ExtractResult {
@@ -125,35 +125,65 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
 
     let mut constructor: Option<Constructor> = None;
     let mut public_methods: Vec<MethodSignature> = Vec::new();
+    let mut traits = TraitData::default();
+    let is_trait = matches!(kind, ClassKind::Trait);
 
     if let Some(body) = body_node {
         for member in iter_children(body) {
+            if member.kind() == "use_declaration" {
+                crate::lexer::Lexer::read_trait_use_text(
+                    node_text(member, src),
+                    &namespace,
+                    &use_map,
+                    &mut traits,
+                )
+                .map_err(|e| format!("trait use: {e}"))?;
+            }
             if member.kind() == "method_declaration" {
                 let method_name = member
                     .child_by_field_name("name")
                     .map(|n| node_text(n, src).trim().to_string())
                     .unwrap_or_default();
 
+                let is_abstract_method = has_modifier(member, src, "abstract");
                 if method_name == "__construct" {
-                    constructor = Some(parse_constructor(member, src, &namespace, &use_map));
+                    // An abstract constructor in a trait only asks for one. It is not one.
+                    if !(is_trait && is_abstract_method) {
+                        constructor = Some(parse_constructor(member, src, &namespace, &use_map));
+                    }
                 } else {
                     // Check visibility
-                    let vis = get_visibility(member, src);
+                    let is_public = get_visibility(member, src) == "public";
                     let is_final_method = has_modifier(member, src, "final");
-                    if vis == "public" && !is_final_method {
+                    if is_trait || (is_public && !is_final_method) {
                         let is_static = has_modifier(member, src, "static");
                         let returns_reference = node_text(member, src).contains("function &");
                         let params = parse_method_params_ts(member, src, &namespace, &use_map);
                         let return_type = member
                             .child_by_field_name("return_type")
                             .map(|n| node_text(n, src).trim_start_matches(':').trim().to_string());
-                        public_methods.push(MethodSignature {
+                        let signature = MethodSignature {
                             name: method_name,
                             params,
                             return_type,
                             is_static,
                             returns_reference,
-                        });
+                        };
+                        if is_trait {
+                            traits.methods.push(TraitMethod {
+                                signature: signature.clone(),
+                                is_public,
+                                is_final: is_final_method,
+                                is_abstract: is_abstract_method,
+                            });
+                        }
+                        if is_public && !is_final_method {
+                            public_methods.push(signature);
+                        } else {
+                            traits.hidden_methods.push(signature.name);
+                        }
+                    } else {
+                        traits.hidden_methods.push(method_name);
                     }
                 }
             }
@@ -178,6 +208,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         is_abstract,
         is_final,
         public_methods,
+        traits: Box::new(traits),
     }))
 }
 
@@ -446,8 +477,8 @@ fn parse_ctor_params_ts(
     let mut params = Vec::new();
     for child in iter_children(params_node) {
         match child.kind() {
-            "simple_parameter" | "variadic_parameter" | "promoted_parameter" => {
-                let is_promoted = child.kind() == "promoted_parameter";
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
+                let is_promoted = child.kind() == "property_promotion_parameter";
                 let is_variadic = child.kind() == "variadic_parameter";
 
                 let type_hint = child.child_by_field_name("type").map(|n| {
@@ -459,7 +490,8 @@ fn parse_ctor_params_ts(
                     .child_by_field_name("name")
                     .map(|n| {
                         let s = node_text(n, src).trim();
-                        s.trim_start_matches('$').to_string()
+                        // In a promoted parameter the name node includes a by-reference `&`.
+                        s.trim_start_matches(['&', ' ', '$']).to_string()
                     })
                     .unwrap_or_default();
 
@@ -501,7 +533,7 @@ fn parse_method_params_ts(
     if let Some(params_node) = method.child_by_field_name("parameters") {
         for child in iter_children(params_node) {
             match child.kind() {
-                "simple_parameter" | "variadic_parameter" | "promoted_parameter" => {
+                "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
                     let is_variadic = child.kind() == "variadic_parameter";
                     let type_hint = child.child_by_field_name("type").map(|n| {
                         let raw = extract_type_from_node(n, src);
@@ -556,8 +588,8 @@ fn resolve_type_in_hint(
             .split('|')
             .map(|part| {
                 let p = part.trim();
-                if is_primitive_type(p) || p.eq_ignore_ascii_case("null") {
-                    p.to_string()
+                if is_primitive_type(p) {
+                    p.to_ascii_lowercase()
                 } else {
                     resolve_type_hint(p, namespace, use_map)
                 }
@@ -566,7 +598,7 @@ fn resolve_type_in_hint(
         return format!("{}{}", prefix, resolved.join("|"));
     }
     if is_primitive_type(inner) {
-        return raw.to_string();
+        return raw.to_ascii_lowercase();
     }
     format!("{}{}", prefix, resolve_type_hint(inner, namespace, use_map))
 }
@@ -614,16 +646,18 @@ fn is_primitive_type(t: &str) -> bool {
     is_primitive_base(t)
 }
 
+/// PHP reads a reserved type name in any case. `integer`, `double` and `boolean` are not reserved,
+/// so `Boolean` can be a class. Those three keep their exact spelling here.
 fn is_primitive_base(t: &str) -> bool {
+    if matches!(t, "integer" | "double" | "boolean") {
+        return true;
+    }
     matches!(
-        t,
+        t.to_ascii_lowercase().as_str(),
         "int"
-            | "integer"
             | "float"
-            | "double"
             | "string"
             | "bool"
-            | "boolean"
             | "array"
             | "callable"
             | "iterable"
@@ -658,6 +692,32 @@ mod tests {
     }
 
     #[test]
+    fn test_tier2_reserved_type_names_are_builtin_in_any_case() {
+        let result = extract(
+            "<?php\nnamespace Foo;\nclass Baz\n{\n    public function __construct(Array $a, ?String $b, Int|Null $c, Boolean $d) {}\n}\n",
+        );
+        let ExtractResult::Ok(info) = result else {
+            panic!("Expected Ok, got {result:?}");
+        };
+        let hints: Vec<_> = info
+            .constructor
+            .unwrap()
+            .params
+            .iter()
+            .map(|param| (param.type_hint.clone().unwrap(), param.is_primitive))
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                ("array".to_string(), true),
+                ("?string".to_string(), true),
+                ("int|null".to_string(), true),
+                ("Foo\\Boolean".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
     fn test_tier2_simple_class() {
         let result = extract("<?php\nnamespace Foo\\Bar;\nclass Baz {}");
         match result {
@@ -685,5 +745,26 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn test_tier2_reads_promoted_constructor_parameters() {
+        // The intersection type sends this file from Tier 1 to Tier 2.
+        let result = extract(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public function __construct(\n        private readonly Baz&Qux $x,\n        Dep $y,\n        protected ?Dep $z = null,\n        public int &$r = 0,\n    ) {}\n}",
+        );
+        let ExtractResult::Ok(info) = result else {
+            panic!("Expected Ok, got {:?}", result);
+        };
+        let params = info.constructor.unwrap().params;
+        let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["x", "y", "z", "r"]);
+        let promoted: Vec<_> = params.iter().map(|p| p.is_promoted).collect();
+        assert_eq!(promoted, [true, false, true, true]);
+        assert!(!params[0].is_optional);
+        assert_eq!(params[2].default_value.as_deref(), Some("null"));
+        assert!(params[2].is_optional);
+        assert_eq!(params[2].type_hint.as_deref(), Some("?Foo\\Dep"));
+        assert!(params[3].is_primitive);
     }
 }

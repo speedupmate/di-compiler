@@ -65,18 +65,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             asset_suffix: linux-x64
             runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+            apt_packages: musl-tools
+            cc_env: CC_x86_64_unknown_linux_musl=musl-gcc
+          - target: aarch64-unknown-linux-musl
             asset_suffix: linux-arm64
             runner: ubuntu-24.04-arm
+            apt_packages: musl-tools
+            cc_env: CC_aarch64_unknown_linux_musl=musl-gcc
           - target: x86_64-apple-darwin
             asset_suffix: macos-x64
             runner: macos-15-intel
+            apt_packages: ""
+            cc_env: ""
           - target: aarch64-apple-darwin
             asset_suffix: macos-arm64
             runner: macos-15
+            apt_packages: ""
+            cc_env: ""
 
     steps:
       - name: Check out repository
@@ -89,6 +97,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install Linux musl C toolchain
+        if: ${{ matrix.apt_packages != '' }}
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt_packages }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -96,7 +107,12 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --locked --release -p "$BIN_NAME" --target "${{ matrix.target }}"
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.cc_env }}" ]; then
+            export "${{ matrix.cc_env }}"
+          fi
+          cargo build --locked --release -p "$BIN_NAME" --target "${{ matrix.target }}"
 
       - name: Package release asset
         run: |
