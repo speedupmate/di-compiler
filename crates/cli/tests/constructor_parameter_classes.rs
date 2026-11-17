@@ -96,13 +96,29 @@ fn factory_of_a_missing_class_stops_the_compile() {
     assert_stops(&output, "Acme\\On\\Model\\Thing");
 }
 
+fn php_version_id() -> u32 {
+    let output = Command::new("php")
+        .args(["-r", "echo PHP_VERSION_ID;"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+// From PHP 8.5, reflection names the class itself for a `self` type, so Magento finds it.
 #[test]
-fn parameter_typed_self_stops_the_compile() {
+fn parameter_typed_self_stops_the_compile_before_php_8_5() {
     let source = thing("class Thing { public function __construct(self $other) {} }");
     let Some(output) = compile_with(&[(THING, &source)]) else {
         return;
     };
-    assert_stops(&output, "Acme\\On\\Model\\Thing");
+    if php_version_id() >= 80500 {
+        assert_compiles(&output);
+    } else {
+        assert_stops(&output, "Acme\\On\\Model\\Thing");
+    }
 }
 
 #[test]
