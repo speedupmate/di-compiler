@@ -289,6 +289,8 @@ fn warning_while_a_class_file_loads_stops_the_compile_as_bin_magento_turns_it_in
     assert_stops(&output, &["Model/Thing.php", "careful"]);
 }
 
+// Every PHP 8 version deprecates an optional parameter with a non-null default before a
+// required one while it compiles the file.
 #[test]
 fn deprecation_while_a_class_file_compiles_stops_the_compile() {
     let Some(output) = compile_with(&[
@@ -298,7 +300,7 @@ fn deprecation_while_a_class_file_compiles_stops_the_compile() {
         ),
         (
             THING,
-            &model("class Thing { public function run(Gadget $g = null, $x) {} }"),
+            &model("class Thing { public function run($g = 1, $x) {} }"),
         ),
     ]) else {
         return;
