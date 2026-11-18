@@ -33,6 +33,8 @@ mod file_level_checks;
 mod incompatible_modules;
 mod requested_regeneration;
 mod run_report;
+mod watch;
+mod watch_set;
 use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
@@ -136,6 +138,21 @@ struct Args {
     /// Print one JSON line with the result on stdout when the compile ends
     #[arg(long)]
     summary_json: bool,
+
+    /// Compile, then compile again after every change to PHP classes, di.xml files, the module
+    /// list or Composer packages (for development)
+    #[arg(long)]
+    watch: bool,
+
+    /// Like --watch, polling for changes every MS milliseconds instead of using file events
+    #[arg(
+        long,
+        value_name = "MS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "1000"
+    )]
+    watch_poll: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +575,30 @@ fn main() {
             log::LevelFilter::Info
         })
         .init();
+
+    if args.watch || args.watch_poll.is_some() {
+        if args.dry_run || args.validate || args.compare_archive {
+            eprintln!(
+                "error: --watch cannot be combined with --dry-run, --validate or --compare-archive"
+            );
+            std::process::exit(2);
+        }
+        let magento_root = args
+            .magento_root
+            .canonicalize()
+            .unwrap_or(args.magento_root.clone());
+        let generated_root = args
+            .output
+            .clone()
+            .unwrap_or_else(|| magento_root.join("generated"));
+        watch::run(watch::Options {
+            magento_root,
+            generated_root,
+            php: args.fallback_php.clone(),
+            poll: args.watch_poll.map(std::time::Duration::from_millis),
+            verbose: args.verbose,
+        });
+    }
     run_report::stop_on_signals();
 
     // Wire --fallback-php to the env var that Tier 3 reads.

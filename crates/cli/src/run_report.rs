@@ -88,6 +88,12 @@ pub fn exit(code: i32, error: Option<&str>) -> ! {
 #[cfg(unix)]
 pub fn stop_on_signals() {
     use signal_hook::consts::{SIGINT, SIGTERM};
+    // Test hook: a compile that does not stop on SIGTERM, so the watcher's kill path can be tested.
+    if std::env::var_os("FAST_DI_COMPILE_TEST_IGNORE_SIGTERM").is_some() {
+        let ignored = std::sync::Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(SIGTERM, ignored);
+        return;
+    }
     let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) else {
         log::warn!("Could not install the SIGINT/SIGTERM handler");
         return;
