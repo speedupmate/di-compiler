@@ -41,8 +41,8 @@ use code_generator::{
     generate_area_config_with_overrides, generate_extension, generate_extension_interface,
     generate_factory, generate_interceptor, generate_proxy, generate_proxy_deferred,
     generate_search_results, interceptor_path, proxy_deferred_path, proxy_path,
-    search_results_path, serialize_interception_php, serialize_plugin_list_php, write_if_changed,
-    ExtensionAttributeSpec, ExtensionSpec, AREAS,
+    search_results_path, serialize_interception_php, serialize_plugin_list_php, write_atomic,
+    write_if_changed, ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
     detect_factories_from_configs, detect_interceptors, detect_named_factories,
@@ -149,7 +149,7 @@ impl IncrementalCache {
 
     fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+            let _ = write_atomic(path, json.as_bytes());
         }
     }
 
@@ -2011,7 +2011,7 @@ fn main() {
         let app_action_list_path = metadata_root.join("app_action_list.php");
         must_write(&app_action_list_path, &app_action_list);
         if let Err(e) =
-            std::fs::create_dir_all(&fp_dir).and_then(|()| std::fs::write(&fp_path, new_fp))
+            std::fs::create_dir_all(&fp_dir).and_then(|()| write_atomic(&fp_path, &new_fp))
         {
             stop_compile(&format!("Could not write {}: {e}", fp_path.display()));
         }
