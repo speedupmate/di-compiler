@@ -32,6 +32,7 @@ mod di_xml_checks;
 mod file_level_checks;
 mod incompatible_modules;
 mod requested_regeneration;
+mod run_report;
 use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
@@ -127,6 +128,14 @@ struct Args {
     /// Continue when Magento-style constructor integrity validation fails
     #[arg(long)]
     ignore_constructor_integrity: bool,
+
+    /// Log warnings and errors only
+    #[arg(long, short = 'q')]
+    quiet: bool,
+
+    /// Print one JSON line with the result on stdout when the compile ends
+    #[arg(long)]
+    summary_json: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -538,14 +547,18 @@ fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) ->
 
 fn main() {
     let args = Args::parse();
+    run_report::start(args.summary_json);
 
     env_logger::Builder::new()
         .filter_level(if args.verbose {
             log::LevelFilter::Debug
+        } else if args.quiet {
+            log::LevelFilter::Warn
         } else {
             log::LevelFilter::Info
         })
         .init();
+    run_report::stop_on_signals();
 
     // Wire --fallback-php to the env var that Tier 3 reads.
     if args.fallback_php != "php" {
@@ -554,8 +567,9 @@ fn main() {
 
     // Validate requires --php-generated
     if args.validate && args.php_generated.is_none() {
-        eprintln!("error: --validate requires --php-generated <dir>");
-        std::process::exit(2);
+        let message = "--validate requires --php-generated <dir>";
+        eprintln!("error: {message}");
+        run_report::exit(2, Some(message));
     }
 
     // Configure rayon thread pool
@@ -589,7 +603,7 @@ fn main() {
         incompatible_modules::incompatible_modules(&installed_modules, &enabled_modules)
     {
         eprintln!("error: {message}");
-        std::process::exit(1);
+        run_report::exit(1, Some(&message));
     }
 
     let generated_root = args
@@ -598,15 +612,17 @@ fn main() {
         .unwrap_or_else(|| magento_root.join("generated"));
     let code_root = generated_root.join("code");
     let metadata_root = generated_root.join("metadata");
-    if !args.dry_run {
-        METADATA_ROOT.get_or_init(|| metadata_root.clone());
-    }
+    run_report::on_stop_remove(
+        (!args.dry_run).then(|| metadata_root.clone()),
+        vec![worker_script_path(), class_checks::class_list_path()],
+    );
     if !args.dry_run && !generated_folders_are_writable(&generated_root) {
-        eprintln!(
-            "error: Command line user does not have read and write permissions on generated directory ({}). Please address this issue before using this command.",
+        let message = format!(
+            "Command line user does not have read and write permissions on generated directory ({}). Please address this issue before using this command.",
             generated_root.display()
         );
-        std::process::exit(1);
+        eprintln!("error: {message}");
+        run_report::exit(1, Some(&message));
     }
 
     // Magento's boot before setup:di:compile, before PHP loads anything from generated/.
@@ -1305,6 +1321,7 @@ fn main() {
         );
         log_phase_elapsed("Total", total_started);
         let _ = std::fs::remove_file(&worker_script_path);
+        run_report::print_summary(None);
         return;
     }
 
@@ -2070,13 +2087,14 @@ fn main() {
                 );
                 if args.compare_fail_on_diff && !summary.is_clean() {
                     log_phase_elapsed("Total", total_started);
-                    std::process::exit(1);
+                    run_report::exit(1, Some("archive compare found differences"));
                 }
             }
             Err(e) => {
-                eprintln!("error: archive compare failed: {e}");
+                let message = format!("archive compare failed: {e}");
+                eprintln!("error: {message}");
                 log_phase_elapsed("Total", total_started);
-                std::process::exit(2);
+                run_report::exit(2, Some(&message));
             }
         }
         log_phase_elapsed("Archive compare", compare_archive_started);
@@ -2095,7 +2113,7 @@ fn main() {
         log_phase_elapsed("Phase 8", phase_8_started);
         if !result.is_clean() {
             log_phase_elapsed("Total", total_started);
-            std::process::exit(1);
+            run_report::exit(1, Some("validation against PHP output found differences"));
         }
     }
 
@@ -2104,6 +2122,7 @@ fn main() {
 
     // Clean up the temp PHP worker script.
     let _ = std::fs::remove_file(&worker_script_path);
+    run_report::print_summary(None);
 }
 
 /// `InterceptionConfigurationBuilder::getInterceptedMethods()` calls `get_class_methods()` on
@@ -2337,19 +2356,13 @@ fn is_generated_class_name(class: &str) -> bool {
         .any(|suffix| class.ends_with(suffix))
 }
 
-static METADATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
-
 /// Ends a compile that Magento would stop too. `DiCompileCommand::execute()` empties
 /// `generated/metadata` first, so a failed compile never leaves old metadata for the store to use.
 /// Removing it at the end gives the same result, and a passing compile can still skip phase 7.
 fn stop_compile(message: &str) -> ! {
     eprintln!("error: {message}");
-    if let Some(root) = METADATA_ROOT.get() {
-        let _ = std::fs::remove_dir_all(root);
-    }
-    let _ = std::fs::remove_file(worker_script_path());
-    let _ = std::fs::remove_file(class_checks::class_list_path());
-    std::process::exit(1);
+    run_report::clean_up();
+    run_report::exit(1, Some(message));
 }
 
 /// `Mapper\\Dom::convert()` evaluates each argument after `Config\\Dom` merged the files of one

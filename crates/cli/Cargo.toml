@@ -24,6 +24,11 @@ di-xml-reader = { path = "../di-xml-reader" }
 di-resolver = { path = "../di-resolver" }
 code-generator = { path = "../code-generator" }
 validator = { path = "../validator" }
+notify.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

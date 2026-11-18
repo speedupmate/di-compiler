@@ -1,14 +1,38 @@
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+static UNCHANGED: AtomicUsize = AtomicUsize::new(0);
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// Files that `write_if_changed()` wrote and left as they were, in this process.
+pub fn write_counts() -> (usize, usize) {
+    (
+        WRITTEN.load(Ordering::Relaxed),
+        UNCHANGED.load(Ordering::Relaxed),
+    )
+}
+
+/// Every later write fails with `ErrorKind::Interrupted`. A compile that is told to stop calls this
+/// before it removes its output, so no thread writes a file back into it.
+pub fn stop_writes() {
+    STOPPED.store(true, Ordering::SeqCst);
+}
+
+fn interrupted() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "the compile is stopping")
+}
 
 /// Writes `content` to a temporary file in the folder of `path`, then renames it over `path`. A
 /// request that reads the file meanwhile sees the old or the new content, never a part of it. A
 /// replaced file keeps its permission bits. The temporary name starts with a dot and ends in
 /// `.tmp`, so no autoloader maps a class to it.
 pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if STOPPED.load(Ordering::SeqCst) {
+        return Err(interrupted());
+    }
     let folder = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -33,6 +57,9 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
             file.set_permissions(existing.permissions())?;
         }
         drop(file);
+        if STOPPED.load(Ordering::SeqCst) {
+            return Err(interrupted());
+        }
         std::fs::rename(&temporary, path)
     })();
     if result.is_err() {
@@ -55,11 +82,13 @@ pub fn write_if_changed(path: &Path, content: &str) -> std::io::Result<bool> {
         let mut h2 = FxHasher::default();
         content.hash(&mut h2);
         if h1.finish() == h2.finish() && existing == content {
+            UNCHANGED.fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
     }
 
     write_atomic(path, content.as_bytes())?;
+    WRITTEN.fetch_add(1, Ordering::Relaxed);
     Ok(true)
 }
 

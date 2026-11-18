@@ -33,6 +33,11 @@ indicatif = "0.17"
 
 # incremental
 blake3 = "1"
+
+# watch mode
+signal-hook = "0.3"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
