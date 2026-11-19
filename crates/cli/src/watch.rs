@@ -22,6 +22,9 @@ use crate::watch_set::{self, WatchSet};
 const DEBOUNCE: Duration = Duration::from_millis(300);
 const METADATA_CHECK: Duration = Duration::from_secs(2);
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// A terminal sends Ctrl+C to every process of its foreground group, and `bin/magento` forwards
+/// it too, so signals this close together count as one stop request.
+const SAME_STOP: Duration = Duration::from_secs(1);
 const POLL_DEFAULT: Duration = Duration::from_millis(1000);
 
 pub struct Options {
@@ -410,7 +413,10 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
                     send(pid, Stop::Terminate);
                     stop_sent = Some((Instant::now(), count));
                 }
-                Some((sent, seen)) if count > seen || sent.elapsed() >= STOP_GRACE => {
+                Some((sent, seen))
+                    if (count > seen && sent.elapsed() >= SAME_STOP)
+                        || sent.elapsed() >= STOP_GRACE =>
+                {
                     send(pid, Stop::KillGroup);
                     killed = true;
                     break child.wait().ok();

@@ -573,3 +573,26 @@ fn a_module_copied_in_is_watched_down_to_its_deepest_folder() {
         "{status}"
     );
 }
+
+#[test]
+fn two_signals_close_together_stop_the_compile_gracefully() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    let watcher = store.watch(&["--watch"]);
+    slow_class(&store);
+    wait_for_worker(&store);
+    // Ctrl+C reaches the watcher from the terminal and once more through bin/magento.
+    watcher.signal(libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(100));
+    watcher.signal(libc::SIGINT);
+    let (code, output) = watcher.wait(Duration::from_secs(10));
+    assert_eq!(code, Some(130), "{}", output.join("\n"));
+    assert!(
+        !output.join("\n").contains("was killed"),
+        "{}",
+        output.join("\n")
+    );
+    assert!(store.leftovers().is_empty(), "{:?}", store.leftovers());
+}
