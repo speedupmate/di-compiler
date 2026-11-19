@@ -33,6 +33,8 @@ pub struct Options {
     pub php: String,
     pub poll: Option<Duration>,
     pub verbose: bool,
+    /// Stop as on SIGTERM when the process that started the watcher ends.
+    pub exit_with_parent: bool,
 }
 
 /// Arguments of this process that a compile child gets, without the watch flags and without the
@@ -47,7 +49,12 @@ pub fn child_arguments(
             let text = argument.to_string_lossy();
             !matches!(
                 text.as_ref(),
-                "--watch" | "--watch-poll" | "--quiet" | "-q" | "--summary-json"
+                "--watch"
+                    | "--watch-poll"
+                    | "--watch-exit-with-parent"
+                    | "--quiet"
+                    | "-q"
+                    | "--summary-json"
             ) && !text.starts_with("--watch-poll=")
         })
         .collect();
@@ -99,10 +106,32 @@ fn listen_for_signals() -> Received {
     Received::default()
 }
 
+/// A wrapper such as `bin/magento` can end without passing its signal on, for example when PHP
+/// has no `pcntl`. The watcher then counts the end of its parent as SIGTERM.
+#[cfg(unix)]
+fn stop_when_parent_ends(received: &Received) {
+    let parent = unsafe { libc::getppid() };
+    let shared = received.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(200));
+        if unsafe { libc::getppid() } != parent {
+            shared.last.store(libc::SIGTERM as usize, Ordering::SeqCst);
+            shared.count.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn stop_when_parent_ends(_received: &Received) {}
+
 type Events = mpsc::Receiver<notify::Result<Event>>;
 
 pub fn run(options: Options) -> ! {
     let received = listen_for_signals();
+    if options.exit_with_parent {
+        stop_when_parent_ends(&received);
+    }
     let child_args = child_arguments(std::env::args_os().skip(1), options.verbose);
     let (sender, events): (mpsc::Sender<notify::Result<Event>>, Events) = mpsc::channel();
 
@@ -612,6 +641,7 @@ mod tests {
             "--magento-root",
             "/srv",
             "--watch",
+            "--watch-exit-with-parent",
             "-j",
             "4",
             "--quiet",

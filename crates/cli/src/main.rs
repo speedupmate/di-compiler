@@ -153,6 +153,10 @@ struct Args {
         default_missing_value = "1000"
     )]
     watch_poll: Option<u64>,
+
+    /// With --watch: stop as on SIGTERM when the parent process ends (used by bin/magento)
+    #[arg(long, hide = true)]
+    watch_exit_with_parent: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +601,7 @@ fn main() {
             php: args.fallback_php.clone(),
             poll: args.watch_poll.map(std::time::Duration::from_millis),
             verbose: args.verbose,
+            exit_with_parent: args.watch_exit_with_parent,
         });
     }
     run_report::stop_on_signals();

@@ -596,3 +596,46 @@ fn two_signals_close_together_stop_the_compile_gracefully() {
     );
     assert!(store.leftovers().is_empty(), "{:?}", store.leftovers());
 }
+
+#[test]
+fn the_watcher_stops_when_its_parent_ends() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    let log = store.temp.path().join("watch.log");
+    // A parent that starts the watcher, waits for its first compile, then ends without passing
+    // on any signal, as bin/magento does on PHP without pcntl.
+    let script = format!(
+        "{bin} --magento-root {root} --watch --watch-exit-with-parent > {log} 2>&1 & echo $!; \
+         for i in $(seq 1 100); do grep -q compiled {log} && exit 0; sleep 0.1; done",
+        bin = env!("CARGO_BIN_EXE_fast-di-compile"),
+        root = store.root().display(),
+        log = log.display(),
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env("TMPDIR", store.temp.path())
+        .output()
+        .unwrap();
+    let pid: libc::pid_t = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the watcher kept running:\n{}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(store.metadata().exists());
+    assert!(
+        store.leftovers().iter().all(|name| name == "watch.log"),
+        "{:?}",
+        store.leftovers()
+    );
+}
