@@ -105,6 +105,7 @@ pub fn run(options: Options) -> ! {
 
     let mut set = watch_set::resolve(&options.magento_root);
     let (mut watcher, mode) = start_watcher(&options, sender, &set);
+    let file_events = mode == "file events";
     eprintln!(
         "{} watching {} folders ({mode}); Ctrl+C to stop",
         clock(),
@@ -125,6 +126,7 @@ pub fn run(options: Options) -> ! {
 
     let global = options.generated_root.join("metadata/global.php");
     let mut pending: Vec<PathBuf> = Vec::new();
+    let mut new_folders: Vec<PathBuf> = Vec::new();
     let mut last_event = Instant::now();
     let mut compile_now: Option<String> = Some("start".into());
     let mut clean_config_cache = false;
@@ -139,6 +141,12 @@ pub fn run(options: Options) -> ! {
         let due = !pending.is_empty() && last_event.elapsed() >= DEBOUNCE;
         if compile_now.is_some() || due {
             let triggers = std::mem::take(&mut pending);
+            // Nothing changed for the debounce time, so a copied tree is complete by now.
+            for folder in new_folders.drain(..) {
+                if folder.is_dir() {
+                    let _ = watcher.watch(&folder, RecursiveMode::Recursive);
+                }
+            }
             let trigger = compile_now
                 .take()
                 .unwrap_or_else(|| describe(&triggers, &options));
@@ -167,6 +175,9 @@ pub fn run(options: Options) -> ! {
             Ok(Ok(event)) => {
                 if options.verbose {
                     eprintln!("  event {:?} {:?}", event.kind, event.paths);
+                }
+                if file_events {
+                    new_folders.extend(watch_new_folders(watcher.as_mut(), &event, &set));
                 }
                 if let Some(paths) = relevant_paths(&event, &options.magento_root) {
                     pending.extend(paths);
@@ -277,6 +288,28 @@ fn replace_watches(watcher: &mut (dyn Watcher + Send), old: &WatchSet, new: &Wat
     if let Err(e) = add_watches(watcher, new) {
         eprintln!("{} warning: could not watch every folder: {e}", clock());
     }
+}
+
+/// Folders created in quick succession (a module copied in, a `git checkout`) can appear between
+/// the listing of a new parent folder and the start of its watch, and then stay unwatched. Each
+/// new folder is watched again, recursively, at once and once more right before the next
+/// compile, when the copy is complete. Returns the new folders for that second pass.
+fn watch_new_folders(
+    watcher: &mut (dyn Watcher + Send),
+    event: &Event,
+    set: &WatchSet,
+) -> Vec<PathBuf> {
+    if !matches!(event.kind, EventKind::Create(_)) {
+        return Vec::new();
+    }
+    let mut created = Vec::new();
+    for path in &event.paths {
+        if path.is_dir() && set.recursive.iter().any(|root| path.starts_with(root)) {
+            let _ = watcher.watch(path, RecursiveMode::Recursive);
+            created.push(path.clone());
+        }
+    }
+    created
 }
 
 /// The paths of `event` that call for a compile, or `None`.
@@ -504,8 +537,10 @@ fn remove_leftovers(options: &Options, pid: u32) {
     let _ = std::fs::remove_file(temp.join(format!("fast-di-classes-{pid}.txt")));
 }
 
-/// The module list lives in the `config` cache too (routes, for example), so a change of
-/// `app/etc/config.php` needs `cache:clean config` after the compile.
+/// The module list lives in caches too: routes in `config`, and in the compiled environment the
+/// controller list of `App\Router\ActionList` in `compiled_config`. A change of
+/// `app/etc/config.php` needs both cleaned after the compile, or a newly enabled module's pages
+/// answer 404.
 fn clean_config(options: &Options) {
     let magento = options.magento_root.join("bin/magento");
     if !magento.is_file() {
@@ -513,20 +548,26 @@ fn clean_config(options: &Options) {
     }
     let result = Command::new(&options.php)
         .arg(&magento)
-        .args(["cache:clean", "config", "--quiet"])
+        .args(["cache:clean", "config", "compiled_config", "--quiet"])
         .current_dir(&options.magento_root)
         .stdin(Stdio::null())
         .output();
     match result {
         Ok(output) if output.status.success() => {
-            eprintln!("{}   cache:clean config (module list changed)", clock())
+            eprintln!(
+                "{}   cache:clean config compiled_config (module list changed)",
+                clock()
+            )
         }
         Ok(output) => eprintln!(
-            "{} warning: cache:clean config failed: {}",
+            "{} warning: cache:clean config compiled_config failed: {}",
             clock(),
             String::from_utf8_lossy(&output.stderr).trim()
         ),
-        Err(e) => eprintln!("{} warning: could not run cache:clean config: {e}", clock()),
+        Err(e) => eprintln!(
+            "{} warning: could not run cache:clean config compiled_config: {e}",
+            clock()
+        ),
     }
 }
 

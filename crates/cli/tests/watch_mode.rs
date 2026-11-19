@@ -539,3 +539,37 @@ fn watch_refuses_one_off_modes() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--watch cannot be combined"));
 }
+
+#[test]
+fn a_module_copied_in_is_watched_down_to_its_deepest_folder() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    let mut watcher = store.watch(&["--watch"]);
+    // Created in one go, as a copy or a checkout does.
+    let module = store.root().join("app/code/Acme/Two");
+    fs::create_dir_all(module.join("etc/frontend")).unwrap();
+    fs::write(module.join("registration.php"), "<?php\n").unwrap();
+    fs::write(
+        module.join("etc/module.xml"),
+        "<config><module name=\"Acme_Two\"/></config>\n",
+    )
+    .unwrap();
+    fs::write(module.join("etc/frontend/di.xml"), "<config/>\n").unwrap();
+    let mut status = watcher.next_status(WAIT);
+    while !status.contains("app/code/Acme/Two") {
+        status = watcher.next_status(WAIT);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    fs::write(
+        module.join("etc/frontend/di.xml"),
+        "<config><!-- changed --></config>\n",
+    )
+    .unwrap();
+    let status = watcher.next_status(WAIT);
+    assert!(
+        status.contains("app/code/Acme/Two/etc/frontend/di.xml"),
+        "{status}"
+    );
+}
