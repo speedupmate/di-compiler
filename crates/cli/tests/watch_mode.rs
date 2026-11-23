@@ -722,7 +722,8 @@ fn fake_magento(store: &Store, mode: &str) {
          file_put_contents($root . '/var/clean.log', implode(' ', array_slice($argv, 1)) . \"\\n\", FILE_APPEND);\n\
          $mode = @file_get_contents(__DIR__ . '/clean-mode');\n\
          if ($mode === 'fail') {\n    fwrite(STDERR, \"cache backend down\\n\");\n    exit(1);\n}\n\
-         if ($mode === 'slow') {\n    sleep(30);\n}\nexit(0);\n",
+         if ($mode === 'slow') {\n    sleep(30);\n}\n\
+         if ($mode === 'linger') {\n    exec((is_executable('/usr/bin/setsid') ? 'setsid ' : '') . 'sleep 10 > /dev/null &');\n}\nexit(0);\n",
     );
     write(store.root(), "bin/clean-mode", mode);
     fs::create_dir_all(store.root().join("var")).unwrap();
@@ -792,5 +793,64 @@ fn sigint_during_a_cache_clean_stops_at_once() {
         started.elapsed() < Duration::from_secs(2),
         "{:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn a_process_left_by_the_cache_clean_does_not_hold_up_the_watcher() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    // The process keeps the stderr of the cache clean open after `bin/magento` ends.
+    fake_magento(&store, "linger");
+    let mut watcher = store.watch(&["--watch"]);
+    touch_module_list(&store);
+    assert!(watcher.next_status(WAIT).contains("✓ compiled"));
+    assert!(
+        watcher.wait_for("(module list changed)", Duration::from_secs(5)),
+        "{}",
+        watcher.seen.join("\n")
+    );
+    let started = Instant::now();
+    watcher.signal(libc::SIGTERM);
+    let (code, output) = watcher.wait(Duration::from_secs(15));
+    assert_eq!(code, Some(143), "{}", output.join("\n"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn metadata_that_cannot_be_removed_is_reported_as_still_in_use() {
+    if !has_php() {
+        return;
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can remove files from a read-only folder");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let store = Store::new();
+    let mut watcher = store.watch(&["--watch"]);
+    let metadata = store.root().join("generated/metadata");
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o555)).unwrap();
+    replace(
+        store.root(),
+        "app/code/Acme/On/etc/di.xml",
+        &plugin_on(&["Widget"]),
+    );
+    let status = watcher.next_status(WAIT);
+    let reported = watcher.wait_for("still runs on the metadata of an earlier compile", WAIT);
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = watcher.seen.join("\n");
+    assert!(status.contains("✗ failed"), "{output}");
+    assert!(store.metadata().exists(), "{output}");
+    assert!(reported, "{output}");
+    assert!(
+        !output.contains("store runs without compiled metadata"),
+        "{output}"
     );
 }

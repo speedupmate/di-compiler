@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ const CLEAN_TIMEOUT: Duration = Duration::from_secs(60);
 const CLEAN_RETRY_FIRST: Duration = Duration::from_secs(2);
 const CLEAN_RETRY_MAX: Duration = Duration::from_secs(60);
 const POLL_DEFAULT: Duration = Duration::from_millis(1000);
+const PIPE_DRAIN: Duration = Duration::from_millis(500);
 
 pub struct Options {
     pub magento_root: PathBuf,
@@ -428,15 +429,15 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            remove_metadata(options);
+            let removal = remove_metadata(options);
             eprintln!("{} ✗ could not start the compile: {e}", clock());
-            eprintln!("{RUNTIME_MODE}");
+            removal.report();
             return false;
         }
     };
     let pid = child.id();
-    let stdout = read_all(child.stdout.take());
-    let stderr = read_all(child.stderr.take());
+    let stdout = capture(child.stdout.take());
+    let stderr = capture(child.stderr.take());
 
     let mut stop_sent: Option<(Instant, usize)> = None;
     let mut killed = false;
@@ -470,24 +471,51 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
     send(pid, Stop::KillGroup);
     let outcome = Outcome {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: stdout.finish(),
+        stderr: stderr.finish(),
         killed,
     };
     if outcome.killed {
-        remove_leftovers(options, pid);
+        remove_leftovers(pid);
     }
     let summary = summary_of(&outcome);
     let ok = succeeded(&outcome, summary.as_ref());
     // Before the status line, so the line always describes what is on disk.
-    if !ok {
-        remove_metadata(options);
-    }
+    let removal = (!ok).then(|| remove_metadata(options));
     report(&outcome, summary.as_ref(), ok, started, trigger);
-    if !ok {
-        eprintln!("{RUNTIME_MODE}");
+    if let Some(removal) = removal {
+        removal.report();
     }
     ok
+}
+
+/// What a failed compile left the store running on.
+enum Removal {
+    /// No `global.php`: Magento builds its object manager from the configuration at runtime.
+    Runtime,
+    /// `global.php` is gone, other metadata files are left. Magento reads none of them without it.
+    RuntimeWithLeftovers(std::io::Error),
+    /// `global.php` is still there, so Magento keeps using the metadata of an earlier compile.
+    Stale(PathBuf, std::io::Error),
+}
+
+impl Removal {
+    fn report(&self) {
+        match self {
+            Self::Runtime => eprintln!("{RUNTIME_MODE}"),
+            Self::RuntimeWithLeftovers(e) => {
+                eprintln!("{RUNTIME_MODE}");
+                eprintln!("warning: some files in generated/metadata could not be removed: {e}");
+            }
+            Self::Stale(path, e) => {
+                eprintln!("error: could not remove {}: {e}", path.display());
+                eprintln!(
+                    "store still runs on the metadata of an earlier compile; \
+                     fix the permissions of generated/metadata or remove it"
+                );
+            }
+        }
+    }
 }
 
 const RUNTIME_MODE: &str = "store runs without compiled metadata until the next successful compile";
@@ -495,10 +523,19 @@ const RUNTIME_MODE: &str = "store runs without compiled metadata until the next 
 /// After a failed compile the store must never run on the metadata of an earlier compile. A
 /// compile that stops early (an incompatible module, for example) leaves its output alone, as a
 /// one-off compile should, so the watcher removes the metadata itself.
-fn remove_metadata(options: &Options) {
+///
+/// `EnvironmentFactory` picks the compiled object manager by the existence of `global.php`, so
+/// that file goes first and decides what the store runs on.
+fn remove_metadata(options: &Options) -> Removal {
     let metadata = options.generated_root.join("metadata");
-    if metadata.exists() {
-        let _ = std::fs::remove_dir_all(&metadata);
+    let global = metadata.join("global.php");
+    match std::fs::remove_file(&global) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Removal::Stale(global, e),
+        _ => {}
+    }
+    match std::fs::remove_dir_all(&metadata) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Removal::RuntimeWithLeftovers(e),
+        _ => Removal::Runtime,
     }
 }
 
@@ -565,16 +602,47 @@ fn report(
     }
 }
 
-fn read_all<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(mut pipe) = pipe {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            text = String::from_utf8_lossy(&bytes).into_owned();
+/// A child's pipe, read on its own thread so the child never blocks on a full pipe.
+struct Capture {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    reader: JoinHandle<()>,
+}
+
+fn capture<R: Read + Send + 'static>(pipe: Option<R>) -> Capture {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&bytes);
+    let reader = std::thread::spawn(move || {
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
         }
-        text
-    })
+    });
+    Capture { bytes, reader }
+}
+
+impl Capture {
+    /// The text of the pipe, called once the child has ended. A process the child started can
+    /// keep the pipe open long after that, so the wait for the end of the pipe is short and what
+    /// arrived until then is the result. The reader thread then ends with that process.
+    fn finish(self) -> String {
+        let until = Instant::now() + PIPE_DRAIN;
+        while !self.reader.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let bytes = self.bytes.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 enum Stop {
@@ -602,9 +670,9 @@ fn send(pid: u32, stop: Stop) {
 #[cfg(not(unix))]
 fn send(_pid: u32, _stop: Stop) {}
 
-/// What a killed compile could not remove itself, as `stop_compile()` would have.
-fn remove_leftovers(options: &Options, pid: u32) {
-    let _ = std::fs::remove_dir_all(options.generated_root.join("metadata"));
+/// The worker files a killed compile could not remove itself, as `stop_compile()` would have.
+/// `remove_metadata()` takes care of the metadata after every failed compile.
+fn remove_leftovers(pid: u32) {
     let temp = std::env::temp_dir();
     let _ = std::fs::remove_file(temp.join(format!("fast-di-worker-{pid}.php")));
     let _ = std::fs::remove_file(temp.join(format!("fast-di-classes-{pid}.txt")));
@@ -698,7 +766,7 @@ fn clean_config(options: &Options, received: &Received) -> Clean {
         }
     };
     let pid = child.id();
-    let stderr = read_all(child.stderr.take());
+    let stderr = capture(child.stderr.take());
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -723,7 +791,9 @@ fn clean_config(options: &Options, received: &Received) -> Clean {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let stderr = stderr.join().unwrap_or_default();
+    // Whatever the cache command left running in its group ends with it, as after a compile.
+    send(pid, Stop::KillGroup);
+    let stderr = stderr.finish();
     if status.is_some_and(|status| status.success()) {
         eprintln!(
             "{}   cache:clean config compiled_config (module list changed)",
