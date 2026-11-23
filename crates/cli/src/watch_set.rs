@@ -39,11 +39,12 @@ const COMPOSER_FILES: [&str; 2] = ["installed.json", "autoload_files.php"];
 ///   repository), with all subfolders, at its real path;
 /// - the `etc/` folder of every module inside `vendor/`, with all subfolders, since vendor code
 ///   changes through Composer and only `di.xml` there changes by hand;
-/// - `app/etc/` for `di.xml` and `config.php`, `vendor/composer/` for the Composer files.
+/// - `app/etc/` with all subfolders, for `di.xml`, `config.php` and `*/di.xml`;
+/// - `vendor/composer/` for the Composer files.
 pub fn resolve(magento_root: &Path) -> WatchSet {
     let root = real(magento_root);
     let vendor = root.join("vendor");
-    let mut recursive: Vec<PathBuf> = ["app/code", "lib/internal"]
+    let mut recursive: Vec<PathBuf> = ["app/code", "lib/internal", "app/etc"]
         .iter()
         .map(|folder| root.join(folder))
         .filter(|folder| folder.is_dir())
@@ -72,14 +73,11 @@ pub fn resolve(magento_root: &Path) -> WatchSet {
     recursive.dedup();
     let recursive = without_nested(recursive);
 
-    let filtered = [
-        (root.join("app/etc"), vec!["di.xml", "config.php"]),
-        (vendor.join("composer"), COMPOSER_FILES.to_vec()),
-    ]
-    .into_iter()
-    .filter(|(folder, _)| folder.is_dir())
-    .map(|(folder, names)| FilteredFolder { folder, names })
-    .collect();
+    let filtered = [(vendor.join("composer"), COMPOSER_FILES.to_vec())]
+        .into_iter()
+        .filter(|(folder, _)| folder.is_dir())
+        .map(|(folder, names)| FilteredFolder { folder, names })
+        .collect();
 
     WatchSet {
         recursive,
@@ -108,6 +106,9 @@ pub fn is_relevant(path: &Path, is_folder: bool, magento_root: &Path) -> bool {
     if is_editor_temporary(name) {
         return false;
     }
+    if let Ok(inside) = path.strip_prefix(root.join("app/etc")) {
+        return is_relevant_in_app_etc(inside, is_folder);
+    }
     if is_folder {
         return true;
     }
@@ -115,10 +116,19 @@ pub fn is_relevant(path: &Path, is_folder: bool, magento_root: &Path) -> bool {
     if parent == root.join("vendor/composer") {
         return COMPOSER_FILES.contains(&name);
     }
-    if parent == root.join("app/etc") {
-        return matches!(name, "di.xml" | "config.php");
-    }
     name.ends_with(".php") || matches!(name, "di.xml" | "module.xml")
+}
+
+/// The compiler reads `app/etc/di.xml` and `app/etc/*/di.xml`, the glob of Magento's primary
+/// `FileResolver`, whose `*` skips hidden folders. `config.php` holds the module list.
+fn is_relevant_in_app_etc(inside: &Path, is_folder: bool) -> bool {
+    let parts: Vec<&str> = inside.iter().filter_map(|part| part.to_str()).collect();
+    match parts.as_slice() {
+        [name] if !is_folder => matches!(*name, "di.xml" | "config.php"),
+        [folder] => !folder.starts_with('.'),
+        [folder, "di.xml"] => !is_folder && !folder.starts_with('.'),
+        _ => false,
+    }
 }
 
 /// True when the change is a Composer change, after which the module list itself can differ.
@@ -223,18 +233,13 @@ mod tests {
         assert!(!set
             .recursive
             .contains(&root.join("vendor/magento/module-a")));
+        assert!(set.recursive.contains(&root.join("app/etc")));
         assert_eq!(
             set.filtered,
-            vec![
-                FilteredFolder {
-                    folder: root.join("app/etc"),
-                    names: vec!["di.xml", "config.php"],
-                },
-                FilteredFolder {
-                    folder: root.join("vendor/composer"),
-                    names: vec!["installed.json", "autoload_files.php"],
-                },
-            ]
+            vec![FilteredFolder {
+                folder: root.join("vendor/composer"),
+                names: vec!["installed.json", "autoload_files.php"],
+            }]
         );
         assert!(!set
             .recursive
@@ -255,7 +260,14 @@ mod tests {
         assert!(relevant("vendor/composer/installed.json"));
         assert!(relevant("vendor/composer/autoload_files.php"));
 
+        assert!(relevant("app/etc/local/di.xml"));
+        assert!(is_relevant(&root.join("app/etc/local"), true, &root));
+
         assert!(!relevant("app/etc/env.php"));
+        assert!(!relevant("app/etc/local/env.php"));
+        assert!(!relevant("app/etc/local/deeper/di.xml"));
+        assert!(!relevant("app/etc/.hidden/di.xml"));
+        assert!(!is_relevant(&root.join("app/etc/.hidden"), true, &root));
         assert!(!relevant("vendor/composer/autoload_classmap.php"));
         assert!(!relevant("app/code/Acme/On/etc/acl.xml"));
         assert!(!relevant("app/code/Acme/On/view/frontend/web/js/a.js"));

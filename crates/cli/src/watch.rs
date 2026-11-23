@@ -25,6 +25,9 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// A terminal sends Ctrl+C to every process of its foreground group, and `bin/magento` forwards
 /// it too, so signals this close together count as one stop request.
 const SAME_STOP: Duration = Duration::from_secs(1);
+const CLEAN_TIMEOUT: Duration = Duration::from_secs(60);
+const CLEAN_RETRY_FIRST: Duration = Duration::from_secs(2);
+const CLEAN_RETRY_MAX: Duration = Duration::from_secs(60);
 const POLL_DEFAULT: Duration = Duration::from_millis(1000);
 
 pub struct Options {
@@ -161,7 +164,7 @@ pub fn run(options: Options) -> ! {
     let mut new_folders: Vec<PathBuf> = Vec::new();
     let mut last_event = Instant::now();
     let mut compile_now: Option<String> = Some("start".into());
-    let mut clean_config_cache = false;
+    let mut config_cache = ConfigCacheClean::default();
     let mut check_metadata = false;
     let mut last_check = Instant::now();
 
@@ -182,9 +185,12 @@ pub fn run(options: Options) -> ! {
             let trigger = compile_now
                 .take()
                 .unwrap_or_else(|| describe(&triggers, &options));
-            clean_config_cache |= triggers
+            if triggers
                 .iter()
-                .any(|path| watch_set::is_module_list_change(path, &options.magento_root));
+                .any(|path| watch_set::is_module_list_change(path, &options.magento_root))
+            {
+                config_cache.request();
+            }
             if triggers
                 .iter()
                 .any(|path| watch_set::is_composer_change(path, &options.magento_root))
@@ -194,9 +200,8 @@ pub fn run(options: Options) -> ! {
                 set = next;
             }
             let ok = compile(&options, &child_args, &received, &trigger);
-            if ok && clean_config_cache {
-                clean_config(&options);
-                clean_config_cache = false;
+            if ok {
+                config_cache.run_if_requested(&options, &received);
             }
             check_metadata = ok;
             last_check = Instant::now();
@@ -222,6 +227,10 @@ pub fn run(options: Options) -> ! {
                 eprintln!("error: the file watcher stopped");
                 std::process::exit(1);
             }
+        }
+
+        if check_metadata && pending.is_empty() && config_cache.retry_due() {
+            config_cache.run_if_requested(&options, &received);
         }
 
         if check_metadata && pending.is_empty() && last_check.elapsed() >= METADATA_CHECK {
@@ -420,6 +429,7 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
         Ok(child) => child,
         Err(e) => {
             eprintln!("{} ✗ could not start the compile: {e}", clock());
+            run_without_metadata(options);
             return false;
         }
     };
@@ -466,10 +476,25 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
     if outcome.killed {
         remove_leftovers(options, pid);
     }
-    report(options, &outcome, started, trigger)
+    let ok = report(&outcome, started, trigger);
+    if !ok {
+        run_without_metadata(options);
+    }
+    ok
 }
 
-fn report(options: &Options, outcome: &Outcome, started: Instant, trigger: &str) -> bool {
+/// After a failed compile the store must never run on the metadata of an earlier compile. A
+/// compile that stops early (an incompatible module, for example) leaves its output alone, as a
+/// one-off compile should, so the watcher removes the metadata itself.
+fn run_without_metadata(options: &Options) {
+    let metadata = options.generated_root.join("metadata");
+    if metadata.exists() {
+        let _ = std::fs::remove_dir_all(&metadata);
+    }
+    eprintln!("store runs without compiled metadata until the next successful compile");
+}
+
+fn report(outcome: &Outcome, started: Instant, trigger: &str) -> bool {
     let summary: Option<serde_json::Value> = outcome
         .stdout
         .lines()
@@ -519,9 +544,6 @@ fn report(options: &Options, outcome: &Outcome, started: Instant, trigger: &str)
                 Some(code) => eprintln!("error: the compile ended with exit code {code}"),
                 None => eprintln!("error: the compile ended by a signal"),
             }
-        }
-        if !options.generated_root.join("metadata/global.php").exists() {
-            eprintln!("store runs without compiled metadata until the next successful compile");
         }
     }
     ok
@@ -574,36 +596,131 @@ fn remove_leftovers(options: &Options, pid: u32) {
 
 /// The module list lives in caches too: routes in `config`, and in the compiled environment the
 /// controller list of `App\Router\ActionList` in `compiled_config`. A change of
-/// `app/etc/config.php` needs both cleaned after the compile, or a newly enabled module's pages
-/// answer 404.
-fn clean_config(options: &Options) {
+/// `app/etc/config.php` needs both cleaned after a passing compile, or a newly enabled module's
+/// pages answer 404. A failed clean stays requested and is tried again with growing pauses.
+struct ConfigCacheClean {
+    requested: bool,
+    retry_at: Option<Instant>,
+    pause: Duration,
+}
+
+impl Default for ConfigCacheClean {
+    fn default() -> Self {
+        Self {
+            requested: false,
+            retry_at: None,
+            pause: CLEAN_RETRY_FIRST,
+        }
+    }
+}
+
+impl ConfigCacheClean {
+    fn request(&mut self) {
+        self.requested = true;
+        self.retry_at = None;
+        self.pause = CLEAN_RETRY_FIRST;
+    }
+
+    fn retry_due(&self) -> bool {
+        self.requested && self.retry_at.is_some_and(|at| Instant::now() >= at)
+    }
+
+    fn run_if_requested(&mut self, options: &Options, received: &Received) {
+        if !self.requested {
+            return;
+        }
+        match clean_config(options, received) {
+            Clean::Done => *self = Self::default(),
+            Clean::Failed => {
+                eprintln!(
+                    "{}   cache:clean config compiled_config will be tried again in {}s",
+                    clock(),
+                    self.pause.as_secs()
+                );
+                self.retry_at = Some(Instant::now() + self.pause);
+                self.pause = (self.pause * 2).min(CLEAN_RETRY_MAX);
+            }
+            Clean::Interrupted => {}
+        }
+    }
+}
+
+enum Clean {
+    Done,
+    Failed,
+    Interrupted,
+}
+
+/// Runs `bin/magento cache:clean config compiled_config` in its own process group, so a stop
+/// request or the timeout can end it together with anything it started.
+fn clean_config(options: &Options, received: &Received) -> Clean {
     let magento = options.magento_root.join("bin/magento");
     if !magento.is_file() {
-        return;
+        return Clean::Done;
     }
-    let result = Command::new(&options.php)
+    let mut command = Command::new(&options.php);
+    command
         .arg(&magento)
         .args(["cache:clean", "config", "compiled_config", "--quiet"])
         .current_dir(&options.magento_root)
         .stdin(Stdio::null())
-        .output();
-    match result {
-        Ok(output) if output.status.success() => {
-            eprintln!(
-                "{}   cache:clean config compiled_config (module list changed)",
-                clock()
-            )
-        }
-        Ok(output) => eprintln!(
-            "{} warning: cache:clean config compiled_config failed: {}",
-            clock(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(e) => eprintln!(
-            "{} warning: could not run cache:clean config compiled_config: {e}",
-            clock()
-        ),
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!(
+                "{} warning: could not run cache:clean config compiled_config: {e}",
+                clock()
+            );
+            return Clean::Failed;
+        }
+    };
+    let pid = child.id();
+    let stderr = read_all(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if received.count() > 0 {
+            send(pid, Stop::KillGroup);
+            let _ = child.wait();
+            return Clean::Interrupted;
+        }
+        if started.elapsed() >= CLEAN_TIMEOUT {
+            send(pid, Stop::KillGroup);
+            let _ = child.wait();
+            eprintln!(
+                "{} warning: cache:clean config compiled_config did not finish within {}s",
+                clock(),
+                CLEAN_TIMEOUT.as_secs()
+            );
+            return Clean::Failed;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stderr = stderr.join().unwrap_or_default();
+    if status.is_some_and(|status| status.success()) {
+        eprintln!(
+            "{}   cache:clean config compiled_config (module list changed)",
+            clock()
+        );
+        return Clean::Done;
+    }
+    eprintln!(
+        "{} warning: cache:clean config compiled_config failed: {}",
+        clock(),
+        stderr.trim()
+    );
+    Clean::Failed
 }
 
 #[cfg(unix)]

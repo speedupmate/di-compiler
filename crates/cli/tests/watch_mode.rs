@@ -179,6 +179,24 @@ impl Watcher {
         }
     }
 
+    /// True when a line containing `text` was printed, waiting up to `timeout` for it.
+    fn wait_for(&mut self, text: &str, timeout: Duration) -> bool {
+        if self.seen.iter().any(|line| line.contains(text)) {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        while let Ok(line) = self
+            .lines
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            self.seen.push(line.clone());
+            if line.contains(text) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// True when no status line arrives within `quiet`.
     fn stays_quiet(&mut self, quiet: Duration) -> bool {
         let deadline = Instant::now() + quiet;
@@ -637,5 +655,142 @@ fn the_watcher_stops_when_its_parent_ends() {
         store.leftovers().iter().all(|name| name == "watch.log"),
         "{:?}",
         store.leftovers()
+    );
+}
+
+#[test]
+fn a_di_xml_in_an_app_etc_folder_compiles_again() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    let mut watcher = store.watch(&["--watch"]);
+    write(
+        store.root(),
+        "app/etc/local/di.xml",
+        &plugin_on(&["Gadget"]),
+    );
+    let mut status = watcher.next_status(WAIT);
+    while !status.contains("app/etc/local") {
+        status = watcher.next_status(WAIT);
+    }
+    assert!(status.contains("✓ compiled"), "{status}");
+    assert!(store.interceptor("Gadget").exists());
+    write(
+        store.root(),
+        "app/etc/local/di.xml",
+        &plugin_on(&["Gadget", "Widget"]),
+    );
+    assert!(watcher.next_status(WAIT).contains("app/etc/local/di.xml"));
+    assert!(store.interceptor("Widget").exists());
+}
+
+#[test]
+fn a_compile_that_stops_early_still_removes_the_metadata() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    let mut watcher = store.watch(&["--watch"]);
+    assert!(store.metadata().exists());
+    // An incompatible module stops the compile before it touches its output.
+    replace(
+        store.root(),
+        "app/etc/config.php",
+        "<?php\nreturn [\n    'modules' => [\n        'Acme_On' => 1,\n        'Creatuity_Interception' => 1,\n    ],\n];\n",
+    );
+    let status = watcher.next_status(WAIT);
+    assert!(status.contains("✗ failed"), "{status}");
+    assert!(!store.metadata().exists());
+    assert!(watcher.wait_for("store runs without compiled metadata", WAIT));
+
+    replace(
+        store.root(),
+        "app/etc/config.php",
+        "<?php\nreturn [\n    'modules' => [\n        'Acme_On' => 1,\n    ],\n];\n",
+    );
+    assert!(watcher.next_status(WAIT).contains("✓ compiled"));
+    assert!(store.metadata().exists());
+}
+
+/// A `bin/magento` that logs each run to `var/clean.log` and behaves as `bin/clean-mode` says.
+fn fake_magento(store: &Store, mode: &str) {
+    write(
+        store.root(),
+        "bin/magento",
+        "<?php\n$root = dirname(__DIR__);\n\
+         file_put_contents($root . '/var/clean.log', implode(' ', array_slice($argv, 1)) . \"\\n\", FILE_APPEND);\n\
+         $mode = @file_get_contents(__DIR__ . '/clean-mode');\n\
+         if ($mode === 'fail') {\n    fwrite(STDERR, \"cache backend down\\n\");\n    exit(1);\n}\n\
+         if ($mode === 'slow') {\n    sleep(30);\n}\nexit(0);\n",
+    );
+    write(store.root(), "bin/clean-mode", mode);
+    fs::create_dir_all(store.root().join("var")).unwrap();
+}
+
+fn touch_module_list(store: &Store) {
+    replace(
+        store.root(),
+        "app/etc/config.php",
+        "<?php\nreturn [\n    'modules' => [\n        'Acme_On' => 1,\n    ],\n];\n// touched\n",
+    );
+}
+
+#[test]
+fn a_failed_cache_clean_is_tried_again_without_a_new_change() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    fake_magento(&store, "fail");
+    let mut watcher = store.watch(&["--watch"]);
+    touch_module_list(&store);
+    assert!(watcher.next_status(WAIT).contains("✓ compiled"));
+    assert!(
+        watcher.wait_for("will be tried again in 2s", WAIT),
+        "{}",
+        watcher.seen.join("\n")
+    );
+    assert!(watcher.seen.join("\n").contains("cache backend down"));
+
+    write(store.root(), "bin/clean-mode", "ok");
+    assert!(
+        watcher.wait_for("(module list changed)", Duration::from_secs(10)),
+        "{}",
+        watcher.seen.join("\n")
+    );
+    let runs = fs::read_to_string(store.root().join("var/clean.log")).unwrap();
+    assert!(runs.lines().count() >= 2, "{runs}");
+    assert!(
+        runs.lines()
+            .all(|line| line == "cache:clean config compiled_config --quiet"),
+        "{runs}"
+    );
+}
+
+#[test]
+fn sigint_during_a_cache_clean_stops_at_once() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    fake_magento(&store, "slow");
+    let mut watcher = store.watch(&["--watch"]);
+    touch_module_list(&store);
+    assert!(watcher.next_status(WAIT).contains("✓ compiled"));
+    let deadline = Instant::now() + WAIT;
+    while !store.root().join("var/clean.log").exists() {
+        assert!(Instant::now() < deadline, "the cache clean never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    watcher.signal(libc::SIGINT);
+    let (code, output) = watcher.wait(Duration::from_secs(10));
+    assert_eq!(code, Some(130), "{}", output.join("\n"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
     );
 }
