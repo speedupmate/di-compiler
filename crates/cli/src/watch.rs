@@ -428,8 +428,9 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
+            remove_metadata(options);
             eprintln!("{} ✗ could not start the compile: {e}", clock());
-            run_without_metadata(options);
+            eprintln!("{RUNTIME_MODE}");
             return false;
         }
     };
@@ -476,43 +477,59 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
     if outcome.killed {
         remove_leftovers(options, pid);
     }
-    let ok = report(&outcome, started, trigger);
+    let summary = summary_of(&outcome);
+    let ok = succeeded(&outcome, summary.as_ref());
+    // Before the status line, so the line always describes what is on disk.
     if !ok {
-        run_without_metadata(options);
+        remove_metadata(options);
+    }
+    report(&outcome, summary.as_ref(), ok, started, trigger);
+    if !ok {
+        eprintln!("{RUNTIME_MODE}");
     }
     ok
 }
 
+const RUNTIME_MODE: &str = "store runs without compiled metadata until the next successful compile";
+
 /// After a failed compile the store must never run on the metadata of an earlier compile. A
 /// compile that stops early (an incompatible module, for example) leaves its output alone, as a
 /// one-off compile should, so the watcher removes the metadata itself.
-fn run_without_metadata(options: &Options) {
+fn remove_metadata(options: &Options) {
     let metadata = options.generated_root.join("metadata");
     if metadata.exists() {
         let _ = std::fs::remove_dir_all(&metadata);
     }
-    eprintln!("store runs without compiled metadata until the next successful compile");
 }
 
-fn report(outcome: &Outcome, started: Instant, trigger: &str) -> bool {
-    let summary: Option<serde_json::Value> = outcome
+fn summary_of(outcome: &Outcome) -> Option<serde_json::Value> {
+    outcome
         .stdout
         .lines()
         .rev()
         .find(|line| line.starts_with('{'))
-        .and_then(|line| serde_json::from_str(line).ok());
-    let ok = summary
-        .as_ref()
+        .and_then(|line| serde_json::from_str(line).ok())
+}
+
+fn succeeded(outcome: &Outcome, summary: Option<&serde_json::Value>) -> bool {
+    summary
         .and_then(|summary| summary["ok"].as_bool())
         .unwrap_or(false)
-        && outcome.status.is_some_and(|status| status.success());
+        && outcome.status.is_some_and(|status| status.success())
+}
+
+fn report(
+    outcome: &Outcome,
+    summary: Option<&serde_json::Value>,
+    ok: bool,
+    started: Instant,
+    trigger: &str,
+) {
     let seconds = summary
-        .as_ref()
         .and_then(|summary| summary["duration_ms"].as_u64())
         .map(|ms| ms as f64 / 1000.0)
         .unwrap_or_else(|| started.elapsed().as_secs_f64());
     let written = summary
-        .as_ref()
         .and_then(|summary| summary["files_written"].as_u64())
         .unwrap_or(0);
     let suffix = if trigger.is_empty() {
@@ -546,7 +563,6 @@ fn report(outcome: &Outcome, started: Instant, trigger: &str) -> bool {
             }
         }
     }
-    ok
 }
 
 fn read_all<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
