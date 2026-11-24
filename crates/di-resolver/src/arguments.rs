@@ -114,8 +114,13 @@ pub fn resolve_for_class(
     const_map: &FxHashMap<String, String>,
 ) -> Vec<ResolvedArg> {
     let di_args = merged_di_arguments_for_type_name(fqcn, class_map, di_config);
-    let di_arg_map: FxHashMap<&str, &Argument> =
-        di_args.iter().map(|a| (argument_name(a), a)).collect();
+    // `xsi:type="null"` interprets to PHP null, and `isset()` in
+    // `ArgumentsResolver::getResolvedConstructorArguments()` skips a null argument.
+    let di_arg_map: FxHashMap<&str, &Argument> = di_args
+        .iter()
+        .filter(|a| !matches!(a, Argument::Null { .. }))
+        .map(|a| (argument_name(a), a))
+        .collect();
     let Some(ctor) = &info.constructor else {
         return vec![];
     };

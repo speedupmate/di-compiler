@@ -1,6 +1,7 @@
 //! PHP treats a parameter with a default as required when a required parameter follows it,
 //! `Type $param = null` included. `ClassReader::getConstructor()` reads that from reflection, so
-//! `ArgumentsResolver` gives such a parameter an instance and not its default.
+//! `ArgumentsResolver` gives such a parameter an instance and not its default. It skips a
+//! configured `xsi:type="null"` argument, because `isset()` is false for the null it interprets to.
 
 use std::fs;
 use std::path::Path;
@@ -13,6 +14,10 @@ fn write(root: &Path, relative: &str, content: &str) {
 }
 
 fn global_metadata_for(constructor: &str) -> Option<String> {
+    global_metadata_with_di_xml(constructor, None)
+}
+
+fn global_metadata_with_di_xml(constructor: &str, di_xml: Option<&str>) -> Option<String> {
     if Command::new("php").arg("-v").output().is_err() {
         eprintln!("skipped: these tests need php on the PATH");
         return None;
@@ -51,6 +56,9 @@ fn global_metadata_for(constructor: &str) -> Option<String> {
             "<?php\nnamespace Acme\\First\\Model;\n\nclass Thing\n{{\n    public function __construct({constructor})\n    {{\n    }}\n}}\n"
         ),
     );
+    if let Some(di_xml) = di_xml {
+        write(root, "app/code/Acme/First/etc/di.xml", di_xml);
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_fast-di-compile"))
         .arg("--magento-root")
         .arg(root)
@@ -124,4 +132,34 @@ fn nullable_parameter_without_a_default_gets_an_instance() {
         arguments.contains("'_i_' => 'Acme\\\\First\\\\Model\\\\Gadget'"),
         "{arguments}"
     );
+}
+
+const NULL_GADGET_DI_XML: &str = "<config xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\
+    <type name=\"Acme\\First\\Model\\Thing\"><arguments>\
+    <argument name=\"gadget\" xsi:type=\"null\"/>\
+    </arguments></type></config>\n";
+
+#[test]
+fn configured_null_for_a_required_parameter_gives_an_instance() {
+    let Some(metadata) =
+        global_metadata_with_di_xml("?Gadget $gadget, Widget $widget", Some(NULL_GADGET_DI_XML))
+    else {
+        return;
+    };
+    let arguments = thing_arguments(&metadata);
+    assert!(
+        arguments.contains("'_i_' => 'Acme\\\\First\\\\Model\\\\Gadget'"),
+        "{arguments}"
+    );
+}
+
+#[test]
+fn configured_null_for_an_optional_parameter_gives_its_default() {
+    let Some(metadata) =
+        global_metadata_with_di_xml("Widget $widget, $gadget = 5", Some(NULL_GADGET_DI_XML))
+    else {
+        return;
+    };
+    let arguments = thing_arguments(&metadata);
+    assert!(arguments.contains("'_v_' => 5"), "{arguments}");
 }
