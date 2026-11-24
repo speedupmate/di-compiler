@@ -10,8 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, PoisonError};
-use std::thread::JoinHandle;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, CreateKind, MetadataKind, ModifyKind, RemoveKind};
@@ -436,12 +435,14 @@ fn compile(options: &Options, child_args: &[OsString], received: &Received, trig
         }
     };
     let pid = child.id();
-    let stdout = capture(child.stdout.take());
-    let stderr = capture(child.stderr.take());
+    let mut stdout = capture(child.stdout.take());
+    let mut stderr = capture(child.stderr.take());
 
     let mut stop_sent: Option<(Instant, usize)> = None;
     let mut killed = false;
     let status = loop {
+        stdout.pump();
+        stderr.pump();
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
@@ -602,46 +603,76 @@ fn report(
     }
 }
 
-/// A child's pipe, read on its own thread so the child never blocks on a full pipe.
+/// A child's pipe, read without blocking by the loop that waits for the child. The child never
+/// blocks on a full pipe, and a process the child started can hold the pipe open without holding
+/// a thread or a file descriptor of the watcher.
 struct Capture {
-    bytes: Arc<Mutex<Vec<u8>>>,
-    reader: JoinHandle<()>,
+    pipe: Option<Box<dyn Read>>,
+    bytes: Vec<u8>,
 }
 
-fn capture<R: Read + Send + 'static>(pipe: Option<R>) -> Capture {
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&bytes);
-    let reader = std::thread::spawn(move || {
-        let Some(mut pipe) = pipe else {
-            return;
-        };
-        let mut chunk = [0u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => sink
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
+#[cfg(unix)]
+fn capture<R: Read + std::os::fd::AsRawFd + 'static>(pipe: Option<R>) -> Capture {
+    let pipe = pipe.map(|pipe| {
+        let fd = pipe.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
+        Box::new(pipe) as Box<dyn Read>
     });
-    Capture { bytes, reader }
+    Capture {
+        pipe,
+        bytes: Vec::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn capture<R: Read + 'static>(pipe: Option<R>) -> Capture {
+    Capture {
+        pipe: pipe.map(|pipe| Box::new(pipe) as Box<dyn Read>),
+        bytes: Vec::new(),
+    }
 }
 
 impl Capture {
+    /// Takes what the pipe holds now. True once the pipe has ended, which also closes it.
+    fn pump(&mut self) -> bool {
+        if cfg!(not(unix)) {
+            return self.pipe.is_none();
+        }
+        let Some(pipe) = self.pipe.as_mut() else {
+            return true;
+        };
+        let mut chunk = [0u8; 8192];
+        let ended = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(n) => self.bytes.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break false,
+                Err(_) => break true,
+            }
+        };
+        if ended {
+            self.pipe = None;
+        }
+        ended
+    }
+
     /// The text of the pipe, called once the child has ended. A process the child started can
-    /// keep the pipe open long after that, so the wait for the end of the pipe is short and what
-    /// arrived until then is the result. The reader thread then ends with that process.
-    fn finish(self) -> String {
+    /// keep the pipe open long after that, so the wait for the end of the pipe is short; then the
+    /// pipe is closed and what arrived until then is the result.
+    fn finish(mut self) -> String {
+        #[cfg(not(unix))]
+        if let Some(mut pipe) = self.pipe.take() {
+            let _ = pipe.read_to_end(&mut self.bytes);
+        }
         let until = Instant::now() + PIPE_DRAIN;
-        while !self.reader.is_finished() && Instant::now() < until {
+        while !self.pump() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let bytes = self.bytes.lock().unwrap_or_else(PoisonError::into_inner);
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
 
@@ -766,9 +797,10 @@ fn clean_config(options: &Options, received: &Received) -> Clean {
         }
     };
     let pid = child.id();
-    let stderr = capture(child.stderr.take());
+    let mut stderr = capture(child.stderr.take());
     let started = Instant::now();
     let status = loop {
+        stderr.pump();
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}

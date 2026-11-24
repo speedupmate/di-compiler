@@ -854,3 +854,54 @@ fn metadata_that_cannot_be_removed_is_reported_as_still_in_use() {
         "{output}"
     );
 }
+
+#[cfg(target_os = "linux")]
+fn threads_and_descriptors(pid: u32) -> (usize, usize) {
+    let count = |folder: &str| {
+        fs::read_dir(format!("/proc/{pid}/{folder}"))
+            .unwrap()
+            .count()
+    };
+    (count("task"), count("fd"))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_left_by_the_cache_clean_takes_no_thread_or_descriptor_of_the_watcher() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    fake_magento(&store, "linger");
+    let mut watcher = store.watch(&["--watch"]);
+    let before = threads_and_descriptors(watcher.child.id());
+    for round in 1..=3 {
+        replace(
+            store.root(),
+            "app/etc/config.php",
+            &format!(
+                "<?php\nreturn [\n    'modules' => [\n        'Acme_On' => 1,\n    ],\n];\n// {round}\n"
+            ),
+        );
+        assert!(watcher.next_status(WAIT).contains("✓ compiled"));
+        let cleans = || {
+            fs::read_to_string(store.root().join("var/clean.log"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let deadline = Instant::now() + WAIT;
+        while cleans() < round {
+            assert!(Instant::now() < deadline, "the cache clean never ran");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // Past the drain time of the last clean; the lingering processes still run.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        threads_and_descriptors(watcher.child.id()),
+        before,
+        "{}",
+        watcher.seen.join("\n")
+    );
+}
