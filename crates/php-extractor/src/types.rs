@@ -71,6 +71,21 @@ pub struct Constructor {
     pub params: Vec<ConstructorParam>,
 }
 
+/// Whether each parameter is optional for `ReflectionParameter::isOptional()`.
+///
+/// PHP treats a parameter with a default as required when a required parameter follows it,
+/// `Type $param = null` included, and its default is then not available either.
+pub fn optional_in_php(params: &[ConstructorParam]) -> Vec<bool> {
+    let mut flags = vec![false; params.len()];
+    let mut rest_is_optional = true;
+    for (index, param) in params.iter().enumerate().rev() {
+        let optional = param.is_variadic || param.is_optional;
+        flags[index] = rest_is_optional && param.is_optional;
+        rest_is_optional &= optional;
+    }
+    flags
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstructorParam {
     pub name: String,
@@ -125,4 +140,33 @@ pub enum LexError {
     UnexpectedEof,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod optional_in_php_tests {
+    use super::*;
+
+    fn param(is_optional: bool, is_variadic: bool) -> ConstructorParam {
+        ConstructorParam {
+            name: "p".to_string(),
+            type_hint: None,
+            is_optional,
+            default_value: is_optional.then(|| "null".to_string()),
+            is_primitive: false,
+            is_variadic,
+            is_promoted: false,
+        }
+    }
+
+    #[test]
+    fn a_default_before_a_required_parameter_is_required() {
+        let params = [param(true, false), param(false, false), param(true, false)];
+        assert_eq!(optional_in_php(&params), [false, false, true]);
+    }
+
+    #[test]
+    fn a_variadic_parameter_keeps_the_defaults_before_it_optional() {
+        let params = [param(true, false), param(false, true)];
+        assert_eq!(optional_in_php(&params), [true, false]);
+    }
 }

@@ -500,17 +500,12 @@ fn parse_ctor_params_ts(
                     .child_by_field_name("default_value")
                     .map(|n| node_text(n, src).trim().to_string())
                     .filter(|v| !v.is_empty());
-                let is_nullable = child.child_by_field_name("nullable_type").is_some()
-                    || type_hint
-                        .as_ref()
-                        .map(|t| t.starts_with('?'))
-                        .unwrap_or(false);
                 let is_primitive = type_hint.as_deref().map(is_primitive_type).unwrap_or(true);
 
                 params.push(ConstructorParam {
                     name,
                     type_hint,
-                    is_optional: has_default || is_nullable,
+                    is_optional: has_default,
                     default_value,
                     is_primitive,
                     is_variadic,
@@ -766,5 +761,18 @@ mod tests {
         assert!(params[2].is_optional);
         assert_eq!(params[2].type_hint.as_deref(), Some("?Foo\\Dep"));
         assert!(params[3].is_primitive);
+    }
+
+    #[test]
+    fn test_tier2_nullable_parameter_without_default_is_required() {
+        let result = extract(
+            "<?php\nnamespace Foo;\nclass Bar {\n    public function __construct(\n        private readonly Baz&Qux $x,\n        ?Dep $y,\n    ) {}\n}",
+        );
+        let ExtractResult::Ok(info) = result else {
+            panic!("Expected Ok, got {:?}", result);
+        };
+        let params = info.constructor.unwrap().params;
+        assert_eq!(params[1].type_hint.as_deref(), Some("?Foo\\Dep"));
+        assert!(!params[1].is_optional);
     }
 }

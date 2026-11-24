@@ -121,8 +121,9 @@ pub fn resolve_for_class(
     };
 
     let mut resolved = Vec::new();
+    let optional = php_extractor::types::optional_in_php(&ctor.params);
 
-    for param in &ctor.params {
+    for (param, optional) in ctor.params.iter().zip(optional) {
         // Check if di.xml overrides this param
         if let Some(di_arg) = di_arg_map.get(param.name.as_str()) {
             let type_hint = param.type_hint.as_deref().and_then(parameter_class);
@@ -149,7 +150,7 @@ pub fn resolve_for_class(
         let value = if param.is_variadic {
             // `ClassReader::getReflectionParameterDefaultValue()` gives a variadic `[]`.
             ResolvedArgValue::PlainArray(Vec::new())
-        } else if param.is_optional {
+        } else if optional {
             resolve_non_object_default(param.default_value.as_deref(), const_map)
         } else if let Some(type_hint) = param.type_hint.as_deref().and_then(parameter_class) {
             let concrete = di_config.get_preference(&type_hint);
