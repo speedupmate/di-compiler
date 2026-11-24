@@ -62,6 +62,50 @@ pub(crate) fn compiles_disabled_modules(magento_root: &Path) -> Result<bool, Str
     })
 }
 
+/// Whether the store's command passes `setup/src` to the area configuration it compiles.
+///
+/// Magento 2.4.8 added `$compiledPathsList['setup']` to `AREA_CONFIG_GENERATOR`. Without it, the
+/// classes of `setup/src` have no arguments in `generated/metadata`, and no interceptor preference
+/// follows from them. A store without the command, or with a form this code cannot read, keeps
+/// them, as Magento 2.4.8 does.
+pub(crate) fn area_config_compiles_setup_classes(magento_root: &Path) -> bool {
+    let path = magento_root.join(COMPILE_COMMAND);
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return true;
+    };
+    area_config_paths(&without_comments(&source))
+        .map(|paths| paths.contains("$compiledPathsList['setup']"))
+        .unwrap_or_else(|| {
+            log::warn!(
+                "Cannot read the AREA_CONFIG_GENERATOR paths of {}; setup/src classes are compiled as Magento 2.4.8 does",
+                path.display()
+            );
+            true
+        })
+}
+
+fn area_config_paths(code: &str) -> Option<&str> {
+    let (_, after) = code.split_once("OperationFactory::AREA_CONFIG_GENERATOR")?;
+    let list = after.trim_start().strip_prefix("=>")?.trim_start();
+    if !list.starts_with('[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, c) in list.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&list[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn scans_disabled_modules(code: &str) -> Option<bool> {
     let (before, after) = code.split_once("'application'")?;
     let variable = after.trim_start().strip_prefix("=>")?.trim_start();

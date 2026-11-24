@@ -1633,6 +1633,22 @@ fn main() {
             class_map.contains_key(class)
                 || !(disabled_class_map.contains_key(class) || boot.built.contains_key(class))
         });
+        let setup_classes_outside_area_config: FxHashSet<&str> =
+            if compile_scope::area_config_compiles_setup_classes(&magento_root) {
+                FxHashSet::default()
+            } else {
+                let setup_root = magento_root.join("setup");
+                class_map
+                    .iter()
+                    .filter(|(_, info)| info.path.starts_with(&setup_root))
+                    .map(|(name, _)| name.as_str())
+                    .filter(|name| !metadata_base_di_config.preferences.contains_key(*name))
+                    .collect()
+            };
+        argument_type_names.retain(|name| {
+            let class = name.strip_suffix("\\Interceptor").unwrap_or(name);
+            !setup_classes_outside_area_config.contains(class)
+        });
         let argument_type_names = std::sync::Arc::new(argument_type_names);
         let mut interception_type_names = build_interception_type_names(
             &interception_class_map,
@@ -1686,7 +1702,10 @@ fn main() {
     );
         // Build direct interception map once; area-specific preference/instanceTypes
         // overrides are derived from this and each area's merged DI config.
-        let global_interceptor_map = build_direct_interception_map(&interceptors);
+        let mut global_interceptor_map = build_direct_interception_map(&interceptors);
+        // `InterceptorSubstitution` finds interceptors among the classes that have arguments.
+        global_interceptor_map
+            .retain(|class, _| !setup_classes_outside_area_config.contains(class.as_str()));
         let t_interception = Instant::now();
         let all_fqcns = build_interception_registry(
             &interception_type_names,
