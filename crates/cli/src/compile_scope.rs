@@ -7,6 +7,39 @@
 use std::path::Path;
 
 const COMPILE_COMMAND: &str = "setup/src/Magento/Setup/Console/Command/DiCompileCommand.php";
+const CONFIG_READER: &str = "setup/src/Magento/Setup/Module/Di/Compiler/Config/Reader.php";
+
+/// The preference targets that the store's `Reader::generateCachePerScope()` stops on.
+///
+/// Magento 2.4.8 added both checks, 2.4.7 has neither, and a store can patch either way. 2.4.7
+/// ships a preference to a class that does not exist (`Magento\Catalog\Api\Data\MassActionInterface`),
+/// so a store on 2.4.7 compiles only when this follows its own reader.
+pub(crate) struct PreferenceTargetChecks {
+    /// A target that fails `class_exists()`, or whose file fails to load.
+    pub(crate) missing: bool,
+    /// A target that the scan does not list.
+    pub(crate) not_scanned: bool,
+}
+
+/// A store without the reader keeps both checks, because then there is no compile to follow.
+pub(crate) fn preference_target_checks(magento_root: &Path) -> PreferenceTargetChecks {
+    let path = magento_root.join(CONFIG_READER);
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        log::warn!(
+            "{} not found; preference targets are checked as Magento 2.4.8 does",
+            path.display()
+        );
+        return PreferenceTargetChecks {
+            missing: true,
+            not_scanned: true,
+        };
+    };
+    let code = without_comments(&source);
+    PreferenceTargetChecks {
+        missing: code.contains("but the latter does not exist."),
+        not_scanned: code.contains("has not been included in dependency injection compilation."),
+    }
+}
 
 /// Whether the store's command scans the classes of disabled modules.
 ///

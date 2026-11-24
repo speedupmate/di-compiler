@@ -1920,9 +1920,13 @@ fn main() {
             .collect();
         pb_area.finish_with_message("done");
         log_phase_elapsed("Phase 7 area-config loop", t_area_config);
-        if let Err(message) =
-            check_preference_targets(&areas, &area_di_configs, &class_map, &generated_class_map)
-        {
+        if let Err(message) = check_preference_targets(
+            &compile_scope::preference_target_checks(&magento_root),
+            &areas,
+            &area_di_configs,
+            &class_map,
+            &generated_class_map,
+        ) {
             stop_compile(&message);
         }
 
@@ -2252,6 +2256,7 @@ fn generated_class_source_exists(class: &str, source_exists: &impl Fn(&str) -> b
 /// list of known classes grows per area, because `fillThirdPartyInterfaces()` adds the classes
 /// that have a preference. So an area can pass thanks to an earlier one, and the order counts.
 fn check_preference_targets(
+    checks: &compile_scope::PreferenceTargetChecks,
     compiled_areas: &[&str],
     area_di_configs: &FxHashMap<String, std::sync::Arc<DiConfig>>,
     class_map: &FxHashMap<String, ClassInfo>,
@@ -2268,6 +2273,9 @@ fn check_preference_targets(
         instances.sort();
         for instance in instances {
             let target = final_preference(instance, config)?;
+            if !checks.missing && !checks.not_scanned {
+                continue;
+            }
             if target == *instance || config.virtual_types.contains_key(&target) {
                 continue;
             }
@@ -2292,11 +2300,13 @@ fn check_preference_targets(
             match answer {
                 Some("extension") => {}
                 Some("class") if known || is_generated_class_name(&target) => {}
+                Some("class") if !checks.not_scanned => {}
                 Some("class") => {
                     return Err(format!(
                         "Preference declared for \"{instance}\" as \"{target}\", but the latter has not been included in dependency injection compilation."
                     ));
                 }
+                Some(_) if !checks.missing => {}
                 Some("missing") => {
                     return Err(format!(
                         "Preference declared for \"{instance}\" as \"{target}\", but the latter does not exist."
