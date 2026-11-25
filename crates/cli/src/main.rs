@@ -6495,17 +6495,9 @@ fn collect_disabled_ancestors(
     ancestors
 }
 
-/// Filter a list of di.xml paths, dropping files from disabled modules.
-///
-/// A di.xml is dropped when its module can be identified via `etc/module.xml`
-/// AND that module name is absent from `enabled_modules` (which only contains
-/// enabled modules from `app/etc/config.php`).
-///
-/// For vendor packages that have neither `etc/module.xml` nor `registration.php`,
-/// the file is dropped — these are utility/testing packages (e.g. functional-testing-framework)
-/// that are not Magento modules and should not contribute to production DI config.
-///
-/// Files at `app/etc/di.xml` (no vendor module root) are always kept.
+/// The di.xml files Magento reads: the primary ones in `app/etc`, and those of the modules that
+/// `app/etc/config.php` enables. A folder whose `etc/module.xml` names no enabled module, or that
+/// has none, is not a module of that list, whatever else it holds.
 fn filter_enabled_di_xml(
     files: Vec<PathBuf>,
     enabled_modules: &FxHashMap<String, usize>,
@@ -6520,40 +6512,18 @@ fn filter_enabled_di_xml(
                 return false;
             }
 
+            if path.starts_with(magento_root.join("app/etc")) {
+                return true;
+            }
             let Some(module_root) = module_root_from_di_xml(path) else {
-                return true; // can't determine module root → keep (e.g. app/etc/di.xml)
+                return false;
             };
-            // Check if this is a vendor package with module identity.
-            let is_vendor = is_vendor_package_root(module_root, magento_root);
-            if let Some(name) = read_module_name_from_module_xml(module_root) {
-                // Has module.xml — enabled check applies
-                return enabled_modules.contains_key(&name);
-            }
-            if is_vendor {
-                // Vendor package with no module.xml — check for registration.php.
-                // Packages without registration.php are not Magento modules (e.g. testing frameworks).
-                return module_root.join("registration.php").exists();
-            }
-            true // non-vendor path with no module.xml → keep
+            // `Module\Dir\Reader::getConfigurationFiles()` reads the etc folders of the enabled
+            // modules, so a folder without a module of that list contributes nothing.
+            read_module_name_from_module_xml(module_root)
+                .is_some_and(|name| enabled_modules.contains_key(&name))
         })
         .collect()
-}
-
-fn is_vendor_package_root(module_root: &Path, magento_root: &Path) -> bool {
-    // Expected shape: <magento-root>/vendor/<vendor>/<package>
-    if let Ok(rel) = module_root.strip_prefix(magento_root) {
-        let mut comps = rel.components();
-        return comps.next().and_then(|c| c.as_os_str().to_str()) == Some("vendor")
-            && comps.next().is_some()
-            && comps.next().is_some();
-    }
-
-    // Fallback for unexpected path roots.
-    let parts: Vec<&str> = module_root
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
-    parts.windows(3).any(|w| w[0] == "vendor")
 }
 
 fn read_module_name_from_module_xml(module_root: &Path) -> Option<String> {
