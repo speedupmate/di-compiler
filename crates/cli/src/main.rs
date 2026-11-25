@@ -1628,26 +1628,26 @@ fn main() {
         &extension_specs,
         &resolved_const_values,
         &module_paths,
+        compiler_build(),
     );
-    let fp_hit = std::fs::read(&fp_path)
-        .ok()
-        .map(|b| b == new_fp)
-        .unwrap_or(false);
-    // On hit, verify all expected metadata files exist before skipping.
     let plugin_list_ids = plugin_list_cache_ids(&magento_root, &args.fallback_php, &areas);
-    let fp_hit = fp_hit && {
-        areas
-            .iter()
-            .map(|a| metadata_root.join(format!("{}.php", a)))
-            .chain(std::iter::once(metadata_root.join("interception.php")))
-            .chain(std::iter::once(metadata_root.join("app_action_list.php")))
-            .chain(
-                areas
-                    .iter()
-                    .map(|s| metadata_root.join(format!("{}.php", plugin_list_ids[*s]))),
-            )
-            .all(|p| p.exists())
-    };
+    let expected_metadata: Vec<PathBuf> = areas
+        .iter()
+        .map(|a| metadata_root.join(format!("{}.php", a)))
+        .chain(std::iter::once(metadata_root.join("interception.php")))
+        .chain(std::iter::once(metadata_root.join("app_action_list.php")))
+        .chain(
+            areas
+                .iter()
+                .map(|s| metadata_root.join(format!("{}.php", plugin_list_ids[*s]))),
+        )
+        .collect();
+    // A hit needs the same inputs and build, and the metadata files exactly as this compiler
+    // left them: `setup:di:compile` rewrites them without touching this cache.
+    let fp_hit = std::fs::read(&fp_path).is_ok_and(|stored| {
+        metadata_stamp(&expected_metadata)
+            .is_some_and(|stamp| stored == phase7_cache_record(new_fp, stamp))
+    });
     'phase7: {
         if fp_hit {
             log::info!("Phase 7 skipped: fingerprint match");
@@ -2099,10 +2099,19 @@ fn main() {
         let app_action_list = generate_app_action_list_php(&listed_classes);
         let app_action_list_path = metadata_root.join("app_action_list.php");
         must_write(&app_action_list_path, &app_action_list);
-        if let Err(e) =
-            std::fs::create_dir_all(&fp_dir).and_then(|()| write_atomic(&fp_path, &new_fp))
-        {
-            stop_compile(&format!("Could not write {}: {e}", fp_path.display()));
+        match metadata_stamp(&expected_metadata) {
+            Some(stamp) => {
+                let record = phase7_cache_record(new_fp, stamp);
+                if let Err(e) =
+                    std::fs::create_dir_all(&fp_dir).and_then(|()| write_atomic(&fp_path, &record))
+                {
+                    stop_compile(&format!("Could not write {}: {e}", fp_path.display()));
+                }
+            }
+            // A missing metadata file makes the next compile run Phase 7 again.
+            None => {
+                let _ = std::fs::remove_file(&fp_path);
+            }
         }
     } // end 'phase7
     log_phase_elapsed("Phase 7", phase_7_started);
@@ -2637,6 +2646,43 @@ fn hash_method_signature(h: &mut impl std::hash::Hasher, method: &MethodSignatur
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The build of this compiler, so a new build never reuses the metadata of another one, even
+/// with the same version: the version string and the executable itself.
+fn compiler_build() -> u64 {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(env!("GIT_VERSION").as_bytes());
+    if let Ok(executable) = std::env::current_exe().and_then(std::fs::read) {
+        h.write(&executable);
+    }
+    h.finish()
+}
+
+/// Path, size and modification time of each metadata file, or `None` when one is missing.
+fn metadata_stamp(files: &[PathBuf]) -> Option<u64> {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    for file in files {
+        let metadata = std::fs::metadata(file).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        h.write(file.as_os_str().as_encoded_bytes());
+        h.write_u64(metadata.len());
+        h.write_u128(modified.as_nanos());
+    }
+    Some(h.finish())
+}
+
+fn phase7_cache_record(fingerprint: [u8; 8], metadata_stamp: u64) -> Vec<u8> {
+    let mut record = fingerprint.to_vec();
+    record.extend_from_slice(&metadata_stamp.to_le_bytes());
+    record
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_phase7_fp(
     class_map: &FxHashMap<String, ClassInfo>,
     full_di_config: &DiConfig,
@@ -2648,12 +2694,14 @@ fn compute_phase7_fp(
     extension_specs: &[ExtensionSpec],
     resolved_const_values: &FxHashMap<String, ResolvedConstValue>,
     module_paths: &[PathBuf],
+    compiler_build: u64,
 ) -> [u8; 8] {
     use php_extractor::types::ClassKind;
     use std::hash::Hasher;
 
     let mut h = rustc_hash::FxHasher::default();
     h.write_u64(4u64); // version — bump to force cache invalidation on codegen changes
+    h.write_u64(compiler_build);
 
     // --- class_map: FQCN + full ClassInfo content ---
     let mut class_keys: Vec<&str> = class_map.keys().map(|s| s.as_str()).collect();
@@ -7189,6 +7237,7 @@ mod tests {
             &extension_specs,
             &resolved_const_values,
             &module_paths,
+            1,
         );
 
         plugin_info.public_methods[0].name = "afterSave".to_string();
@@ -7204,9 +7253,31 @@ mod tests {
             &extension_specs,
             &resolved_const_values,
             &module_paths,
+            1,
         );
 
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn phase7_fingerprint_changes_with_the_compiler_build() {
+        let fingerprint = |build| {
+            super::compute_phase7_fp(
+                &Default::default(),
+                &Default::default(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &Default::default(),
+                &[],
+                build,
+            )
+        };
+        assert_eq!(fingerprint(1), fingerprint(1));
+        assert_ne!(fingerprint(1), fingerprint(2));
     }
 
     #[test]
