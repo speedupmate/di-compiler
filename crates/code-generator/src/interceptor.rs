@@ -218,7 +218,12 @@ pub fn render_type_hint(th: &str) -> String {
             .collect();
         let has_null = raw_parts.contains(&"null");
         let non_null: Vec<&str> = raw_parts.iter().copied().filter(|p| *p != "null").collect();
-        if has_null && non_null.len() == 1 && !PRIMITIVES.contains(&non_null[0]) {
+        // `?` takes a single name only, so `(A&B)|null` keeps its form.
+        if has_null
+            && non_null.len() == 1
+            && !PRIMITIVES.contains(&non_null[0])
+            && !non_null[0].contains(['(', '&'])
+        {
             let rendered = render_type_part(non_null[0], PRIMITIVES);
             if nullable.is_empty() {
                 return format!("?{}", rendered);
@@ -233,16 +238,29 @@ pub fn render_type_hint(th: &str) -> String {
         return format!("{}{}", nullable, parts.join("|"));
     }
 
-    // Plain class name
-    format!("{}\\{}", nullable, core)
+    // A class name or an intersection
+    format!("{}{}", nullable, render_type_part(core, PRIMITIVES))
 }
 
+/// One member of a union: a name, an intersection `A&B`, or a DNF group `(A&B)`. Every class name
+/// gets its leading `\`, or it would resolve against the namespace of the interceptor.
 fn render_type_part(p: &str, primitives: &[&str]) -> String {
-    if primitives.contains(&p) {
-        p.to_string()
-    } else {
-        format!("\\{}", p.trim_start_matches('\\'))
-    }
+    let (open, inner, close) = match p.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+        Some(inner) => ("(", inner, ")"),
+        None => ("", p, ""),
+    };
+    let names: Vec<String> = inner
+        .split('&')
+        .map(str::trim)
+        .map(|name| {
+            if primitives.contains(&name) {
+                name.to_string()
+            } else {
+                format!("\\{}", name.trim_start_matches('\\'))
+            }
+        })
+        .collect();
+    format!("{open}{}{close}", names.join("&"))
 }
 
 /// Namespace for generated interceptor class: `<TargetFQCN>`.
@@ -320,6 +338,20 @@ mod tests {
     fn test_render_type_hint_nullable_primitive() {
         assert_eq!(render_type_hint("?string"), "?string");
         assert_eq!(render_type_hint("?int"), "?int");
+    }
+
+    #[test]
+    fn every_class_of_an_intersection_or_dnf_type_is_fully_qualified() {
+        assert_eq!(render_type_hint("Foo\\A&Foo\\B"), "\\Foo\\A&\\Foo\\B");
+        assert_eq!(
+            render_type_hint("(Foo\\A&Foo\\B)|null"),
+            "(\\Foo\\A&\\Foo\\B)|null"
+        );
+        assert_eq!(
+            render_type_hint("Foo\\C|(Foo\\A&Foo\\B)|string"),
+            "\\Foo\\C|(\\Foo\\A&\\Foo\\B)|string"
+        );
+        assert_eq!(render_type_hint("Foo\\A|null"), "?\\Foo\\A");
     }
 
     #[test]
