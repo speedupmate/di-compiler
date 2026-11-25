@@ -1158,9 +1158,10 @@ impl<'a> Scanner<'a> {
         }
 
         self.skip_noise();
+        // Dropping a parameter would shift every argument after it, so a parameter this lexer
+        // cannot read goes to the next tier.
         if self.peek() != b'$' {
-            self.skip_to_param_end();
-            return Ok(None);
+            return Err(LexError::Unsupported("constructor_parameter".into()));
         }
         self.advance(1);
         let name_bytes = self.read_word();
@@ -1219,8 +1220,7 @@ impl<'a> Scanner<'a> {
 
         self.skip_noise();
         if self.peek() != b'$' {
-            self.skip_to_param_end();
-            return Ok(None);
+            return Err(LexError::Unsupported("method_parameter".into()));
         }
         self.advance(1);
         let name_bytes = self.read_word();
@@ -1261,9 +1261,56 @@ impl<'a> Scanner<'a> {
         if b == b'$' || b == b')' || b == b',' || b == b'.' || b == b'&' {
             return Ok(None);
         }
-        if !is_word_start(b) && b != b'\\' {
+        if b != b'(' && !is_word_start(b) && b != b'\\' {
             return Ok(None);
         }
+        let mut parts = vec![self.read_union_member()?];
+
+        // PHP allows whitespace and comments on both sides of `|`.
+        loop {
+            let before_bar = self.pos;
+            self.skip_noise();
+            if self.peek() != b'|' {
+                self.pos = before_bar;
+                break;
+            }
+            self.advance(1);
+            self.skip_noise();
+            parts.push(self.read_union_member()?);
+        }
+
+        let mut resolved = parts.join("|");
+        if is_nullable {
+            resolved = format!("?{resolved}");
+        }
+        Ok(Some(resolved))
+    }
+
+    /// One member of a union type: a name, or the intersection group of a DNF type, `(A&B)`.
+    fn read_union_member(&mut self) -> Result<String, LexError> {
+        if self.peek() != b'(' {
+            return self.read_type_name();
+        }
+        self.advance(1);
+        let mut names = Vec::new();
+        loop {
+            self.skip_noise();
+            names.push(self.read_type_name()?);
+            self.skip_noise();
+            match self.peek() {
+                b'&' => self.advance(1),
+                b')' => {
+                    self.advance(1);
+                    break;
+                }
+                _ => return Err(LexError::Unsupported("dnf_type".into())),
+            }
+        }
+        Ok(format!("({})", names.join("&")))
+    }
+
+    /// A type name, resolved against the namespace and the `use` imports.
+    fn read_type_name(&mut self) -> Result<String, LexError> {
         let absolute = self.peek() == b'\\';
         if absolute {
             self.advance(1);
@@ -1272,59 +1319,28 @@ impl<'a> Scanner<'a> {
         while !self.is_eof() && (is_word_char(self.peek()) || self.peek() == b'\\') {
             self.advance(1);
         }
-        let raw_type = std::str::from_utf8(&self.src[start..self.pos])
-            .unwrap_or("")
-            .to_string();
-        if raw_type.is_empty() {
-            return Ok(None);
+        let name = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
+        if name.is_empty() {
+            return Err(LexError::Unsupported("type".into()));
         }
-
-        let first = if absolute {
-            raw_type.clone()
+        Ok(if absolute {
+            name.to_string()
         } else {
-            self.resolve_type(&raw_type)
-        };
-        let mut parts: Vec<String> = vec![first];
-
-        while self.peek() == b'|' {
-            self.advance(1);
-            let part_abs = self.peek() == b'\\';
-            if part_abs {
-                self.advance(1);
-            }
-            let pstart = self.pos;
-            while !self.is_eof() && (is_word_char(self.peek()) || self.peek() == b'\\') {
-                self.advance(1);
-            }
-            let part = std::str::from_utf8(&self.src[pstart..self.pos])
-                .unwrap_or("")
-                .to_string();
-            if !part.is_empty() {
-                let resolved = if part_abs {
-                    part
-                } else {
-                    self.resolve_type(&part)
-                };
-                parts.push(resolved);
-            }
-        }
-
-        let mut resolved = if parts.len() > 1 {
-            parts.join("|")
-        } else {
-            parts.remove(0)
-        };
-        if is_nullable {
-            resolved = format!("?{resolved}");
-        }
-        Ok(Some(resolved))
+            self.resolve_type(name)
+        })
     }
 
     fn read_return_type(&mut self) -> Result<String, LexError> {
-        match self.try_read_type_hint()? {
-            Some(t) => Ok(t),
-            None => Ok(String::new()),
+        let Some(return_type) = self.try_read_type_hint()? else {
+            return Ok(String::new());
+        };
+        let after = self.pos;
+        self.skip_noise();
+        if self.peek() == b'&' {
+            return Err(LexError::Unsupported("intersection_type".into()));
         }
+        self.pos = after;
+        Ok(return_type)
     }
 
     fn skip_type_hint(&mut self) -> Result<(), LexError> {
@@ -1391,44 +1407,6 @@ impl<'a> Scanner<'a> {
             .unwrap_or("")
             .trim()
             .to_string()
-    }
-
-    fn skip_to_param_end(&mut self) {
-        let mut depth: i32 = 0;
-        loop {
-            if self.is_eof() {
-                break;
-            }
-            match self.peek() {
-                b'\'' => {
-                    self.advance(1);
-                    self.skip_sq_string();
-                }
-                b'"' => {
-                    self.advance(1);
-                    self.skip_dq_string();
-                }
-                b'<' if self.at(1) == b'<' && self.at(2) == b'<' => {
-                    self.advance(3);
-                    self.skip_heredoc();
-                }
-                b'(' | b'[' => {
-                    depth += 1;
-                    self.advance(1);
-                }
-                b')' if depth == 0 => break,
-                b')' => {
-                    depth -= 1;
-                    self.advance(1);
-                }
-                b']' if depth > 0 => {
-                    depth -= 1;
-                    self.advance(1);
-                }
-                b',' if depth == 0 => break,
-                _ => self.advance(1),
-            }
-        }
     }
 
     fn skip_to_matching_paren(&mut self) {
@@ -1946,6 +1924,95 @@ class Bar {
         // `Baz` in namespace `Foo` resolves to `Foo\Baz`, union with `null` preserved
         assert_eq!(ctor.params[0].type_hint.as_deref(), Some("Foo\\Baz|null"));
         assert!(ctor.params[0].is_optional);
+    }
+
+    #[test]
+    fn spaced_union_types_keep_every_member_and_parameter() {
+        let info = extract_str(
+            r#"<?php
+namespace Foo;
+class Bar {
+    public function __construct(
+        A $first,
+        B | null $middle,
+        \X\Y /* why */ | /* not */ C $commented,
+        A $last,
+        private B | null $tail = null
+    ) {}
+    public function run(B | null $value): A | \X\Y
+    {
+    }
+}"#,
+        )
+        .unwrap();
+        let params = info.constructor.unwrap().params;
+        let shape: Vec<_> = params
+            .iter()
+            .map(|param| (param.name.as_str(), param.type_hint.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("first", "Foo\\A"),
+                ("middle", "Foo\\B|null"),
+                ("commented", "X\\Y|Foo\\C"),
+                ("last", "Foo\\A"),
+                ("tail", "Foo\\B|null"),
+            ]
+        );
+        let run = &info.public_methods[0];
+        assert_eq!(run.params[0].type_hint.as_deref(), Some("Foo\\B|null"));
+        assert_eq!(run.return_type.as_deref(), Some("Foo\\A|X\\Y"));
+    }
+
+    #[test]
+    fn dnf_types_keep_their_groups_and_their_place() {
+        let info = extract_str(
+            r#"<?php
+namespace Foo;
+use X\Y as Alias;
+class Bar {
+    public function __construct(A $first, ( A & Alias ) | null $either, B $last) {}
+    public function run(\C|(A&\D) $value): (A&B)|null
+    {
+    }
+}"#,
+        )
+        .unwrap();
+        let params = info.constructor.unwrap().params;
+        let shape: Vec<_> = params
+            .iter()
+            .map(|param| (param.name.as_str(), param.type_hint.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("first", "Foo\\A"),
+                ("either", "(Foo\\A&X\\Y)|null"),
+                ("last", "Foo\\B")
+            ]
+        );
+        let run = &info.public_methods[0];
+        assert_eq!(run.params[0].type_hint.as_deref(), Some("C|(Foo\\A&D)"));
+        assert_eq!(run.return_type.as_deref(), Some("(Foo\\A&Foo\\B)|null"));
+    }
+
+    /// The next tier reads these. A parameter dropped here would shift every argument after it.
+    #[test]
+    fn types_the_lexer_cannot_read_are_unsupported() {
+        for source in [
+            "public function run(): A & B {}",
+            "public function run(): A&B {}",
+            "public function __construct(A|(B|C) $dep) {}",
+        ] {
+            let result = extract_str(&format!(
+                "<?php\nnamespace Foo;\nclass Bar {{\n    {source}\n}}"
+            ));
+            assert!(
+                matches!(result, Err(LexError::Unsupported(_))),
+                "{source}: {result:?}"
+            );
+        }
     }
 
     #[test]

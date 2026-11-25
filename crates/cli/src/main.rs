@@ -248,7 +248,7 @@ function tstr($t): ?string {
         return $name;
     }
     if ($t instanceof ReflectionUnionType) {
-        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p->getName();
+        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p instanceof ReflectionIntersectionType ? '(' . tstr($p) . ')' : $p->getName();
         return implode('|', $parts);
     }
     if ($t instanceof ReflectionIntersectionType) {
@@ -270,7 +270,10 @@ function method_tstr($t, ReflectionClass $declaring): ?string {
         if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') return '?' . $name;
         return $name;
     }
-    $parts = []; foreach ($t->getTypes() as $p) $parts[] = resolve_name($p->getName(), $declaring);
+    $parts = [];
+    foreach ($t->getTypes() as $p) {
+        $parts[] = $p instanceof ReflectionIntersectionType ? '(' . method_tstr($p, $declaring) . ')' : resolve_name($p->getName(), $declaring);
+    }
     return implode($t instanceof ReflectionUnionType ? '|' : '&', $parts);
 }
 function reflect_methods(string $class): ?array {
