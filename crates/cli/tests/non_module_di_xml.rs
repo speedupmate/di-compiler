@@ -180,3 +180,20 @@ fn the_di_xml_of_an_enabled_module_and_of_app_etc_still_apply() {
         assert!(area.contains(WIDGET), "{path}: no preference in {metadata}");
     }
 }
+
+/// `extension_attributes.xml` comes through `Module\Dir\Reader` too. Read, this one would stop
+/// the compile.
+#[test]
+fn an_extension_attributes_xml_in_a_folder_that_is_no_module_is_not_read() {
+    if !has_php() {
+        return;
+    }
+    let (_store, output) = compile(&[
+        ("app/code/Acme/NotAModule/registration.php", "<?php\n"),
+        (
+            "app/code/Acme/NotAModule/etc/extension_attributes.xml",
+            "<config><extension_attributes for=\"Acme\\On\\Api\\Data\\GadgetInterface\">",
+        ),
+    ]);
+    assert_compiles(&output);
+}

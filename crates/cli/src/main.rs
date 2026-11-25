@@ -6192,10 +6192,14 @@ fn find_extension_attributes_files(
     let mut ordered_files: Vec<(usize, usize, PathBuf)> = Vec::new();
     for (discovery_idx, module_path) in module_paths.iter().enumerate() {
         let file = module_path.join("etc/extension_attributes.xml");
+        // Read through `Module\Dir\Reader` like di.xml: only the enabled modules count, so a
+        // library or a folder without `etc/module.xml` contributes nothing.
+        let Some(order) = read_module_name_from_module_xml(module_path)
+            .and_then(|name| module_order.get(&name).copied())
+        else {
+            continue;
+        };
         if file.exists() {
-            let order = read_module_name_from_module_xml(module_path)
-                .and_then(|name| module_order.get(&name).copied())
-                .unwrap_or(usize::MAX / 2 + discovery_idx);
             ordered_files.push((order, discovery_idx, file));
         }
     }
