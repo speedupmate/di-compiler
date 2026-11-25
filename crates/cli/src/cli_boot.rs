@@ -88,8 +88,10 @@ pub(crate) fn classes_built_at_boot(
         if info.kind != ClassKind::Class || info.is_abstract {
             continue;
         }
-        for param in constructor_params(&info, lookup) {
-            if param.is_optional || param.is_variadic || param.is_primitive {
+        let params = constructor_params(&info, lookup);
+        let optional = php_extractor::types::optional_in_php(&params);
+        for (param, optional) in params.iter().zip(optional) {
+            if optional || param.is_variadic || param.is_primitive {
                 continue;
             }
             let Some(type_hint) = param.type_hint.as_deref() else {

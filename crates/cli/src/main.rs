@@ -32,6 +32,9 @@ mod di_xml_checks;
 mod file_level_checks;
 mod incompatible_modules;
 mod requested_regeneration;
+mod run_report;
+mod watch;
+mod watch_set;
 use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
@@ -41,8 +44,8 @@ use code_generator::{
     generate_area_config_with_overrides, generate_extension, generate_extension_interface,
     generate_factory, generate_interceptor, generate_proxy, generate_proxy_deferred,
     generate_search_results, interceptor_path, proxy_deferred_path, proxy_path,
-    search_results_path, serialize_interception_php, serialize_plugin_list_php, write_if_changed,
-    ExtensionAttributeSpec, ExtensionSpec, AREAS,
+    search_results_path, serialize_interception_php, serialize_plugin_list_php, write_atomic,
+    write_if_changed, ExtensionAttributeSpec, ExtensionSpec, AREAS,
 };
 use di_resolver::{
     detect_factories_from_configs, detect_interceptors, detect_named_factories,
@@ -127,6 +130,33 @@ struct Args {
     /// Continue when Magento-style constructor integrity validation fails
     #[arg(long)]
     ignore_constructor_integrity: bool,
+
+    /// Log warnings and errors only
+    #[arg(long, short = 'q')]
+    quiet: bool,
+
+    /// Print one JSON line with the result on stdout when the compile ends
+    #[arg(long)]
+    summary_json: bool,
+
+    /// Compile, then compile again after every change to PHP classes, di.xml files, the module
+    /// list or Composer packages (for development)
+    #[arg(long)]
+    watch: bool,
+
+    /// Like --watch, polling for changes every MS milliseconds instead of using file events
+    #[arg(
+        long,
+        value_name = "MS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "1000"
+    )]
+    watch_poll: Option<u64>,
+
+    /// With --watch: stop as on SIGTERM when the parent process ends (used by bin/magento)
+    #[arg(long, hide = true)]
+    watch_exit_with_parent: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +179,7 @@ impl IncrementalCache {
 
     fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+            let _ = write_atomic(path, json.as_bytes());
         }
     }
 
@@ -218,7 +248,7 @@ function tstr($t): ?string {
         return $name;
     }
     if ($t instanceof ReflectionUnionType) {
-        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p->getName();
+        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p instanceof ReflectionIntersectionType ? '(' . tstr($p) . ')' : $p->getName();
         return implode('|', $parts);
     }
     if ($t instanceof ReflectionIntersectionType) {
@@ -240,7 +270,10 @@ function method_tstr($t, ReflectionClass $declaring): ?string {
         if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') return '?' . $name;
         return $name;
     }
-    $parts = []; foreach ($t->getTypes() as $p) $parts[] = resolve_name($p->getName(), $declaring);
+    $parts = [];
+    foreach ($t->getTypes() as $p) {
+        $parts[] = $p instanceof ReflectionIntersectionType ? '(' . method_tstr($p, $declaring) . ')' : resolve_name($p->getName(), $declaring);
+    }
     return implode($t instanceof ReflectionUnionType ? '|' : '&', $parts);
 }
 function reflect_methods(string $class): ?array {
@@ -538,14 +571,43 @@ fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) ->
 
 fn main() {
     let args = Args::parse();
+    run_report::start(args.summary_json);
 
     env_logger::Builder::new()
         .filter_level(if args.verbose {
             log::LevelFilter::Debug
+        } else if args.quiet {
+            log::LevelFilter::Warn
         } else {
             log::LevelFilter::Info
         })
         .init();
+
+    if args.watch || args.watch_poll.is_some() {
+        if args.dry_run || args.validate || args.compare_archive {
+            eprintln!(
+                "error: --watch cannot be combined with --dry-run, --validate or --compare-archive"
+            );
+            std::process::exit(2);
+        }
+        let magento_root = args
+            .magento_root
+            .canonicalize()
+            .unwrap_or(args.magento_root.clone());
+        let generated_root = args
+            .output
+            .clone()
+            .unwrap_or_else(|| magento_root.join("generated"));
+        watch::run(watch::Options {
+            magento_root,
+            generated_root,
+            php: args.fallback_php.clone(),
+            poll: args.watch_poll.map(std::time::Duration::from_millis),
+            verbose: args.verbose,
+            exit_with_parent: args.watch_exit_with_parent,
+        });
+    }
+    run_report::stop_on_signals();
 
     // Wire --fallback-php to the env var that Tier 3 reads.
     if args.fallback_php != "php" {
@@ -554,8 +616,9 @@ fn main() {
 
     // Validate requires --php-generated
     if args.validate && args.php_generated.is_none() {
-        eprintln!("error: --validate requires --php-generated <dir>");
-        std::process::exit(2);
+        let message = "--validate requires --php-generated <dir>";
+        eprintln!("error: {message}");
+        run_report::exit(2, Some(message));
     }
 
     // Configure rayon thread pool
@@ -589,7 +652,7 @@ fn main() {
         incompatible_modules::incompatible_modules(&installed_modules, &enabled_modules)
     {
         eprintln!("error: {message}");
-        std::process::exit(1);
+        run_report::exit(1, Some(&message));
     }
 
     let generated_root = args
@@ -598,15 +661,17 @@ fn main() {
         .unwrap_or_else(|| magento_root.join("generated"));
     let code_root = generated_root.join("code");
     let metadata_root = generated_root.join("metadata");
-    if !args.dry_run {
-        METADATA_ROOT.get_or_init(|| metadata_root.clone());
-    }
+    run_report::on_stop_remove(
+        (!args.dry_run).then(|| metadata_root.clone()),
+        vec![worker_script_path(), class_checks::class_list_path()],
+    );
     if !args.dry_run && !generated_folders_are_writable(&generated_root) {
-        eprintln!(
-            "error: Command line user does not have read and write permissions on generated directory ({}). Please address this issue before using this command.",
+        let message = format!(
+            "Command line user does not have read and write permissions on generated directory ({}). Please address this issue before using this command.",
             generated_root.display()
         );
-        std::process::exit(1);
+        eprintln!("error: {message}");
+        run_report::exit(1, Some(&message));
     }
 
     // Magento's boot before setup:di:compile, before PHP loads anything from generated/.
@@ -1305,6 +1370,7 @@ fn main() {
         );
         log_phase_elapsed("Total", total_started);
         let _ = std::fs::remove_file(&worker_script_path);
+        run_report::print_summary(None);
         return;
     }
 
@@ -1562,26 +1628,26 @@ fn main() {
         &extension_specs,
         &resolved_const_values,
         &module_paths,
+        compiler_build(),
     );
-    let fp_hit = std::fs::read(&fp_path)
-        .ok()
-        .map(|b| b == new_fp)
-        .unwrap_or(false);
-    // On hit, verify all expected metadata files exist before skipping.
     let plugin_list_ids = plugin_list_cache_ids(&magento_root, &args.fallback_php, &areas);
-    let fp_hit = fp_hit && {
-        areas
-            .iter()
-            .map(|a| metadata_root.join(format!("{}.php", a)))
-            .chain(std::iter::once(metadata_root.join("interception.php")))
-            .chain(std::iter::once(metadata_root.join("app_action_list.php")))
-            .chain(
-                areas
-                    .iter()
-                    .map(|s| metadata_root.join(format!("{}.php", plugin_list_ids[*s]))),
-            )
-            .all(|p| p.exists())
-    };
+    let expected_metadata: Vec<PathBuf> = areas
+        .iter()
+        .map(|a| metadata_root.join(format!("{}.php", a)))
+        .chain(std::iter::once(metadata_root.join("interception.php")))
+        .chain(std::iter::once(metadata_root.join("app_action_list.php")))
+        .chain(
+            areas
+                .iter()
+                .map(|s| metadata_root.join(format!("{}.php", plugin_list_ids[*s]))),
+        )
+        .collect();
+    // A hit needs the same inputs and build, and the metadata files exactly as this compiler
+    // left them: `setup:di:compile` rewrites them without touching this cache.
+    let fp_hit = std::fs::read(&fp_path).is_ok_and(|stored| {
+        metadata_stamp(&expected_metadata)
+            .is_some_and(|stamp| stored == phase7_cache_record(new_fp, stamp))
+    });
     'phase7: {
         if fp_hit {
             log::info!("Phase 7 skipped: fingerprint match");
@@ -1632,6 +1698,22 @@ fn main() {
             let class = name.strip_suffix("\\Interceptor").unwrap_or(name);
             class_map.contains_key(class)
                 || !(disabled_class_map.contains_key(class) || boot.built.contains_key(class))
+        });
+        let setup_classes_outside_area_config: FxHashSet<&str> =
+            if compile_scope::area_config_compiles_setup_classes(&magento_root) {
+                FxHashSet::default()
+            } else {
+                let setup_root = magento_root.join("setup");
+                class_map
+                    .iter()
+                    .filter(|(_, info)| info.path.starts_with(&setup_root))
+                    .map(|(name, _)| name.as_str())
+                    .filter(|name| !metadata_base_di_config.preferences.contains_key(*name))
+                    .collect()
+            };
+        argument_type_names.retain(|name| {
+            let class = name.strip_suffix("\\Interceptor").unwrap_or(name);
+            !setup_classes_outside_area_config.contains(class)
         });
         let argument_type_names = std::sync::Arc::new(argument_type_names);
         let mut interception_type_names = build_interception_type_names(
@@ -1686,7 +1768,10 @@ fn main() {
     );
         // Build direct interception map once; area-specific preference/instanceTypes
         // overrides are derived from this and each area's merged DI config.
-        let global_interceptor_map = build_direct_interception_map(&interceptors);
+        let mut global_interceptor_map = build_direct_interception_map(&interceptors);
+        // `InterceptorSubstitution` finds interceptors among the classes that have arguments.
+        global_interceptor_map
+            .retain(|class, _| !setup_classes_outside_area_config.contains(class.as_str()));
         let t_interception = Instant::now();
         let all_fqcns = build_interception_registry(
             &interception_type_names,
@@ -1920,9 +2005,13 @@ fn main() {
             .collect();
         pb_area.finish_with_message("done");
         log_phase_elapsed("Phase 7 area-config loop", t_area_config);
-        if let Err(message) =
-            check_preference_targets(&areas, &area_di_configs, &class_map, &generated_class_map)
-        {
+        if let Err(message) = check_preference_targets(
+            &compile_scope::preference_target_checks(&magento_root),
+            &areas,
+            &area_di_configs,
+            &class_map,
+            &generated_class_map,
+        ) {
             stop_compile(&message);
         }
 
@@ -2010,10 +2099,19 @@ fn main() {
         let app_action_list = generate_app_action_list_php(&listed_classes);
         let app_action_list_path = metadata_root.join("app_action_list.php");
         must_write(&app_action_list_path, &app_action_list);
-        if let Err(e) =
-            std::fs::create_dir_all(&fp_dir).and_then(|()| std::fs::write(&fp_path, new_fp))
-        {
-            stop_compile(&format!("Could not write {}: {e}", fp_path.display()));
+        match metadata_stamp(&expected_metadata) {
+            Some(stamp) => {
+                let record = phase7_cache_record(new_fp, stamp);
+                if let Err(e) =
+                    std::fs::create_dir_all(&fp_dir).and_then(|()| write_atomic(&fp_path, &record))
+                {
+                    stop_compile(&format!("Could not write {}: {e}", fp_path.display()));
+                }
+            }
+            // A missing metadata file makes the next compile run Phase 7 again.
+            None => {
+                let _ = std::fs::remove_file(&fp_path);
+            }
         }
     } // end 'phase7
     log_phase_elapsed("Phase 7", phase_7_started);
@@ -2070,13 +2168,14 @@ fn main() {
                 );
                 if args.compare_fail_on_diff && !summary.is_clean() {
                     log_phase_elapsed("Total", total_started);
-                    std::process::exit(1);
+                    run_report::exit(1, Some("archive compare found differences"));
                 }
             }
             Err(e) => {
-                eprintln!("error: archive compare failed: {e}");
+                let message = format!("archive compare failed: {e}");
+                eprintln!("error: {message}");
                 log_phase_elapsed("Total", total_started);
-                std::process::exit(2);
+                run_report::exit(2, Some(&message));
             }
         }
         log_phase_elapsed("Archive compare", compare_archive_started);
@@ -2095,7 +2194,7 @@ fn main() {
         log_phase_elapsed("Phase 8", phase_8_started);
         if !result.is_clean() {
             log_phase_elapsed("Total", total_started);
-            std::process::exit(1);
+            run_report::exit(1, Some("validation against PHP output found differences"));
         }
     }
 
@@ -2104,6 +2203,7 @@ fn main() {
 
     // Clean up the temp PHP worker script.
     let _ = std::fs::remove_file(&worker_script_path);
+    run_report::print_summary(None);
 }
 
 /// `InterceptionConfigurationBuilder::getInterceptedMethods()` calls `get_class_methods()` on
@@ -2252,6 +2352,7 @@ fn generated_class_source_exists(class: &str, source_exists: &impl Fn(&str) -> b
 /// list of known classes grows per area, because `fillThirdPartyInterfaces()` adds the classes
 /// that have a preference. So an area can pass thanks to an earlier one, and the order counts.
 fn check_preference_targets(
+    checks: &compile_scope::PreferenceTargetChecks,
     compiled_areas: &[&str],
     area_di_configs: &FxHashMap<String, std::sync::Arc<DiConfig>>,
     class_map: &FxHashMap<String, ClassInfo>,
@@ -2268,6 +2369,9 @@ fn check_preference_targets(
         instances.sort();
         for instance in instances {
             let target = final_preference(instance, config)?;
+            if !checks.missing && !checks.not_scanned {
+                continue;
+            }
             if target == *instance || config.virtual_types.contains_key(&target) {
                 continue;
             }
@@ -2292,11 +2396,13 @@ fn check_preference_targets(
             match answer {
                 Some("extension") => {}
                 Some("class") if known || is_generated_class_name(&target) => {}
+                Some("class") if !checks.not_scanned => {}
                 Some("class") => {
                     return Err(format!(
                         "Preference declared for \"{instance}\" as \"{target}\", but the latter has not been included in dependency injection compilation."
                     ));
                 }
+                Some(_) if !checks.missing => {}
                 Some("missing") => {
                     return Err(format!(
                         "Preference declared for \"{instance}\" as \"{target}\", but the latter does not exist."
@@ -2337,19 +2443,13 @@ fn is_generated_class_name(class: &str) -> bool {
         .any(|suffix| class.ends_with(suffix))
 }
 
-static METADATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
-
 /// Ends a compile that Magento would stop too. `DiCompileCommand::execute()` empties
 /// `generated/metadata` first, so a failed compile never leaves old metadata for the store to use.
 /// Removing it at the end gives the same result, and a passing compile can still skip phase 7.
 fn stop_compile(message: &str) -> ! {
     eprintln!("error: {message}");
-    if let Some(root) = METADATA_ROOT.get() {
-        let _ = std::fs::remove_dir_all(root);
-    }
-    let _ = std::fs::remove_file(worker_script_path());
-    let _ = std::fs::remove_file(class_checks::class_list_path());
-    std::process::exit(1);
+    run_report::clean_up();
+    run_report::exit(1, Some(message));
 }
 
 /// `Mapper\\Dom::convert()` evaluates each argument after `Config\\Dom` merged the files of one
@@ -2546,6 +2646,43 @@ fn hash_method_signature(h: &mut impl std::hash::Hasher, method: &MethodSignatur
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The build of this compiler, so a new build never reuses the metadata of another one, even
+/// with the same version: the version string and the executable itself.
+fn compiler_build() -> u64 {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(env!("GIT_VERSION").as_bytes());
+    if let Ok(executable) = std::env::current_exe().and_then(std::fs::read) {
+        h.write(&executable);
+    }
+    h.finish()
+}
+
+/// Path, size and modification time of each metadata file, or `None` when one is missing.
+fn metadata_stamp(files: &[PathBuf]) -> Option<u64> {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    for file in files {
+        let metadata = std::fs::metadata(file).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        h.write(file.as_os_str().as_encoded_bytes());
+        h.write_u64(metadata.len());
+        h.write_u128(modified.as_nanos());
+    }
+    Some(h.finish())
+}
+
+fn phase7_cache_record(fingerprint: [u8; 8], metadata_stamp: u64) -> Vec<u8> {
+    let mut record = fingerprint.to_vec();
+    record.extend_from_slice(&metadata_stamp.to_le_bytes());
+    record
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_phase7_fp(
     class_map: &FxHashMap<String, ClassInfo>,
     full_di_config: &DiConfig,
@@ -2557,12 +2694,14 @@ fn compute_phase7_fp(
     extension_specs: &[ExtensionSpec],
     resolved_const_values: &FxHashMap<String, ResolvedConstValue>,
     module_paths: &[PathBuf],
+    compiler_build: u64,
 ) -> [u8; 8] {
     use php_extractor::types::ClassKind;
     use std::hash::Hasher;
 
     let mut h = rustc_hash::FxHasher::default();
     h.write_u64(4u64); // version — bump to force cache invalidation on codegen changes
+    h.write_u64(compiler_build);
 
     // --- class_map: FQCN + full ClassInfo content ---
     let mut class_keys: Vec<&str> = class_map.keys().map(|s| s.as_str()).collect();
@@ -6053,10 +6192,14 @@ fn find_extension_attributes_files(
     let mut ordered_files: Vec<(usize, usize, PathBuf)> = Vec::new();
     for (discovery_idx, module_path) in module_paths.iter().enumerate() {
         let file = module_path.join("etc/extension_attributes.xml");
+        // Read through `Module\Dir\Reader` like di.xml: only the enabled modules count, so a
+        // library or a folder without `etc/module.xml` contributes nothing.
+        let Some(order) = read_module_name_from_module_xml(module_path)
+            .and_then(|name| module_order.get(&name).copied())
+        else {
+            continue;
+        };
         if file.exists() {
-            let order = read_module_name_from_module_xml(module_path)
-                .and_then(|name| module_order.get(&name).copied())
-                .unwrap_or(usize::MAX / 2 + discovery_idx);
             ordered_files.push((order, discovery_idx, file));
         }
     }
@@ -6404,17 +6547,9 @@ fn collect_disabled_ancestors(
     ancestors
 }
 
-/// Filter a list of di.xml paths, dropping files from disabled modules.
-///
-/// A di.xml is dropped when its module can be identified via `etc/module.xml`
-/// AND that module name is absent from `enabled_modules` (which only contains
-/// enabled modules from `app/etc/config.php`).
-///
-/// For vendor packages that have neither `etc/module.xml` nor `registration.php`,
-/// the file is dropped — these are utility/testing packages (e.g. functional-testing-framework)
-/// that are not Magento modules and should not contribute to production DI config.
-///
-/// Files at `app/etc/di.xml` (no vendor module root) are always kept.
+/// The di.xml files Magento reads: the primary ones in `app/etc`, and those of the modules that
+/// `app/etc/config.php` enables. A folder whose `etc/module.xml` names no enabled module, or that
+/// has none, is not a module of that list, whatever else it holds.
 fn filter_enabled_di_xml(
     files: Vec<PathBuf>,
     enabled_modules: &FxHashMap<String, usize>,
@@ -6429,40 +6564,18 @@ fn filter_enabled_di_xml(
                 return false;
             }
 
+            if path.starts_with(magento_root.join("app/etc")) {
+                return true;
+            }
             let Some(module_root) = module_root_from_di_xml(path) else {
-                return true; // can't determine module root → keep (e.g. app/etc/di.xml)
+                return false;
             };
-            // Check if this is a vendor package with module identity.
-            let is_vendor = is_vendor_package_root(module_root, magento_root);
-            if let Some(name) = read_module_name_from_module_xml(module_root) {
-                // Has module.xml — enabled check applies
-                return enabled_modules.contains_key(&name);
-            }
-            if is_vendor {
-                // Vendor package with no module.xml — check for registration.php.
-                // Packages without registration.php are not Magento modules (e.g. testing frameworks).
-                return module_root.join("registration.php").exists();
-            }
-            true // non-vendor path with no module.xml → keep
+            // `Module\Dir\Reader::getConfigurationFiles()` reads the etc folders of the enabled
+            // modules, so a folder without a module of that list contributes nothing.
+            read_module_name_from_module_xml(module_root)
+                .is_some_and(|name| enabled_modules.contains_key(&name))
         })
         .collect()
-}
-
-fn is_vendor_package_root(module_root: &Path, magento_root: &Path) -> bool {
-    // Expected shape: <magento-root>/vendor/<vendor>/<package>
-    if let Ok(rel) = module_root.strip_prefix(magento_root) {
-        let mut comps = rel.components();
-        return comps.next().and_then(|c| c.as_os_str().to_str()) == Some("vendor")
-            && comps.next().is_some()
-            && comps.next().is_some();
-    }
-
-    // Fallback for unexpected path roots.
-    let parts: Vec<&str> = module_root
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
-    parts.windows(3).any(|w| w[0] == "vendor")
 }
 
 fn read_module_name_from_module_xml(module_root: &Path) -> Option<String> {
@@ -7128,6 +7241,7 @@ mod tests {
             &extension_specs,
             &resolved_const_values,
             &module_paths,
+            1,
         );
 
         plugin_info.public_methods[0].name = "afterSave".to_string();
@@ -7143,9 +7257,31 @@ mod tests {
             &extension_specs,
             &resolved_const_values,
             &module_paths,
+            1,
         );
 
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn phase7_fingerprint_changes_with_the_compiler_build() {
+        let fingerprint = |build| {
+            super::compute_phase7_fp(
+                &Default::default(),
+                &Default::default(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &Default::default(),
+                &[],
+                build,
+            )
+        };
+        assert_eq!(fingerprint(1), fingerprint(1));
+        assert_ne!(fingerprint(1), fingerprint(2));
     }
 
     #[test]

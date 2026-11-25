@@ -216,3 +216,118 @@ fn preference_in_a_disabled_module_does_not_stop_the_compile() {
     };
     assert_compiles(&output);
 }
+
+const CONFIG_READER: &str = "setup/src/Magento/Setup/Module/Di/Compiler/Config/Reader.php";
+
+const READER_WITHOUT_CHECKS: &str = "<?php\nnamespace Magento\\Setup\\Module\\Di\\Compiler\\Config;\n\n\
+     class Reader\n{\n    public function generateCachePerScope($definitionsCollection, $areaCode)\n    {\n        \
+     // Preference declared for a class that does not exist is fine: \"but the latter does not exist.\"\n        \
+     $config['preferences'][$instanceName] = $preference;\n    }\n}\n";
+
+const READER_WITH_CHECKS: &str = "<?php\nnamespace Magento\\Setup\\Module\\Di\\Compiler\\Config;\n\n\
+     class Reader\n{\n    public function generateCachePerScope($definitionsCollection, $areaCode)\n    {\n        \
+     throw new LocalizedException(new Phrase('Preference declared for \"%instanceName\" as \"%preference\", \
+     but the latter does not exist.'));\n        \
+     throw new LocalizedException(new Phrase('Preference declared for \"%instanceName\" as \"%preference\", \
+     but the latter' . ' has not been included in dependency injection compilation.'));\n    }\n}\n";
+
+#[test]
+fn missing_target_compiles_when_the_store_reader_does_not_check_it() {
+    let xml = preference("Acme\\On\\Model\\Gone");
+    let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_WITHOUT_CHECKS)])
+    else {
+        return;
+    };
+    assert_compiles(&output);
+}
+
+#[test]
+fn unscanned_target_compiles_when_the_store_reader_does_not_check_it() {
+    let xml = preference("Acme\\On\\Test\\Stub");
+    let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_WITHOUT_CHECKS)])
+    else {
+        return;
+    };
+    assert_compiles(&output);
+}
+
+#[test]
+fn circular_preference_stops_the_compile_when_the_store_reader_does_not_check_targets() {
+    let xml = di_xml(
+        "<preference for=\"Acme\\On\\Model\\Gadget\" type=\"Acme\\On\\Model\\Other\"/>\n\
+         <preference for=\"Acme\\On\\Model\\Other\" type=\"Acme\\On\\Model\\Gadget\"/>",
+    );
+    let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_WITHOUT_CHECKS)])
+    else {
+        return;
+    };
+    assert_stops(&output, "Circular type preference");
+}
+
+#[test]
+fn missing_target_stops_the_compile_when_the_store_reader_checks_it() {
+    let xml = preference("Acme\\On\\Model\\Gone");
+    let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_WITH_CHECKS)])
+    else {
+        return;
+    };
+    assert_stops(&output, MISSING);
+}
+
+#[test]
+fn unscanned_target_stops_the_compile_when_the_store_reader_checks_it() {
+    let xml = preference("Acme\\On\\Test\\Stub");
+    let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_WITH_CHECKS)])
+    else {
+        return;
+    };
+    assert_stops(
+        &output,
+        "has not been included in dependency injection compilation.",
+    );
+}
+
+/// The two checks as Magento 2.4.8 writes them, line breaks included.
+const READER_2_4_8: &str = "<?php\nnamespace Magento\\Setup\\Module\\Di\\Compiler\\Config;\n\n\
+     class Reader\n{\n    public function generateCachePerScope($definitionsCollection, $areaCode)\n    {\n        \
+     if (!class_exists($preference)) {\n            throw new LocalizedException(new Phrase(\n                \
+     'Preference declared for \"%instanceName\" as \"%preference\", but the latter does not exist.',\n            \
+     ));\n        }\n        if (!$definitionsCollection->hasInstance($preference)) {\n            \
+     throw new LocalizedException(new Phrase(\n                \
+     'Preference declared for \"%instanceName\" as \"%preference\", but the latter'\n                    \
+     . ' has not been included in dependency injection compilation.',\n            ));\n        }\n    }\n}\n";
+
+const CHECKS_OFF: &str = "does not stop on a preference to";
+
+#[test]
+fn the_reader_of_magento_2_4_8_keeps_both_checks() {
+    for (target, message) in [
+        ("Acme\\On\\Model\\Gone", MISSING),
+        (
+            "Acme\\On\\Test\\Stub",
+            "has not been included in dependency injection compilation.",
+        ),
+    ] {
+        let xml = preference(target);
+        let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_2_4_8)]) else {
+            return;
+        };
+        assert_stops(&output, message);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(CHECKS_OFF));
+    }
+}
+
+#[test]
+fn the_log_says_when_the_store_reader_does_not_check_targets() {
+    let xml = preference("Acme\\On\\Model\\Gone");
+    let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_WITHOUT_CHECKS)])
+    else {
+        return;
+    };
+    assert_compiles(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("{CHECKS_OFF} a missing or unscanned class")),
+        "{stderr}"
+    );
+}

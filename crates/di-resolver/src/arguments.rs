@@ -114,15 +114,21 @@ pub fn resolve_for_class(
     const_map: &FxHashMap<String, String>,
 ) -> Vec<ResolvedArg> {
     let di_args = merged_di_arguments_for_type_name(fqcn, class_map, di_config);
-    let di_arg_map: FxHashMap<&str, &Argument> =
-        di_args.iter().map(|a| (argument_name(a), a)).collect();
+    // `xsi:type="null"` interprets to PHP null, and `isset()` in
+    // `ArgumentsResolver::getResolvedConstructorArguments()` skips a null argument.
+    let di_arg_map: FxHashMap<&str, &Argument> = di_args
+        .iter()
+        .filter(|a| !matches!(a, Argument::Null { .. }))
+        .map(|a| (argument_name(a), a))
+        .collect();
     let Some(ctor) = &info.constructor else {
         return vec![];
     };
 
     let mut resolved = Vec::new();
+    let optional = php_extractor::types::optional_in_php(&ctor.params);
 
-    for param in &ctor.params {
+    for (param, optional) in ctor.params.iter().zip(optional) {
         // Check if di.xml overrides this param
         if let Some(di_arg) = di_arg_map.get(param.name.as_str()) {
             let type_hint = param.type_hint.as_deref().and_then(parameter_class);
@@ -149,7 +155,7 @@ pub fn resolve_for_class(
         let value = if param.is_variadic {
             // `ClassReader::getReflectionParameterDefaultValue()` gives a variadic `[]`.
             ResolvedArgValue::PlainArray(Vec::new())
-        } else if param.is_optional {
+        } else if optional {
             resolve_non_object_default(param.default_value.as_deref(), const_map)
         } else if let Some(type_hint) = param.type_hint.as_deref().and_then(parameter_class) {
             let concrete = di_config.get_preference(&type_hint);
