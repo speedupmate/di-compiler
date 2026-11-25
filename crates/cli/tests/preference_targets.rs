@@ -286,3 +286,48 @@ fn unscanned_target_stops_the_compile_when_the_store_reader_checks_it() {
         "has not been included in dependency injection compilation.",
     );
 }
+
+/// The two checks as Magento 2.4.8 writes them, line breaks included.
+const READER_2_4_8: &str = "<?php\nnamespace Magento\\Setup\\Module\\Di\\Compiler\\Config;\n\n\
+     class Reader\n{\n    public function generateCachePerScope($definitionsCollection, $areaCode)\n    {\n        \
+     if (!class_exists($preference)) {\n            throw new LocalizedException(new Phrase(\n                \
+     'Preference declared for \"%instanceName\" as \"%preference\", but the latter does not exist.',\n            \
+     ));\n        }\n        if (!$definitionsCollection->hasInstance($preference)) {\n            \
+     throw new LocalizedException(new Phrase(\n                \
+     'Preference declared for \"%instanceName\" as \"%preference\", but the latter'\n                    \
+     . ' has not been included in dependency injection compilation.',\n            ));\n        }\n    }\n}\n";
+
+const CHECKS_OFF: &str = "does not stop on a preference to";
+
+#[test]
+fn the_reader_of_magento_2_4_8_keeps_both_checks() {
+    for (target, message) in [
+        ("Acme\\On\\Model\\Gone", MISSING),
+        (
+            "Acme\\On\\Test\\Stub",
+            "has not been included in dependency injection compilation.",
+        ),
+    ] {
+        let xml = preference(target);
+        let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_2_4_8)]) else {
+            return;
+        };
+        assert_stops(&output, message);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(CHECKS_OFF));
+    }
+}
+
+#[test]
+fn the_log_says_when_the_store_reader_does_not_check_targets() {
+    let xml = preference("Acme\\On\\Model\\Gone");
+    let Some(output) = compile_with(&[(MODULE_DI, &xml), (CONFIG_READER, READER_WITHOUT_CHECKS)])
+    else {
+        return;
+    };
+    assert_compiles(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("{CHECKS_OFF} a missing or unscanned class")),
+        "{stderr}"
+    );
+}

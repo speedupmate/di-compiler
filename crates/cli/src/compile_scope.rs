@@ -35,10 +35,24 @@ pub(crate) fn preference_target_checks(magento_root: &Path) -> PreferenceTargetC
         };
     };
     let code = without_comments(&source);
-    PreferenceTargetChecks {
+    let checks = PreferenceTargetChecks {
         missing: code.contains("but the latter does not exist."),
         not_scanned: code.contains("has not been included in dependency injection compilation."),
+    };
+    // Normal on Magento 2.4.7 and older. On a newer store it means the message text changed.
+    let unchecked = match (checks.missing, checks.not_scanned) {
+        (true, true) => None,
+        (false, false) => Some("a missing or unscanned class"),
+        (false, true) => Some("a missing class"),
+        (true, false) => Some("an unscanned class"),
+    };
+    if let Some(unchecked) = unchecked {
+        log::info!(
+            "{} does not stop on a preference to {unchecked}, so this compile does not either",
+            path.display()
+        );
     }
+    checks
 }
 
 /// Whether the store's command scans the classes of disabled modules.
