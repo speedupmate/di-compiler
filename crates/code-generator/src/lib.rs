@@ -30,7 +30,7 @@ pub use plugin_list::{
 pub use proxy::{generate_proxy, proxy_path};
 pub use proxy_deferred::{generate_proxy_deferred, proxy_deferred_path};
 pub use search_results::{generate_search_results, search_results_path};
-pub use writer::write_if_changed;
+pub use writer::{stop_writes, write_atomic, write_counts, write_if_changed};
 
 /// Convert a `default_value` string from the PHP extractor into valid PHP syntax
 /// for use in generated code (interceptors, proxies, etc.).

@@ -144,6 +144,43 @@ fn plugin_on_an_interface_of_a_final_class_stops_the_compile() {
     assert_stops(&output, "Acme\\On\\Model\\Sealed");
 }
 
+// `Interception\Config\Config::generateIntercepted()` merges the plugins of every scope.
+#[test]
+fn plugin_in_an_area_di_xml_on_a_final_class_stops_the_compile() {
+    for area in ["frontend", "adminhtml", "webapi_rest", "crontab", "graphql"] {
+        let (_, plugin) = plugin_on("Sealed", "");
+        let Some(output) = run(vec![
+            model(
+                "Sealed",
+                "final class Sealed\n{\n    public function run()\n    {\n    }\n}",
+            ),
+            (format!("app/code/Acme/On/etc/{area}/di.xml"), plugin),
+        ]) else {
+            return;
+        };
+        assert_stops(&output, "Acme\\On\\Model\\Sealed");
+    }
+}
+
+// A plugin on a virtual type stays with the virtual type name. `hasPlugins()` of the final class
+// is false, so Magento generates no interceptor and the compile passes.
+#[test]
+fn plugin_on_a_virtual_type_of_a_final_class_compiles() {
+    let Some(output) = run(vec![
+        model(
+            "Sealed",
+            "final class Sealed\n{\n    public function run()\n    {\n    }\n}",
+        ),
+        (
+            "app/code/Acme/On/etc/di.xml".to_string(),
+            "<config><virtualType name=\"Acme\\On\\Model\\SealedVirtual\" type=\"Acme\\On\\Model\\Sealed\"/><type name=\"Acme\\On\\Model\\SealedVirtual\"><plugin name=\"p\" type=\"Acme\\On\\Plugin\\Watch\"/></type></config>\n".to_string(),
+        ),
+    ]) else {
+        return;
+    };
+    assert_compiles(&output);
+}
+
 #[test]
 fn final_class_without_plugins_compiles() {
     let Some(output) = run(vec![
