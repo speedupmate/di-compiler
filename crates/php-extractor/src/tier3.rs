@@ -15,7 +15,10 @@ use serde::Deserialize;
 
 use crate::lexer::is_primitive_type;
 use crate::php_snippets::{BOOT_PHP, ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP, TYPE_STRING_PHP};
-use crate::types::{ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult};
+use crate::types::{
+    ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
+    MethodSignature, TraitData, TraitMethod,
+};
 
 /// How Tier 3 runs PHP for one store.
 #[derive(Debug, Clone)]
@@ -57,12 +60,12 @@ pub fn extract_tier3(path: &Path) -> ExtractResult {
     if CONFIG.get().is_none() {
         return ExtractResult::PhpFallbackFailed("Tier 3 is not configured".into());
     }
-    // `reflect` does not read methods yet. A class without them would get an interceptor
-    // without its methods, so the chain does not use it yet.
-    ExtractResult::PhpFallbackFailed("Tier 3 does not read methods yet".into())
+    // The chain uses `reflect` once Tier 2 hands its broken trees on and the scan scope of a
+    // Tier 3 file is known.
+    ExtractResult::PhpFallbackFailed("Tier 3 is not in the extraction chain yet".into())
 }
 
-/// Reads the class a file declares, in PHP: its identity, header and constructor.
+/// Reads the class a file declares, in PHP: its identity, header, constructor and methods.
 pub fn reflect(config: &Tier3Config, path: &Path) -> ExtractResult {
     match run(config, path) {
         Ok(Tier3Output::Class(class)) => ExtractResult::Ok(class.into_class_info(path)),
@@ -283,26 +286,49 @@ foreach ($found->isInterface() ? $header['extends'] : $implements as $name) {
         $mismatch($name . ' is not an interface PHP has for it');
     }
 }
-// A constructor this class declares, its traits' included; an inherited one is the parent's.
+$parameter = static function (ReflectionParameter $p): array {
+    $hasDefault = $p->isDefaultValueAvailable();
+    return [
+        'name' => $p->getName(),
+        'type_hint' => tstr($p->getType()),
+        'has_default' => $hasDefault,
+        'default_value' => $hasDefault ? encode_default($p->getDefaultValue()) : null,
+        'is_variadic' => $p->isVariadic(),
+        'is_promoted' => $p->isPromoted(),
+        'is_by_ref' => $p->isPassedByReference(),
+    ];
+};
+$declares = static fn (ReflectionMethod $m): bool => strcasecmp($m->getDeclaringClass()->getName(), $found->getName()) === 0;
+// A constructor this class declares, its traits' included; an inherited one is the parent's. An
+// abstract constructor of a trait only asks for one.
 $constructor = null;
+$methods = [];
+$reading = 'the constructor';
 try {
     $method = $found->getConstructor();
-    if ($method !== null && strcasecmp($method->getDeclaringClass()->getName(), $found->getName()) === 0) {
-        $constructor = [];
-        foreach ($method->getParameters() as $p) {
-            $hasDefault = $p->isDefaultValueAvailable();
-            $constructor[] = [
-                'name' => $p->getName(),
-                'type_hint' => tstr($p->getType()),
-                'has_default' => $hasDefault,
-                'default_value' => $hasDefault ? encode_default($p->getDefaultValue()) : null,
-                'is_variadic' => $p->isVariadic(),
-                'is_promoted' => $p->isPromoted(),
-            ];
+    if ($method !== null && $declares($method) && !($found->isTrait() && $method->isAbstract())) {
+        $constructor = array_map($parameter, $method->getParameters());
+    }
+    // The methods this class declares. PHP has already added those of its traits, with their
+    // aliases and `insteadof` rules applied, as declared by this class.
+    $reading = 'the methods';
+    foreach ($found->getMethods() as $method) {
+        if (!$declares($method) || strcasecmp($method->getName(), '__construct') === 0) {
+            continue;
         }
+        $methods[] = [
+            'name' => $method->getName(),
+            'params' => array_map($parameter, $method->getParameters()),
+            'return_type' => tstr($method->getReturnType()),
+            'is_static' => $method->isStatic(),
+            'returns_reference' => $method->returnsReference(),
+            'is_public' => $method->isPublic(),
+            'is_final' => $method->isFinal(),
+            'is_abstract' => $method->isAbstract(),
+        ];
     }
 } catch (\Throwable $e) {
-    $fail('Could not read the constructor of ' . $first . ': ' . $e->getMessage());
+    $fail('Could not read ' . $reading . ' of ' . $first . ': ' . $e->getMessage());
 }
 $kind = $found->isInterface() ? 'interface' : ($found->isTrait() ? 'trait' : ($found->isAbstract() ? 'abstract_class' : 'class'));
 $finished = true;
@@ -316,6 +342,7 @@ $write([
     'extends' => $extends,
     'implements' => $implements,
     'constructor' => $constructor,
+    'methods' => $methods,
 ]);
 "#;
 
@@ -355,6 +382,7 @@ struct Tier3Class {
     extends: Option<String>,
     implements: Vec<String>,
     constructor: Option<Vec<Tier3Param>>,
+    methods: Vec<Tier3Method>,
 }
 
 #[derive(Deserialize)]
@@ -365,6 +393,19 @@ struct Tier3Param {
     default_value: Option<String>,
     is_variadic: bool,
     is_promoted: bool,
+    is_by_ref: bool,
+}
+
+#[derive(Deserialize)]
+struct Tier3Method {
+    name: String,
+    params: Vec<Tier3Param>,
+    return_type: Option<String>,
+    is_static: bool,
+    returns_reference: bool,
+    is_public: bool,
+    is_final: bool,
+    is_abstract: bool,
 }
 
 impl Tier3Class {
@@ -375,6 +416,28 @@ impl Tier3Class {
             Tier3Kind::Interface => ClassKind::Interface,
             Tier3Kind::Trait => ClassKind::Trait,
         };
+        // PHP has applied the trait rules, so `uses` and `rules` stay empty and `apply_traits`
+        // leaves the class as it is.
+        let mut traits = TraitData::default();
+        let mut public_methods = Vec::new();
+        for method in self.methods {
+            let (is_public, is_final, is_abstract) =
+                (method.is_public, method.is_final, method.is_abstract);
+            let signature = method.into_signature();
+            if kind == ClassKind::Trait {
+                traits.methods.push(TraitMethod {
+                    signature: signature.clone(),
+                    is_public,
+                    is_final,
+                    is_abstract,
+                });
+            }
+            if is_public && !is_final {
+                public_methods.push(signature);
+            } else {
+                traits.hidden_methods.push(signature.name);
+            }
+        }
         ClassInfo {
             path: path.to_path_buf(),
             namespace: self.namespace,
@@ -388,8 +451,24 @@ impl Tier3Class {
                 params: params.into_iter().map(Tier3Param::into_param).collect(),
             }),
             is_final: self.is_final,
-            public_methods: Vec::new(),
-            traits: Default::default(),
+            public_methods,
+            traits: Box::new(traits),
+        }
+    }
+}
+
+impl Tier3Method {
+    fn into_signature(self) -> MethodSignature {
+        MethodSignature {
+            name: self.name,
+            params: self
+                .params
+                .into_iter()
+                .map(Tier3Param::into_method_param)
+                .collect(),
+            return_type: self.return_type,
+            is_static: self.is_static,
+            returns_reference: self.returns_reference,
         }
     }
 }
@@ -407,6 +486,18 @@ impl Tier3Param {
             default_value: self.default_value,
             is_variadic: self.is_variadic,
             is_promoted: self.is_promoted,
+        }
+    }
+
+    /// `has_default` is PHP's `isDefaultValueAvailable()`, as for a constructor parameter.
+    fn into_method_param(self) -> MethodParam {
+        MethodParam {
+            name: self.name,
+            type_hint: self.type_hint,
+            has_default: self.has_default,
+            default_value: self.default_value,
+            is_variadic: self.is_variadic,
+            is_by_ref: self.is_by_ref,
         }
     }
 }

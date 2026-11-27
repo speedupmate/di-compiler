@@ -7,7 +7,11 @@ use std::time::Duration;
 use php_extractor::lexer::Lexer;
 use php_extractor::tier3::{reflect, Tier3Config};
 use php_extractor::types::optional_in_php;
-use php_extractor::{extract_file, ClassInfo, ClassKind, ExtractResult};
+use php_extractor::types::MethodParam;
+use php_extractor::{
+    apply_traits, extract_file, ClassInfo, ClassKind, ConstructorParam, ExtractResult,
+    MethodSignature,
+};
 use rustc_hash::FxHashMap;
 use tempfile::TempDir;
 
@@ -188,6 +192,20 @@ const FIXTURE_TABLE: &[(&str, Reference)] = &[
     ("variadic.php", Reference::Tier1),
 ];
 
+/// `info` after `apply_traits`, with traits read by Tier 1 from `files`.
+fn with_traits(info: ClassInfo, files: &[PathBuf]) -> ClassInfo {
+    let fqcn = info.fqcn.clone();
+    let mut map = FxHashMap::default();
+    map.insert(fqcn.clone(), info);
+    apply_traits(&mut map, &|name| {
+        files.iter().find_map(|file| match extract_file(file) {
+            ExtractResult::Ok(found) if found.fqcn.eq_ignore_ascii_case(name) => Some(found),
+            _ => None,
+        })
+    });
+    map.remove(&fqcn).unwrap()
+}
+
 fn reference(path: &Path, expected: Reference) -> Option<ClassInfo> {
     match expected {
         Reference::Tier1 => Some(
@@ -339,6 +357,106 @@ fn header_of(fixture: &str, info: &ClassInfo, reference: bool) -> Header {
     }
 }
 
+/// The methods of a class, after the normalization of the comparison.
+#[derive(Debug, PartialEq)]
+struct Methods {
+    public_methods: Vec<Method>,
+    hidden_methods: Vec<String>,
+    /// For a trait: every method, with public, final and abstract.
+    trait_methods: Vec<(Method, bool, bool, bool)>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Method {
+    name: String,
+    params: Vec<MethodParamFields>,
+    return_type: Option<String>,
+    is_static: bool,
+    returns_reference: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct MethodParamFields {
+    name: String,
+    type_hint: Option<String>,
+    optional_in_php: bool,
+    default: Option<String>,
+    is_variadic: bool,
+    is_by_ref: bool,
+}
+
+fn method_of(signature: &MethodSignature, class: &str) -> Method {
+    let const_map = FxHashMap::default();
+    // `optional_in_php` reads a constructor parameter; a method parameter has the same rule.
+    let as_constructor: Vec<ConstructorParam> = signature
+        .params
+        .iter()
+        .map(|p| ConstructorParam {
+            name: p.name.clone(),
+            type_hint: None,
+            is_optional: p.has_default,
+            default_value: None,
+            is_primitive: false,
+            is_variadic: p.is_variadic,
+            is_promoted: false,
+        })
+        .collect();
+    Method {
+        name: signature.name.clone(),
+        params: signature
+            .params
+            .iter()
+            .zip(optional_in_php(&as_constructor))
+            .map(|(p, optional): (&MethodParam, bool)| MethodParamFields {
+                name: p.name.clone(),
+                type_hint: p.type_hint.as_deref().map(|t| normalize_type(t, class)),
+                optional_in_php: optional,
+                default: optional.then(|| {
+                    format!(
+                        "{:?}",
+                        di_resolver::arguments::resolve_non_object_default(
+                            p.default_value.as_deref(),
+                            &const_map
+                        )
+                    )
+                }),
+                is_variadic: p.is_variadic,
+                is_by_ref: p.is_by_ref,
+            })
+            .collect(),
+        return_type: signature
+            .return_type
+            .as_deref()
+            .map(|t| normalize_type(t, class)),
+        is_static: signature.is_static,
+        returns_reference: signature.returns_reference,
+    }
+}
+
+fn methods_of(info: &ClassInfo) -> Methods {
+    Methods {
+        public_methods: info
+            .public_methods
+            .iter()
+            .map(|m| method_of(m, &info.fqcn))
+            .collect(),
+        hidden_methods: info.traits.hidden_methods.clone(),
+        trait_methods: info
+            .traits
+            .methods
+            .iter()
+            .map(|m| {
+                (
+                    method_of(&m.signature, &info.fqcn),
+                    m.is_public,
+                    m.is_final,
+                    m.is_abstract,
+                )
+            })
+            .collect(),
+    }
+}
+
 /// Compares `fields` of Tier 3 and of the reference for every fixture. `fields` gets the
 /// fixture's name and whether the class is the reference's.
 fn compare_fixtures<T: PartialEq + std::fmt::Debug>(fields: impl Fn(&str, &ClassInfo, bool) -> T) {
@@ -361,8 +479,11 @@ fn compare_fixtures<T: PartialEq + std::fmt::Debug>(fields: impl Fn(&str, &Class
     let mut mismatches = Vec::new();
     for (name, expected) in FIXTURE_TABLE {
         let path = fixtures().join(name);
-        let want = reference(&path, *expected);
-        let got = reflect(&store.config, &path);
+        let want = reference(&path, *expected).map(|info| with_traits(info, &fixture_files()));
+        let got = match reflect(&store.config, &path) {
+            ExtractResult::Ok(info) => ExtractResult::Ok(with_traits(info, &[])),
+            other => other,
+        };
         match (want, got) {
             (None, ExtractResult::NoClass) => {}
             (Some(want), ExtractResult::Ok(got)) => {
@@ -389,6 +510,11 @@ fn every_fixture_has_the_identity_of_its_reference() {
 #[test]
 fn every_fixture_has_the_header_and_constructor_of_its_reference() {
     compare_fixtures(header_of);
+}
+
+#[test]
+fn every_fixture_has_the_methods_of_its_reference() {
+    compare_fixtures(|_, info, _| methods_of(info));
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +770,170 @@ fn a_default_php_cannot_evaluate_fails() {
 }
 
 // ---------------------------------------------------------------------------
+// Methods and traits
+// ---------------------------------------------------------------------------
+
+/// Two traits in files of their own, so Tier 1 can read each of them.
+fn trait_files(store: &Store) -> Vec<PathBuf> {
+    vec![
+        store.file(
+            "Greets.php",
+            "<?php\nnamespace Acme\\Mix;\ntrait Greets {\n    public function hello(): string { return ''; }\n    final public function bye(): void {}\n    protected function secret(self $other) {}\n    abstract public function name(): string;\n}\n",
+        ),
+        store.file(
+            "Waves.php",
+            "<?php\nnamespace Acme\\Mix;\ntrait Waves {\n    public function hello(): int { return 1; }\n    public function wave(?string $how = null, int ...$times): static { return $this; }\n}\n",
+        ),
+    ]
+}
+
+fn requires(files: &[PathBuf]) -> String {
+    files
+        .iter()
+        .map(|file| format!("require_once {};\n", php_string(&file.to_string_lossy())))
+        .collect()
+}
+
+#[test]
+fn trait_rules_give_the_methods_of_tier1_after_apply_traits() {
+    let store = Store::new();
+    let traits = trait_files(&store);
+    let path = store.file(
+        "Person.php",
+        &format!(
+            "<?php\nnamespace Acme\\Mix;\n{}class Person {{\n    use Greets, Waves {{\n        Greets::hello insteadof Waves;\n        Waves::hello as waveHello;\n        wave as protected;\n        secret as public reveal;\n    }}\n    public function name(): string {{ return 'p'; }}\n    private function mine() {{}}\n}}\n",
+            requires(&traits)
+        ),
+    );
+    let tier3 = class(reflect(&store.config, &path));
+    let tier1 = with_traits(Lexer::extract(&path).unwrap(), &traits);
+    assert_eq!(methods_of(&tier3), methods_of(&tier1));
+    assert!(tier3.traits.uses.is_empty() && tier3.traits.rules.is_empty());
+
+    let public: Vec<&str> = tier3
+        .public_methods
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    // The class's own methods first, then each trait's, an alias before its method.
+    assert_eq!(public, ["name", "hello", "reveal", "waveHello"]);
+    let hello = &tier3.public_methods[1];
+    assert_eq!(hello.return_type.as_deref(), Some("string"));
+    assert_eq!(
+        tier3.traits.hidden_methods,
+        ["mine", "bye", "secret", "wave"]
+    );
+}
+
+#[test]
+fn a_trait_lists_every_method_with_its_flags() {
+    let store = Store::new();
+    let traits = trait_files(&store);
+    let tier3 = class(reflect(&store.config, &traits[0]));
+    assert_eq!(tier3.kind, ClassKind::Trait);
+    let flags: Vec<(&str, bool, bool, bool)> = tier3
+        .traits
+        .methods
+        .iter()
+        .map(|m| {
+            (
+                m.signature.name.as_str(),
+                m.is_public,
+                m.is_final,
+                m.is_abstract,
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            ("hello", true, false, false),
+            ("bye", true, true, false),
+            ("secret", false, false, false),
+            ("name", true, false, true),
+        ]
+    );
+    let tier1 = Lexer::extract(&traits[0]).unwrap();
+    assert_eq!(methods_of(&tier3), methods_of(&tier1));
+}
+
+#[test]
+fn an_abstract_constructor_of_a_trait_is_no_constructor() {
+    let store = Store::new();
+    let path = store.file(
+        "NeedsCtor.php",
+        "<?php\nnamespace Acme;\ntrait NeedsCtor { abstract public function __construct(int $size); }\n",
+    );
+    let tier3 = class(reflect(&store.config, &path));
+    assert_eq!(tier3.constructor, None);
+    assert!(tier3.traits.methods.is_empty());
+    assert_eq!(
+        tier3.constructor,
+        Lexer::extract(&path).unwrap().constructor
+    );
+}
+
+#[test]
+fn inherited_methods_belong_to_the_parent() {
+    let store = Store::new();
+    let parent = store.file(
+        "Elder.php",
+        "<?php\nnamespace Acme\\Family;\nclass Elder { public function old() {} protected function older() {} }\n",
+    );
+    let info = class(store.reflect(
+        "Younger.php",
+        &format!(
+            "<?php\nnamespace Acme\\Family;\n{}class Younger extends Elder {{ public function young() {{}} }}\n",
+            requires(&[parent])
+        ),
+    ));
+    let public: Vec<&str> = info
+        .public_methods
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(public, ["young"]);
+    assert!(info.traits.hidden_methods.is_empty());
+}
+
+#[test]
+fn method_parameters_compare_with_tier1_after_normalization() {
+    let store = Store::new();
+    let path = store.file(
+        "Calls.php",
+        "<?php\nnamespace Acme;\nuse Acme\\Data\\Item;\nclass Calls {\n    const LIMIT = 5;\n    public function run($first = 1, string $second, int ...$rest): ?self { return null; }\n    public function &many(array $list = [], ?Item $item = null, &$out = null, int $limit = self::LIMIT): array { return $list; }\n    public static function make(): static { return new static(); }\n}\n",
+    );
+    let tier3 = class(reflect(&store.config, &path));
+    let mut tier1 = Lexer::extract(&path).unwrap();
+    // The resolver cannot evaluate Tier 1's `self::LIMIT`; PHP gives its value.
+    tier1.public_methods[1].params[3].default_value = Some("5".into());
+    assert_eq!(methods_of(&tier3), methods_of(&tier1));
+
+    let run = &tier3.public_methods[0].params;
+    // PHP reports no default before a required parameter; Tier 1 keeps the source's.
+    assert!(!run[0].has_default);
+    assert!(tier1.public_methods[0].params[0].has_default);
+    assert!(run[2].is_variadic && !run[2].has_default);
+
+    let many = &tier3.public_methods[1];
+    assert!(many.returns_reference);
+    assert_eq!(many.params[0].default_value.as_deref(), Some("__json__:[]"));
+    assert!(many.params[2].is_by_ref);
+    assert_eq!(many.params[3].default_value.as_deref(), Some("5"));
+    assert!(tier3.public_methods[2].is_static);
+}
+
+#[test]
+fn a_method_default_php_cannot_evaluate_fails() {
+    let store = Store::new();
+    let reason = failure(store.reflect(
+        "Broken.php",
+        "<?php\nnamespace Acme;\nclass Broken { public function run(int $size = \\ACME_UNDEFINED_LIMIT) {} }\n",
+    ));
+    assert!(reason.contains("methods of Acme\\Broken"), "{reason}");
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -769,7 +1059,7 @@ fn fake_php(store: &Store, name: &str, json: Option<&str>, code: i32) -> String 
 fn a_result_counts_only_with_exit_code_zero() {
     let mut store = Store::new();
     let file = store.file("Any.php", "<?php\nclass Any {}\n");
-    let class_json = r#"{"result":"class","kind":"class","namespace":"","name":"Any","fqcn":"Any","is_final":false,"extends":null,"implements":[],"constructor":null}"#;
+    let class_json = r#"{"result":"class","kind":"class","namespace":"","name":"Any","fqcn":"Any","is_final":false,"extends":null,"implements":[],"constructor":null,"methods":[]}"#;
 
     store.config.php = fake_php(
         &store,
