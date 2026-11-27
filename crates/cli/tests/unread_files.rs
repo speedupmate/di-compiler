@@ -120,7 +120,9 @@ fn compile(files: &[(&str, &str)], di_xml: &str, scanner: bool) -> Output {
     for (relative, source) in files {
         write(root, &format!("app/code/Acme/On/{relative}"), source);
     }
-    write(root, "app/code/Acme/On/etc/di.xml", di_xml);
+    if !files.iter().any(|(relative, _)| *relative == "etc/di.xml") {
+        write(root, "app/code/Acme/On/etc/di.xml", di_xml);
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_fast-di-compile"))
         .arg("--magento-root")
         .arg(root)
@@ -266,4 +268,45 @@ fn a_file_php_cannot_tokenize_stops_the_compile() {
         &output,
         &["PHP's tokenizer cannot list the classes it declares"],
     );
+}
+
+/// `Holder`'s argument `dep` is `Readable` in one area and the unread `Lost` in the other.
+fn per_area(readable_in: &str, lost_in: &str) -> Output {
+    let argument = |class: &str| {
+        format!("<config><type name=\"Acme\\On\\Model\\Holder\"><arguments><argument name=\"dep\" xsi:type=\"object\">Acme\\On\\Model\\{class}</argument></arguments></type></config>\n")
+    };
+    let (readable, lost) = (argument("Readable"), argument("Lost"));
+    compile(
+        &[
+            (FILE, &inside_if()),
+            (
+                "Model/Readable.php",
+                "<?php\nnamespace Acme\\On\\Model;\n\nclass Readable\n{\n}\n",
+            ),
+            (
+                "Model/Holder.php",
+                "<?php\nnamespace Acme\\On\\Model;\n\nclass Holder\n{\n    public function __construct($dep)\n    {\n    }\n}\n",
+            ),
+            (&format!("etc/{readable_in}/di.xml"), &readable),
+            (&format!("etc/{lost_in}/di.xml"), &lost),
+        ],
+        NO_DI,
+        true,
+    )
+}
+
+#[test]
+fn an_argument_one_area_gives_an_unread_class_stops_the_compile() {
+    if !has_php_8_4() {
+        return;
+    }
+    for (readable_in, lost_in) in [("adminhtml", "frontend"), ("frontend", "adminhtml")] {
+        let output = per_area(readable_in, lost_in);
+        stopped_with(
+            &output,
+            &[&format!(
+                "used by the argument dep of Acme\\On\\Model\\Holder in area {lost_in}"
+            )],
+        );
+    }
 }

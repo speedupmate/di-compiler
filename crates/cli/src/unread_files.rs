@@ -172,50 +172,64 @@ impl Uses {
             .map(String::as_str)
     }
 
-    /// Preferences, types, virtual types, plugins and object arguments. Sorted, so the use named
-    /// first does not depend on hash order.
-    pub(crate) fn add_di_config(&mut self, config: &DiConfig) {
+    /// Preferences, types, virtual types, plugins and object arguments of one area's
+    /// configuration, or the global one. Sorted, so the use named first does not depend on hash
+    /// order.
+    pub(crate) fn add_di_config(&mut self, config: &DiConfig, scope: &str) {
+        let scope = if scope == "global" {
+            "the global configuration".to_string()
+        } else {
+            format!("area {scope}")
+        };
         let mut preferences: Vec<_> = config.preferences.iter().collect();
         preferences.sort();
         for (for_type, to_type) in preferences {
-            self.add(for_type, || format!("the preference for {for_type}"));
-            self.add(to_type, || format!("the preference for {for_type}"));
+            self.add(for_type, || {
+                format!("the preference for {for_type} in {scope}")
+            });
+            self.add(to_type, || {
+                format!("the preference for {for_type} in {scope}")
+            });
         }
         let mut types: Vec<_> = config.type_configs.iter().collect();
         types.sort_by(|a, b| a.0.cmp(b.0));
         for (type_name, type_config) in types {
-            self.add(type_name, || format!("the di.xml type {type_name}"));
+            self.add(type_name, || {
+                format!("the di.xml type {type_name} in {scope}")
+            });
             for argument in &type_config.arguments {
-                self.add_argument(type_name, argument);
+                self.add_argument(type_name, argument, &scope);
             }
         }
         let mut virtual_types: Vec<_> = config.virtual_types.values().collect();
         virtual_types.sort_by(|a, b| a.name.cmp(&b.name));
         for virtual_type in virtual_types {
             self.add(&virtual_type.type_name, || {
-                format!("the virtual type {}", virtual_type.name)
+                format!("the virtual type {} in {scope}", virtual_type.name)
             });
         }
         let mut plugins: Vec<_> = config.plugins.iter().collect();
         plugins.sort_by(|a, b| a.0.cmp(b.0));
         for (owner, list) in plugins {
-            self.add(owner, || format!("the plugins on {owner}"));
+            self.add(owner, || format!("the plugins on {owner} in {scope}"));
             for plugin in list {
                 self.add(&plugin.type_name, || {
-                    format!("the plugin {} on {owner}", plugin.name)
+                    format!("the plugin {} on {owner} in {scope}", plugin.name)
                 });
             }
         }
     }
 
-    fn add_argument(&mut self, type_name: &str, argument: &Argument) {
+    fn add_argument(&mut self, type_name: &str, argument: &Argument, scope: &str) {
         match argument {
             Argument::Object { name, value, .. } => {
-                self.add(value, || format!("the argument {name} of {type_name}"));
+                self.add(value, || {
+                    format!("the argument {name} of {type_name} in {scope}")
+                });
             }
             Argument::Array { items, .. } => {
                 for item in items {
-                    self.add_argument(type_name, item);
+                    self.add_argument(type_name, item, scope);
                 }
             }
             _ => {}
@@ -390,18 +404,18 @@ mod tests {
             },
         );
         let mut uses = Uses::default();
-        uses.add_di_config(&config);
+        uses.add_di_config(&config, "frontend");
         assert_eq!(
             uses.first_use("acme\\lostplugin"),
-            Some("the plugin watch on Acme\\Target")
+            Some("the plugin watch on Acme\\Target in area frontend")
         );
         assert_eq!(
             uses.first_use("Acme\\LostParent"),
-            Some("the virtual type acmeVirtual")
+            Some("the virtual type acmeVirtual in area frontend")
         );
         assert_eq!(
             uses.first_use("\\Acme\\LostHandler"),
-            Some("the argument first of Acme\\Holder")
+            Some("the argument first of Acme\\Holder in area frontend")
         );
     }
 

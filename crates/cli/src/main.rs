@@ -955,8 +955,23 @@ fn main() {
     log_phase_elapsed("Phase 3b", phase_3b_started);
 
     if !unread_files.is_empty() {
-        unread_uses.add_di_config(&di_config);
-        unread_uses.add_di_config(&full_di_config);
+        // Each area as Phase 7 compiles it: an area can replace a global argument, and two
+        // areas can give the same argument different classes.
+        unread_uses.add_di_config(&di_config, "global");
+        for area in &areas {
+            let area_only: Vec<DiConfig> = filter_enabled_di_xml(
+                find_di_xml_files_for_area(&magento_root, area, &enabled_modules),
+                &enabled_modules,
+                &magento_root,
+            )
+            .iter()
+            .filter(|path| !di_xml_files_set.contains(path))
+            .filter_map(|path| area_di_xml_cache.get(path).cloned())
+            .collect();
+            if !area_only.is_empty() {
+                unread_uses.add_di_config(&merge_area_config(&di_config, area_only), area);
+            }
+        }
         decide_unread_files(
             &unread_files,
             &unread_uses,
@@ -1889,10 +1904,8 @@ fn main() {
                             // Area-specific module configs applied via the same two-phase merge as
                             // global: deep-merge area module configs together, then apply on the
                             // global base using shallow (array_replace) semantics per PHP behaviour.
-                            let mut merged_area = apply_module_config_on_primary(
-                                (*metadata_base_di_config).clone(),
-                                merge_configs(extra_configs),
-                            );
+                            let mut merged_area =
+                                merge_area_config(&metadata_base_di_config, extra_configs);
                             apply_resolved_constants_to_di_config(
                                 &mut merged_area,
                                 &resolved_const_values,
@@ -2442,9 +2455,12 @@ fn is_generated_class_name(class: &str) -> bool {
         .any(|suffix| class.ends_with(suffix))
 }
 
-/// Ends a compile that Magento would stop too. `DiCompileCommand::execute()` empties
-/// `generated/metadata` first, so a failed compile never leaves old metadata for the store to use.
-/// Removing it at the end gives the same result, and a passing compile can still skip phase 7.
+/// An area's DI configuration as Phase 7 compiles it: the area's module files merged together,
+/// then applied on the global configuration with `array_replace` semantics, as PHP does.
+fn merge_area_config(global: &DiConfig, area_module_configs: Vec<DiConfig>) -> DiConfig {
+    apply_module_config_on_primary(global.clone(), merge_configs(area_module_configs))
+}
+
 /// Stops the compile for files Magento needs and no tier could read; leaves the others out with
 /// a warning.
 fn decide_unread_files(
@@ -2477,6 +2493,9 @@ fn decide_unread_files(
     }
 }
 
+/// Ends a compile that Magento would stop too. `DiCompileCommand::execute()` empties
+/// `generated/metadata` first, so a failed compile never leaves old metadata for the store to use.
+/// Removing it at the end gives the same result, and a passing compile can still skip phase 7.
 fn stop_compile(message: &str) -> ! {
     eprintln!("error: {message}");
     run_report::clean_up();
