@@ -38,6 +38,7 @@ mod watch_set;
 use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
+use php_extractor::php_snippets::{ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP};
 
 use code_generator::{
     compile_scope_plugin_list, extension_path, factory_path, generate_app_action_list_php,
@@ -219,27 +220,7 @@ spl_autoload_register(function (string $class) use ($generated): void {
     $file = $generated . '/' . str_replace('\\', '/', $class) . '.php';
     if (is_file($file)) require $file;
 });
-// Encodes a default value. `__php__:` and `__obj__:` carry a var_export() expression.
-function holds_object($v): bool {
-    if (is_array($v)) { foreach ($v as $i) if (holds_object($i)) return true; return false; }
-    return is_object($v);
-}
-function holds_instance($v): bool {
-    if (is_array($v)) { foreach ($v as $i) if (holds_instance($i)) return true; return false; }
-    return is_object($v) && !($v instanceof UnitEnum);
-}
-function encode_default($v): string {
-    if (holds_instance($v)) return '__obj__:' . var_export($v, true);
-    if (holds_object($v)) return '__php__:' . var_export($v, true);
-    if (is_array($v)) {
-        $json = json_encode($v);
-        return $json === false ? '__php__:' . var_export($v, true) : '__json__:' . $json;
-    }
-    if ((is_float($v) && !is_finite($v)) || $v === PHP_INT_MIN || (is_string($v) && str_contains($v, "\0"))) {
-        return '__php__:' . var_export($v, true);
-    }
-    return var_export($v, true);
-}
+// ENCODE DEFAULT
 function tstr($t): ?string {
     if ($t === null) return null;
     if ($t instanceof ReflectionNamedType) {
@@ -551,7 +532,9 @@ fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) ->
     let script_path = worker_script_path();
     std::fs::write(
         &script_path,
-        WORKER_PHP.replace("// OBJECT MANAGER", class_checks::OBJECT_MANAGER_PHP),
+        WORKER_PHP
+            .replace("// OBJECT MANAGER", OBJECT_MANAGER_PHP)
+            .replace("// ENCODE DEFAULT\n", ENCODE_DEFAULT_PHP),
     )
     .expect("failed to write PHP worker script to temp dir");
     PHP_WORKER_POOL.get_or_init(|| {
@@ -608,11 +591,6 @@ fn main() {
         });
     }
     run_report::stop_on_signals();
-
-    // Wire --fallback-php to the env var that Tier 3 reads.
-    if args.fallback_php != "php" {
-        std::env::set_var("FAST_DI_PHP", &args.fallback_php);
-    }
 
     // Validate requires --php-generated
     if args.validate && args.php_generated.is_none() {
@@ -683,6 +661,11 @@ fn main() {
 
     // Initialise the persistent PHP worker pool (one autoload per worker process).
     let worker_script_path = init_php_worker_pool(&args.fallback_php, &magento_root, &code_root);
+    let _ = php_extractor::tier3::configure(php_extractor::tier3::Tier3Config::new(
+        args.fallback_php.clone(),
+        &magento_root,
+        &code_root,
+    ));
 
     log::info!(
         "fast-di-compile starting\n  magento_root: {}\n  output:       {}",

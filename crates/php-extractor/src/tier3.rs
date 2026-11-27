@@ -1,321 +1,333 @@
-//! Tier 3: PHP shell fallback extractor.
+//! Tier 3: asks PHP itself, through reflection, for a file Tiers 1 and 2 cannot read.
 //!
-//! Spawns `php -r '...'` to extract class info via JSON stdout.
-//! Used as last resort for files Tier 1 and Tier 2 cannot handle (<0.5%).
-use std::path::Path;
-use std::process::Command;
+//! Each file gets its own `php` process, so a fatal error while loading it ends only that run.
+//! The file loads as it does in `bin/magento`: the store's bootstrap, stand-ins for generated
+//! classes and a lazy ObjectManager. The answer goes to a result file, so anything the store or
+//! the class file prints cannot change it.
 
-use crate::types::{ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
-/// Path to PHP binary. Can be overridden via FAST_DI_PHP env var.
-fn php_bin() -> String {
-    std::env::var("FAST_DI_PHP").unwrap_or_else(|_| "php".to_string())
+use serde::Deserialize;
+
+use crate::php_snippets::{BOOT_PHP, ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP};
+use crate::types::{ClassInfo, ClassKind, ExtractResult};
+
+/// How Tier 3 runs PHP for one store.
+#[derive(Debug, Clone)]
+pub struct Tier3Config {
+    /// The PHP binary (`--fallback-php`).
+    pub php: String,
+    pub magento_root: PathBuf,
+    /// Where generated classes are, as `generated/code`.
+    pub generated: PathBuf,
+    /// A run that takes longer is stopped and counts as failed.
+    pub timeout: Duration,
+    /// Each run gets its own folder in here, removed when the run ends.
+    pub scratch: PathBuf,
 }
 
+impl Tier3Config {
+    pub fn new(php: impl Into<String>, magento_root: &Path, generated: &Path) -> Self {
+        Self {
+            php: php.into(),
+            magento_root: magento_root.to_path_buf(),
+            generated: generated.to_path_buf(),
+            timeout: Duration::from_secs(30),
+            scratch: std::env::temp_dir(),
+        }
+    }
+}
+
+static CONFIG: OnceLock<Tier3Config> = OnceLock::new();
+
+/// Sets the store Tier 3 reads classes of. Only the first call counts; a later one gets its
+/// config back.
+pub fn configure(config: Tier3Config) -> Result<(), Tier3Config> {
+    CONFIG.set(config)
+}
+
+/// Tier 3 as the extraction chain calls it.
 pub fn extract_tier3(path: &Path) -> ExtractResult {
-    let script = build_php_script(path);
-    match run_php(&script) {
-        Ok(json) => match parse_json_output(&json, path) {
-            Ok(Some(info)) => ExtractResult::Ok(info),
-            Ok(None) => ExtractResult::NoClass,
-            Err(e) => ExtractResult::PhpFallbackFailed(e),
-        },
-        Err(e) => {
-            log::warn!("Tier 3 fallback failed for {}: {}", path.display(), e);
-            ExtractResult::PhpFallbackFailed(e)
-        }
+    let _ = path;
+    if CONFIG.get().is_none() {
+        return ExtractResult::PhpFallbackFailed("Tier 3 is not configured".into());
+    }
+    // `reflect` reads only which class a file declares so far. A class without its constructor
+    // and methods would compile to wrong code, so the chain does not use it yet.
+    ExtractResult::PhpFallbackFailed("Tier 3 does not read constructors and methods yet".into())
+}
+
+/// Reads the class a file declares, in PHP.
+pub fn reflect(config: &Tier3Config, path: &Path) -> ExtractResult {
+    match run(config, path) {
+        Ok(Tier3Output::Class(class)) => ExtractResult::Ok(class.into_class_info(path)),
+        Ok(Tier3Output::NoClass) => ExtractResult::NoClass,
+        Ok(Tier3Output::Error { message }) => ExtractResult::PhpFallbackFailed(message),
+        Err(reason) => ExtractResult::PhpFallbackFailed(reason),
     }
 }
 
-fn build_php_script(path: &Path) -> String {
-    let path_str = path.to_string_lossy().replace('\'', "\\'");
-    // PHP script that reflects a class file and outputs JSON
-    format!(
-        r#"<?php
-error_reporting(0);
-$file = '{path_str}';
-$content = file_get_contents($file);
-if (!$content) {{ echo json_encode(null); exit; }}
-// Extract namespace and class name via regex (fast)
-$ns = '';
-if (preg_match('/namespace\s+([\\\\\w]+)\s*[;{{]/m', $content, $m)) {{
-    $ns = $m[1];
-}}
-$kind = 'class';
-$name = '';
-$abstract = false;
-$final = false;
-if (preg_match('/^(abstract\s+)?class\s+(\w+)/m', $content, $m)) {{
-    $name = $m[2];
-    $abstract = !empty($m[1]);
-    $kind = 'class';
-}} elseif (preg_match('/^final\s+class\s+(\w+)/m', $content, $m)) {{
-    $name = $m[1];
-    $final = true;
-    $kind = 'class';
-}} elseif (preg_match('/^interface\s+(\w+)/m', $content, $m)) {{
-    $name = $m[1];
-    $kind = 'interface';
-}} elseif (preg_match('/^trait\s+(\w+)/m', $content, $m)) {{
-    $name = $m[1];
-    $kind = 'trait';
-}} elseif (preg_match('/^enum\s+(\w+)/m', $content, $m)) {{
-    echo json_encode(null);
-    exit;
-}}
-if (!$name) {{ echo json_encode(null); exit; }}
-$fqcn = $ns ? "$ns\\\\$name" : $name;
-$extends = null;
-if (preg_match('/extends\s+([\\\\\w]+)/', $content, $m)) {{
-    $extends = ltrim($m[1], '\\\\');
-}}
-$implements = [];
-if (preg_match('/implements\s+([\s\w\\\\,]+){{/', $content, $m)) {{
-    foreach (preg_split('/,\s*/', trim($m[1])) as $iface) {{
-        $implements[] = ltrim(trim($iface), '\\\\');
-    }}
-}}
-// Require the file to use reflection for constructor params
-require_once $file;
-$params = [];
-try {{
-    $rc = new ReflectionClass($fqcn);
-    $ctor = $rc->getConstructor();
-    if ($ctor) {{
-        foreach ($ctor->getParameters() as $p) {{
-            $th = null;
-            try {{
-                $type = $p->getType();
-                if ($type && $type instanceof ReflectionNamedType) {{
-                    $th = $type->getName();
-                }}
-            }} catch(Throwable $e) {{}}
-            $params[] = [
-                'name' => $p->getName(),
-                'type_hint' => $th,
-                'is_optional' => $p->isOptional(),
-                'is_variadic' => $p->isVariadic(),
-                'is_promoted' => $p->isPromoted(),
-                'is_primitive' => in_array($th, ['int','string','bool','float','array','callable','iterable','void','null','mixed','object']),
-            ];
-        }}
-    }}
-}} catch(Throwable $e) {{}}
-echo json_encode([
-    'namespace' => $ns,
-    'name' => $name,
-    'fqcn' => $fqcn,
-    'kind' => $kind,
-    'extends' => $extends,
-    'implements' => $implements,
-    'is_abstract' => $abstract,
-    'is_final' => $final,
-    'params' => $params,
+/// Needs `$file` and `$result` after `BOOT_PHP`. Writes one JSON object to `$result`.
+const REFLECT_HEAD_PHP: &str = r#"<?php
+[, $root, $generated, $file, $result] = $argv;
+$finished = false;
+$write = static function (array $row) use ($result): void {
+    file_put_contents($result, json_encode($row, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES));
+};
+register_shutdown_function(static function () use (&$finished, $write): void {
+    if ($finished) {
+        return;
+    }
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+    $last = error_get_last();
+    $write(['result' => 'error', 'message' => $last !== null && ($last['type'] & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR))
+        ? 'There is an error in ' . $last['file'] . ' at line: ' . $last['line'] . ': ' . $last['message']
+        : 'The file ended the PHP process']);
+});
+"#;
+
+const REFLECT_PHP: &str = r#"
+$real = realpath($file) ?: $file;
+$level = ob_get_level();
+ob_start();
+try {
+    require_once $file;
+} catch (\Throwable $e) {
+    while (ob_get_level() > $level) {
+        ob_end_clean();
+    }
+    $finished = true;
+    $write(['result' => 'error', 'message' => 'There is an error in ' . $e->getFile() . ' at line: ' . $e->getLine() . ': ' . $e->getMessage()]);
+    exit(0);
+}
+while (ob_get_level() > $level) {
+    ob_end_clean();
+}
+// The class of the file is its first named class-like declaration in source order, as Tier 1
+// reads it. Reflection gives only a line, which two declarations can share, so PHP's tokenizer
+// finds it.
+$tokens = PhpToken::tokenize((string) file_get_contents($file));
+$count = count($tokens);
+$next = static function (int $i) use ($tokens, $count): int {
+    for ($i++; $i < $count && $tokens[$i]->isIgnorable(); $i++) {
+    }
+    return $i;
+};
+$namespace = '';
+$previous = null;
+$first = null;
+for ($i = 0; $i < $count && $first === null; $i++) {
+    $token = $tokens[$i];
+    if ($token->isIgnorable()) {
+        continue;
+    }
+    if ($token->is(T_NAMESPACE)) {
+        $j = $next($i);
+        if ($j < $count && $tokens[$j]->is([T_STRING, T_NAME_QUALIFIED])) {
+            $namespace = $tokens[$j]->text;
+            $i = $j;
+        } elseif ($j < $count && $tokens[$j]->text === '{') {
+            $namespace = '';
+        }
+    } elseif ($token->is([T_CLASS, T_INTERFACE, T_TRAIT, T_ENUM])
+        && !($previous !== null && $previous->is([T_DOUBLE_COLON, T_NEW]))) {
+        // `Foo::class` and `new class` are no declarations; an anonymous class has no name.
+        $j = $next($i);
+        if ($j < $count && $tokens[$j]->is(T_STRING)) {
+            $first = ($namespace === '' ? '' : $namespace . '\\') . $tokens[$j]->text;
+        }
+    }
+    $previous = $token;
+}
+$finished = true;
+if ($first === null) {
+    $write(['result' => 'no_class']);
+    exit(0);
+}
+if (!class_exists($first, false) && !interface_exists($first, false) && !trait_exists($first, false)) {
+    $write(['result' => 'error', 'message' => $first . ' is declared in ' . $file . ', but PHP did not declare it there']);
+    exit(0);
+}
+$found = new ReflectionClass($first);
+$declared = $found->getFileName();
+if ($declared === false || (realpath($declared) ?: $declared) !== $real) {
+    $write(['result' => 'error', 'message' => $first . ' is declared in ' . $file . ', but PHP has it from ' . ($declared ?: 'PHP itself')]);
+    exit(0);
+}
+if ($found->isEnum()) {
+    $write(['result' => 'no_class']);
+    exit(0);
+}
+$write([
+    'result' => 'class',
+    'kind' => $found->isInterface() ? 'interface' : ($found->isTrait() ? 'trait' : ($found->isAbstract() ? 'abstract_class' : 'class')),
+    'namespace' => $found->getNamespaceName(),
+    'name' => $found->getShortName(),
+    'fqcn' => $found->getName(),
 ]);
-"#,
-        path_str = path_str
-    )
+"#;
+
+fn script() -> &'static str {
+    static SCRIPT: OnceLock<String> = OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        format!("{REFLECT_HEAD_PHP}{BOOT_PHP}{OBJECT_MANAGER_PHP}{ENCODE_DEFAULT_PHP}{REFLECT_PHP}")
+    })
 }
 
-fn run_php(script: &str) -> Result<String, String> {
-    let output = Command::new(php_bin())
-        .arg("-r")
-        .arg(script)
-        .output()
-        .map_err(|e| format!("Failed to spawn php: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("php exited {}: {stderr}", output.status));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+#[derive(Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum Tier3Output {
+    Class(Tier3Class),
+    NoClass,
+    Error { message: String },
 }
 
-fn parse_json_output(json: &str, path: &Path) -> Result<Option<ClassInfo>, String> {
-    let trimmed = json.trim();
-    if trimmed == "null" || trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    // Manual JSON parsing to avoid adding serde_json to this crate's hot path.
-    // We expect a flat object with known fields from our PHP script above.
-    // Use serde_json from workspace since it's already a dep of cli.
-    // Actually, for simplicity use a basic approach:
-    parse_class_json(trimmed, path)
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Tier3Kind {
+    Class,
+    AbstractClass,
+    Interface,
+    Trait,
 }
 
-fn parse_class_json(json: &str, path: &Path) -> Result<Option<ClassInfo>, String> {
-    // Use serde_json via the already-compiled workspace dep
-    // We'll parse it manually to avoid adding serde to php-extractor
-    // Simple field extraction:
-    let namespace = extract_json_str(json, "namespace").unwrap_or_default();
-    let name = extract_json_str(json, "name").unwrap_or_default();
-    if name.is_empty() {
-        return Ok(None);
-    }
-    let fqcn = extract_json_str(json, "fqcn").unwrap_or_else(|| {
-        if namespace.is_empty() {
-            name.clone()
-        } else {
-            format!("{}\\{}", namespace, name)
+#[derive(Deserialize)]
+struct Tier3Class {
+    kind: Tier3Kind,
+    namespace: String,
+    name: String,
+    fqcn: String,
+}
+
+impl Tier3Class {
+    fn into_class_info(self, path: &Path) -> ClassInfo {
+        ClassInfo {
+            path: path.to_path_buf(),
+            namespace: self.namespace,
+            name: self.name,
+            fqcn: self.fqcn,
+            kind: match self.kind {
+                Tier3Kind::Class => ClassKind::Class,
+                Tier3Kind::AbstractClass => ClassKind::AbstractClass,
+                Tier3Kind::Interface => ClassKind::Interface,
+                Tier3Kind::Trait => ClassKind::Trait,
+            },
+            extends: None,
+            implements: Vec::new(),
+            constructor: None,
+            is_abstract: false,
+            is_final: false,
+            public_methods: Vec::new(),
+            traits: Default::default(),
         }
-    });
-    let kind_str = extract_json_str(json, "kind").unwrap_or_else(|| "class".to_string());
-    let kind = match kind_str.as_str() {
-        "interface" => ClassKind::Interface,
-        "trait" => ClassKind::Trait,
-        _ => ClassKind::Class,
+    }
+}
+
+fn run(config: &Tier3Config, path: &Path) -> Result<Tier3Output, String> {
+    // A new folder with a random name, readable by this user only. Dropping it removes it, so
+    // it goes on every return, and only what this run created goes with it.
+    let folder = tempfile::Builder::new()
+        .prefix("fast-di-tier3-")
+        .tempdir_in(&config.scratch)
+        .map_err(|e| {
+            format!(
+                "Could not create a folder in {}: {e}",
+                config.scratch.display()
+            )
+        })?;
+    let script_path = folder.path().join("tier3.php");
+    let result_path = folder.path().join("result.json");
+    let stderr_path = folder.path().join("stderr.txt");
+    std::fs::write(&script_path, script())
+        .map_err(|e| format!("Could not write {}: {e}", script_path.display()))?;
+    let stderr = File::create(&stderr_path)
+        .map_err(|e| format!("Could not write {}: {e}", stderr_path.display()))?;
+
+    let mut child = Command::new(&config.php)
+        .args(["-d", "display_errors=stderr"])
+        .arg(&script_path)
+        .arg(&config.magento_root)
+        .arg(&config.generated)
+        .arg(path)
+        .arg(&result_path)
+        .current_dir(&config.magento_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|e| format!("Could not start {}: {e}", config.php))?;
+
+    let deadline = Instant::now() + config.timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timeout after {} s", config.timeout.as_secs_f32()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Could not wait for {}: {e}", config.php));
+            }
+        }
     };
-    let is_abstract = json.contains(r#""is_abstract":true"#);
-    let is_final = json.contains(r#""is_final":true"#);
-    let extends = extract_json_str(json, "extends");
 
-    // Parse params array (simplified)
-    let params = parse_params_array(json);
-
-    Ok(Some(ClassInfo {
-        path: path.to_path_buf(),
-        namespace,
-        name,
-        fqcn,
-        kind,
-        extends,
-        implements: Vec::new(), // simplified — full impl would parse array
-        constructor: if params.is_empty() {
-            None
+    let result = std::fs::read_to_string(&result_path)
+        .ok()
+        .map(|json| serde_json::from_str::<Tier3Output>(&json));
+    match (status.success(), result) {
+        (true, Some(Ok(output))) => return Ok(output),
+        (true, Some(Err(e))) => return Err(format!("Invalid Tier 3 result: {e}")),
+        // A fatal error ends PHP with an exit code; the shutdown function wrote why.
+        (false, Some(Ok(Tier3Output::Error { message }))) => {
+            return Ok(Tier3Output::Error { message })
+        }
+        _ => {}
+    }
+    let first_stderr_line = std::fs::read_to_string(&stderr_path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    Err(format!(
+        "php exited with {} without a usable result{}{}",
+        status
+            .code()
+            .map_or_else(|| "a signal".to_string(), |code| format!("code {code}")),
+        if first_stderr_line.is_empty() {
+            ""
         } else {
-            Some(Constructor { params })
+            ": "
         },
-        is_abstract,
-        is_final,
-        public_methods: Vec::new(), // Tier 3 doesn't extract methods
-        traits: Default::default(),
-    }))
+        first_stderr_line
+    ))
 }
 
-/// Extract a string field from a JSON object string. Very simple, no deps.
-fn extract_json_str(json: &str, field: &str) -> Option<String> {
-    let key = format!(r#""{field}":"#);
-    let pos = json.find(&key)?;
-    let after = &json[pos + key.len()..].trim_start();
-    if let Some(after) = after.strip_prefix('"') {
-        let end = find_json_string_end(after)?;
-        Some(unescape_json(&after[..end]))
-    } else {
-        None
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn find_json_string_end(s: &str) -> Option<usize> {
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i),
-            _ => i += 1,
+    // No test in this binary configures Tier 3.
+    #[test]
+    fn unconfigured_tier3_is_not_attempted() {
+        match extract_tier3(Path::new("/nonexistent/Foo.php")) {
+            ExtractResult::PhpFallbackFailed(reason) => {
+                assert_eq!(reason, "Tier 3 is not configured")
+            }
+            other => panic!("expected PhpFallbackFailed, got {other:?}"),
         }
     }
-    None
 }
-
-fn unescape_json(s: &str) -> String {
-    s.replace("\\\\", "\\")
-        .replace("\\\"", "\"")
-        .replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-}
-
-fn parse_params_array(json: &str) -> Vec<ConstructorParam> {
-    // Find "params":[ ... ] and parse each {name, type_hint, ...} object
-    let marker = r#""params":["#;
-    let start = match json.find(marker) {
-        Some(p) => p + marker.len(),
-        None => return Vec::new(),
-    };
-    let params_json = &json[start..];
-
-    let mut params = Vec::new();
-    let mut depth = 1i32;
-    let mut obj_start: Option<usize> = None;
-    let bytes = params_json.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() && depth > 0 {
-        match bytes[i] {
-            b'{' if depth == 1 => {
-                obj_start = Some(i);
-                depth += 1;
-                i += 1;
-            }
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 1 {
-                    if let Some(os) = obj_start {
-                        let obj = &params_json[os..=i];
-                        let name = extract_json_str(obj, "name").unwrap_or_default();
-                        if !name.is_empty() {
-                            let type_hint = extract_json_str(obj, "type_hint");
-                            let is_optional = obj.contains(r#""is_optional":true"#);
-                            let is_variadic = obj.contains(r#""is_variadic":true"#);
-                            let is_promoted = obj.contains(r#""is_promoted":true"#);
-                            let is_primitive =
-                                type_hint.as_deref().map(is_primitive_type).unwrap_or(true);
-                            params.push(ConstructorParam {
-                                name,
-                                type_hint,
-                                is_optional,
-                                default_value: None,
-                                is_primitive,
-                                is_variadic,
-                                is_promoted,
-                            });
-                        }
-                    }
-                    obj_start = None;
-                } else if depth == 0 {
-                    break;
-                }
-                i += 1;
-            }
-            b']' if depth == 1 => break,
-            _ => i += 1,
-        }
-    }
-
-    params
-}
-
-fn is_primitive_type(t: &str) -> bool {
-    matches!(
-        t,
-        "int"
-            | "integer"
-            | "float"
-            | "double"
-            | "string"
-            | "bool"
-            | "boolean"
-            | "array"
-            | "callable"
-            | "iterable"
-            | "void"
-            | "null"
-            | "mixed"
-            | "never"
-            | "true"
-            | "false"
-            | "object"
-            | "self"
-            | "static"
-            | "parent"
-    )
-}
-
-// No unit tests for tier3 — requires PHP runtime, tested via integration tests.

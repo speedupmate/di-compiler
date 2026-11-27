@@ -688,6 +688,8 @@ dependencies = [
  "memmap2",
  "rayon",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tree-sitter",
