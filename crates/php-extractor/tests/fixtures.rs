@@ -142,6 +142,10 @@ fn fixture_intersection_type_extracted_by_tier2() {
     let ctor = info.constructor.unwrap();
     assert_eq!(ctor.params.len(), 1);
     assert_eq!(ctor.params[0].name, "collection");
+    assert_eq!(
+        ctor.params[0].type_hint.as_deref(),
+        Some("Countable&Iterator")
+    );
 }
 
 #[test]

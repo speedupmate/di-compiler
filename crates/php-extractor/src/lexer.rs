@@ -618,6 +618,14 @@ impl<'a> Scanner<'a> {
         if is_primitive_type(raw) {
             return raw.to_ascii_lowercase();
         }
+        // `namespace\Foo` is relative to the current namespace.
+        if let Some(rest) = crate::tier2::strip_namespace_keyword(raw) {
+            return if self.namespace.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{}\\{}", self.namespace, rest)
+            };
+        }
         // The first segment determines whether there's a use-import match.
         let first = raw.split('\\').next().unwrap_or(raw);
         if let Some(mapped) = self.use_map.get(&first.to_ascii_lowercase()) {
@@ -1772,6 +1780,20 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(info.implements, ["Lib\\C29999"]);
+    }
+
+    #[test]
+    fn a_name_after_the_namespace_keyword_is_relative_to_the_namespace() {
+        let info = extract_str(
+            "<?php\nnamespace Acme\\Shop;\nclass Cart implements namespace\\Marker {\n    \
+             public function __construct(NAMESPACE\\Sub\\Item $item) {}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(info.implements, ["Acme\\Shop\\Marker"]);
+        assert_eq!(
+            info.constructor.unwrap().params[0].type_hint.as_deref(),
+            Some("Acme\\Shop\\Sub\\Item")
+        );
     }
 
     #[test]

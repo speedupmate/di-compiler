@@ -293,11 +293,6 @@ const DEFAULT_VALUES: &[(&str, &str, &str)] = &[
     ("complex_defaults.php", "timeout", "1800"),
 ];
 
-/// Parameter types where the reference is wrong, by fixture and parameter, with PHP's type.
-/// Tier 2 reads an intersection as one name relative to the namespace.
-const TYPE_HINTS: &[(&str, &str, &str)] =
-    &[("intersection_type.php", "collection", "Countable&Iterator")];
-
 /// The header of a class and its constructor, after the normalization of the comparison.
 #[derive(Debug, PartialEq)]
 struct Header {
@@ -375,8 +370,9 @@ fn header_of(fixture: &str, info: &ClassInfo, reference: bool) -> Header {
                     };
                     Param {
                         name: param.name.clone(),
-                        type_hint: listed(TYPE_HINTS)
-                            .or(param.type_hint.as_deref())
+                        type_hint: param
+                            .type_hint
+                            .as_deref()
                             .map(|t| normalize_type(t, &info.fqcn)),
                         optional_in_php: optional,
                         default: optional.then(|| {
@@ -720,14 +716,16 @@ fn a_relative_name_resolves_in_the_namespace() {
         "Local.php",
         "<?php\nnamespace Acme\\Local;\ninterface Marker {}\n",
     );
-    let info = class(store.reflect(
+    let path = store.file(
         "Relative.php",
         &format!(
             "<?php\nnamespace Acme\\Local;\nrequire_once {};\nclass Relative implements namespace\\Marker {{}}\n",
             php_string(&store.dir.path().join("files/Local.php").to_string_lossy())
         ),
-    ));
+    );
+    let info = class(reflect(&store.config, &path));
     assert_eq!(info.implements, ["Acme\\Local\\Marker"]);
+    assert_eq!(info.implements, Lexer::extract(&path).unwrap().implements);
 }
 
 #[test]
