@@ -690,14 +690,20 @@ fn header_names_resolve_through_imports_as_tier1() {
 fn every_import_of_a_comma_list_counts() {
     let store = Store::new();
     let contracts = contracts(&store);
-    let info = class(store.reflect(
+    let path = store.file(
         "ImportList.php",
         &format!(
             "<?php\nnamespace Acme\\Shop;\nuse Acme\\Contracts\\Base as Root, Acme\\Contracts;\nrequire_once {contracts};\nclass Order extends Root implements Contracts\\Third {{}}\n"
         ),
-    ));
+    );
+    let info = class(reflect(&store.config, &path));
     assert_eq!(info.extends.as_deref(), Some("Acme\\Contracts\\Base"));
     assert_eq!(info.implements, ["Acme\\Contracts\\Third"]);
+    let tier1 = Lexer::extract(&path).unwrap();
+    assert_eq!(
+        (info.extends, info.implements),
+        (tier1.extends, tier1.implements)
+    );
 }
 
 #[test]

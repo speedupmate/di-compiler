@@ -482,6 +482,15 @@ impl<'a> Scanner<'a> {
             }
             self.pos = saved;
         }
+        // `use A\B as C, D\E;` imports each name of the list.
+        while self.read_one_import() {
+            self.skip_noise();
+        }
+    }
+
+    /// One name of a `use` statement. True when a `,` follows it, so another name comes next;
+    /// the `;` after the last name is read.
+    fn read_one_import(&mut self) -> bool {
         // Skip leading `\`
         if self.peek() == b'\\' {
             self.advance(1);
@@ -538,7 +547,7 @@ impl<'a> Scanner<'a> {
                     if self.peek() == b';' {
                         self.advance(1);
                     }
-                    return;
+                    return false;
                 }
                 base.push('\\');
             } else {
@@ -547,7 +556,7 @@ impl<'a> Scanner<'a> {
         }
         if base.is_empty() {
             self.skip_to_semicolon();
-            return;
+            return false;
         }
         // Optional `as Alias`
         let alias = self
@@ -557,8 +566,16 @@ impl<'a> Scanner<'a> {
             self.use_map.insert(alias.to_ascii_lowercase(), base);
         }
         self.skip_noise();
-        if self.peek() == b';' {
-            self.advance(1);
+        match self.peek() {
+            b';' => {
+                self.advance(1);
+                false
+            }
+            b',' => {
+                self.advance(1);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1684,6 +1701,52 @@ mod tests {
         let info = extract_str("<?php\nnamespace Foo;\nabstract class AbstractThing {}").unwrap();
         assert!(info.is_abstract);
         assert!(matches!(info.kind, ClassKind::AbstractClass));
+    }
+
+    #[test]
+    fn every_import_of_a_comma_list_counts() {
+        let info = extract_str(
+            "<?php\nnamespace Acme\\Shop;\nuse Lib\\Base as Root, Lib\\Contracts, \\Lib\\Other;\nuse Lib\\Group\\{First, Second as Two};\n\
+             class Order extends Root implements Contracts\\Third, Other, First, Two {\n    \
+             public function __construct(Contracts\\Fourth $a, Other $b) {}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(info.extends.as_deref(), Some("Lib\\Base"));
+        assert_eq!(
+            info.implements,
+            [
+                "Lib\\Contracts\\Third",
+                "Lib\\Other",
+                "Lib\\Group\\First",
+                "Lib\\Group\\Second"
+            ]
+        );
+        let types: Vec<Option<&str>> = info
+            .constructor
+            .as_ref()
+            .unwrap()
+            .params
+            .iter()
+            .map(|p| p.type_hint.as_deref())
+            .collect();
+        assert_eq!(types, [Some("Lib\\Contracts\\Fourth"), Some("Lib\\Other")]);
+    }
+
+    #[test]
+    fn a_long_import_list_is_read_without_deep_recursion() {
+        // Valid PHP; each name used to cost a stack frame.
+        let names: Vec<String> = (0..30_000).map(|i| format!("Lib\\C{i}")).collect();
+        let source = format!(
+            "<?php\nnamespace Acme;\nuse {};\nclass Last implements C29999 {{}}\n",
+            names.join(", ")
+        );
+        let info = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || extract_str(&source).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(info.implements, ["Lib\\C29999"]);
     }
 
     #[test]
