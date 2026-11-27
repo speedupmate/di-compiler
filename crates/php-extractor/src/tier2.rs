@@ -5,25 +5,67 @@ use std::path::Path;
 
 use tree_sitter::{Node, Parser};
 
+use crate::lexer::ScanFacts;
 use crate::types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
     MethodSignature, TraitData, TraitMethod,
 };
 
 pub fn extract_tier2(path: &Path) -> ExtractResult {
+    extract_tier2_with_facts(path).0
+}
+
+/// Like [`extract_tier2`], and also says whether the declaration is inside a block. A file
+/// whose tree has a syntax error is a `ParseFailure`, so it goes on to Tier 3: tree-sitter-php
+/// returns a partial tree for syntax it does not know, such as property hooks.
+pub fn extract_tier2_with_facts(path: &Path) -> (ExtractResult, ScanFacts) {
     let source = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) => return ExtractResult::PhpFallbackFailed(format!("io: {e}")),
+        Err(e) => {
+            return (
+                ExtractResult::PhpFallbackFailed(format!("io: {e}")),
+                ScanFacts::default(),
+            )
+        }
     };
 
     match extract_with_treesitter(&source, path) {
-        Ok(Some(info)) => ExtractResult::Ok(info),
-        Ok(None) => ExtractResult::NoClass,
-        Err(e) => ExtractResult::ParseFailure(e),
+        Ok(Some((info, inside_block))) => (
+            ExtractResult::Ok(info),
+            ScanFacts {
+                class_check: false,
+                inside_block,
+            },
+        ),
+        Ok(None) => (ExtractResult::NoClass, ScanFacts::default()),
+        Err(e) => (ExtractResult::ParseFailure(e), ScanFacts::default()),
     }
 }
 
-fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInfo>, String> {
+/// Whether `node` is inside a block. The file, a namespace and the body of a braced namespace
+/// are no blocks, as for Magento's `FileClassScanner`.
+fn is_inside_block(node: Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let top_level = match parent.kind() {
+            "program" | "namespace_definition" => true,
+            "compound_statement" => parent
+                .parent()
+                .is_some_and(|above| above.kind() == "namespace_definition"),
+            _ => false,
+        };
+        if !top_level {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn extract_with_treesitter(
+    source: &[u8],
+    path: &Path,
+) -> Result<Option<(ClassInfo, bool)>, String> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_php::language_php())
@@ -34,6 +76,9 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         .ok_or_else(|| "tree-sitter returned None".to_string())?;
 
     let root = tree.root_node();
+    if root.has_error() {
+        return Err("tree-sitter-php found a syntax error".into());
+    }
     let src = source;
 
     // Find namespace and collect use-import map for type resolution
@@ -196,20 +241,24 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         format!("{}\\{}", namespace, name)
     };
 
-    Ok(Some(ClassInfo {
-        path: path.to_path_buf(),
-        namespace,
-        name,
-        fqcn,
-        kind,
-        extends,
-        implements,
-        constructor,
-        is_abstract,
-        is_final,
-        public_methods,
-        traits: Box::new(traits),
-    }))
+    let inside_block = is_inside_block(class_node);
+    Ok(Some((
+        ClassInfo {
+            path: path.to_path_buf(),
+            namespace,
+            name,
+            fqcn,
+            kind,
+            extends,
+            implements,
+            constructor,
+            is_abstract,
+            is_final,
+            public_methods,
+            traits: Box::new(traits),
+        },
+        inside_block,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +770,52 @@ mod tests {
             }
             other => panic!("Expected Ok, got {:?}", other),
         }
+    }
+
+    fn extract_with_facts(php: &str) -> (ExtractResult, ScanFacts) {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(php.as_bytes()).unwrap();
+        extract_tier2_with_facts(f.path())
+    }
+
+    const HOOKED: &str = "class Hooked {\n    public string $label { get => 'x'; }\n    public function __construct(private A&B $both, int $size = 3) {}\n}";
+
+    #[test]
+    fn a_tree_with_a_syntax_error_goes_on_to_the_next_tier() {
+        // tree-sitter-php 0.22 does not know property hooks. Its partial tree used to give the
+        // class without its constructor.
+        match extract(&format!("<?php\nnamespace Acme;\n{HOOKED}\n")) {
+            ExtractResult::ParseFailure(reason) => assert!(reason.contains("syntax error")),
+            other => panic!("expected ParseFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tree_with_a_syntax_error_and_no_class_goes_on_too() {
+        // Inside `if`, Tier 2 finds no declaration; before, that was `NoClass`.
+        let result = extract(&format!(
+            "<?php\nnamespace Acme;\nif (true) {{\n{HOOKED}\n}}\n"
+        ));
+        assert!(
+            matches!(result, ExtractResult::ParseFailure(_)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_class_in_a_block_is_reported_inside_one() {
+        let (result, facts) = extract_with_facts(
+            "<?php\nnamespace Acme;\n{\n    class Blocked { public function __construct(A&B $x) {} }\n}\n",
+        );
+        assert!(matches!(result, ExtractResult::Ok(_)), "{result:?}");
+        assert!(facts.inside_block);
+        assert!(!facts.class_check);
+
+        let (result, facts) = extract_with_facts(
+            "<?php\nnamespace Acme;\nclass Top { public function __construct(A&B $x) {} }\n",
+        );
+        assert!(matches!(result, ExtractResult::Ok(_)), "{result:?}");
+        assert!(!facts.inside_block);
     }
 
     #[test]

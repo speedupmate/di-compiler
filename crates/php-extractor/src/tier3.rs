@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::lexer::is_primitive_type;
+use crate::lexer::{is_primitive_type, ScanFacts};
 use crate::php_snippets::{BOOT_PHP, ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP, TYPE_STRING_PHP};
 use crate::types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
@@ -54,24 +54,42 @@ pub fn configure(config: Tier3Config) -> Result<(), Tier3Config> {
     CONFIG.set(config)
 }
 
-/// Tier 3 as the extraction chain calls it.
-pub fn extract_tier3(path: &Path) -> ExtractResult {
-    let _ = path;
-    if CONFIG.get().is_none() {
-        return ExtractResult::PhpFallbackFailed("Tier 3 is not configured".into());
+/// Tier 3 as the extraction chain calls it, with the store `configure` set.
+pub fn extract_tier3(path: &Path) -> (ExtractResult, ScanFacts) {
+    match CONFIG.get() {
+        Some(config) => reflect_with_facts(config, path),
+        None => (
+            ExtractResult::PhpFallbackFailed("Tier 3 is not configured".into()),
+            ScanFacts::default(),
+        ),
     }
-    // The chain uses `reflect` once Tier 2 hands its broken trees on and the scan scope of a
-    // Tier 3 file is known.
-    ExtractResult::PhpFallbackFailed("Tier 3 is not in the extraction chain yet".into())
 }
 
 /// Reads the class a file declares, in PHP: its identity, header, constructor and methods.
 pub fn reflect(config: &Tier3Config, path: &Path) -> ExtractResult {
+    reflect_with_facts(config, path).0
+}
+
+/// Like [`reflect`], and also says whether the declaration is inside a block. `class_check`
+/// stays false: PHP has run any `class_exists()` of the file already.
+pub fn reflect_with_facts(config: &Tier3Config, path: &Path) -> (ExtractResult, ScanFacts) {
     match run(config, path) {
-        Ok(Tier3Output::Class(class)) => ExtractResult::Ok(class.into_class_info(path)),
-        Ok(Tier3Output::NoClass) => ExtractResult::NoClass,
-        Ok(Tier3Output::Error { message }) => ExtractResult::PhpFallbackFailed(message),
-        Err(reason) => ExtractResult::PhpFallbackFailed(reason),
+        Ok(Tier3Output::Class(class)) => {
+            let facts = ScanFacts {
+                class_check: false,
+                inside_block: class.inside_block,
+            };
+            (ExtractResult::Ok(class.into_class_info(path)), facts)
+        }
+        Ok(Tier3Output::NoClass) => (ExtractResult::NoClass, ScanFacts::default()),
+        Ok(Tier3Output::Error { message }) => (
+            ExtractResult::PhpFallbackFailed(message),
+            ScanFacts::default(),
+        ),
+        Err(reason) => (
+            ExtractResult::PhpFallbackFailed(reason),
+            ScanFacts::default(),
+        ),
     }
 }
 
@@ -196,6 +214,7 @@ $readImports = static function (int $i) use ($tokens, $count, $next, &$imports):
 $previous = null;
 $first = null;
 $at = null;
+$insideBlock = false;
 for ($i = 0; $i < $count && $first === null; $i++) {
     $token = $tokens[$i];
     if ($token->isIgnorable()) {
@@ -231,6 +250,8 @@ for ($i = 0; $i < $count && $first === null; $i++) {
         if ($j < $count && $tokens[$j]->is(T_STRING)) {
             $first = ($namespace === '' ? '' : $namespace . '\\') . $tokens[$j]->text;
             $at = $j;
+            // Inside a block, such as `if`, as Tier 1 reads it: a braced namespace is none.
+            $insideBlock = $depth > $importDepth;
         }
     }
     $previous = $token;
@@ -331,6 +352,21 @@ try {
     $fail('Could not read ' . $reading . ' of ' . $first . ': ' . $e->getMessage());
 }
 $kind = $found->isInterface() ? 'interface' : ($found->isTrait() ? 'trait' : ($found->isAbstract() ? 'abstract_class' : 'class'));
+// Magento's scanner decides which classes the compile loads. It reads classes and traits only,
+// so for those it must agree with the block rule; an interface is never its answer.
+$scanner = 'Magento\\Setup\\Module\\Di\\Code\\Reader\\FileClassScanner';
+if ($kind !== 'interface' && class_exists($scanner)) {
+    try {
+        $scan = new $scanner($file);
+        $scanned = method_exists($scan, 'getClassName') ? $scan->getClassName() : (string) (((array) $scan->getClassNames())[0] ?? '');
+    } catch (\Throwable $e) {
+        $fail('Magento\'s FileClassScanner cannot read ' . $file . ': ' . $e->getMessage());
+    }
+    if ((strcasecmp(ltrim($scanned, '\\'), $first) === 0) === $insideBlock) {
+        $fail('Magento\'s FileClassScanner gives ' . ($scanned === '' ? 'no class' : $scanned) . ' for ' . $file
+            . ', but ' . $first . ' is ' . ($insideBlock ? 'inside a block' : 'at the top level'));
+    }
+}
 $finished = true;
 $write([
     'result' => 'class',
@@ -343,6 +379,7 @@ $write([
     'implements' => $implements,
     'constructor' => $constructor,
     'methods' => $methods,
+    'inside_block' => $insideBlock,
 ]);
 "#;
 
@@ -383,6 +420,7 @@ struct Tier3Class {
     implements: Vec<String>,
     constructor: Option<Vec<Tier3Param>>,
     methods: Vec<Tier3Method>,
+    inside_block: bool,
 }
 
 #[derive(Deserialize)]
@@ -596,7 +634,7 @@ mod tests {
     // No test in this binary configures Tier 3.
     #[test]
     fn unconfigured_tier3_is_not_attempted() {
-        match extract_tier3(Path::new("/nonexistent/Foo.php")) {
+        match extract_tier3(Path::new("/nonexistent/Foo.php")).0 {
             ExtractResult::PhpFallbackFailed(reason) => {
                 assert_eq!(reason, "Tier 3 is not configured")
             }

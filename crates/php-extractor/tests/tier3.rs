@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use php_extractor::lexer::Lexer;
-use php_extractor::tier3::{reflect, Tier3Config};
+use php_extractor::tier3::{reflect, reflect_with_facts, Tier3Config};
 use php_extractor::types::optional_in_php;
 use php_extractor::types::MethodParam;
 use php_extractor::{
@@ -47,6 +47,11 @@ const STORE_CLASSES: &[(&str, &str)] = &[
     ),
 ];
 
+const SCANNER_CLASS: &str = "Magento\\Setup\\Module\\Di\\Code\\Reader\\FileClassScanner";
+
+/// Answers what a `// scanner: <answer>` comment in the file says, and no class without one.
+const SCANNER: &str = "<?php\nnamespace Magento\\Setup\\Module\\Di\\Code\\Reader;\nclass FileClassScanner {\n    public function __construct(private string $file) {}\n    public function getClassName(): string {\n        return preg_match('~// scanner: (\\S*)~', file_get_contents($this->file), $m) ? $m[1] : '';\n    }\n}\n";
+
 struct Store {
     dir: TempDir,
     config: Tier3Config,
@@ -56,6 +61,16 @@ impl Store {
     /// A store whose autoloader knows every fixture class, the stubs and `STORE_CLASSES`, and
     /// prints while it loads, as some stores do.
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// A store with a stand-in for Magento's `FileClassScanner` (`SCANNER`).
+    fn with_scanner() -> Self {
+        Self::build(true)
+    }
+
+    fn build(scanner: bool) -> Self {
+        require_php_8_4();
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         let mut classmap: Vec<(String, PathBuf)> = Vec::new();
@@ -65,7 +80,9 @@ impl Store {
             }
         }
         std::fs::create_dir_all(root.join("store")).unwrap();
-        for (class, source) in STORE_CLASSES {
+        let scanner_class = [(SCANNER_CLASS, SCANNER)];
+        let extra: &[(&str, &str)] = if scanner { &scanner_class } else { &[] };
+        for (class, source) in STORE_CLASSES.iter().chain(extra) {
             let file = root
                 .join("store")
                 .join(format!("{}.php", class.replace('\\', "_")));
@@ -131,6 +148,30 @@ spl_autoload_register(static function (string $class) use ($map, $stubs): void {
             .unwrap()
             .next()
             .is_none()
+    }
+}
+
+/// Fails with the version found when `php` is older than 8.4, the version these tests pin.
+fn require_php_8_4() {
+    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let checked = CHECKED.get_or_init(|| {
+        let output = std::process::Command::new("php")
+            .args(["-r", "echo PHP_VERSION_ID, ' ', PHP_VERSION;"])
+            .output()
+            .map_err(|e| format!("these tests need php 8.4 or later on the PATH: {e}"))?;
+        let version = String::from_utf8_lossy(&output.stdout).into_owned();
+        match version.split_once(' ') {
+            Some((id, _)) if id.parse::<u32>().is_ok_and(|id| id >= 80400) => Ok(()),
+            _ => Err(format!(
+                "these tests need PHP 8.4 or later, found {}",
+                version
+                    .split_once(' ')
+                    .map_or(version.as_str(), |(_, text)| text)
+            )),
+        }
+    });
+    if let Err(reason) = checked {
+        panic!("{reason}");
     }
 }
 
@@ -934,6 +975,83 @@ fn a_method_default_php_cannot_evaluate_fails() {
 }
 
 // ---------------------------------------------------------------------------
+// Scan scope
+// ---------------------------------------------------------------------------
+
+fn inside_block(store: &Store, name: &str, source: &str) -> bool {
+    let path = store.file(name, source);
+    match reflect_with_facts(&store.config, &path) {
+        (ExtractResult::Ok(_), facts) => {
+            assert!(!facts.class_check);
+            facts.inside_block
+        }
+        (other, _) => panic!("{name}: expected a class, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_declaration_inside_a_block_is_reported_as_tier1_does() {
+    let store = Store::new();
+    for (name, source, expected) in [
+        ("Top.php", "<?php\nnamespace Acme;\nclass Top {}\n", false),
+        (
+            "Braced.php",
+            "<?php\nnamespace Acme\\Braced {\n    class Braced {}\n}\n",
+            false,
+        ),
+        (
+            "Guarded.php",
+            "<?php\nnamespace Acme;\nif (true) {\n    class Guarded {}\n}\n",
+            true,
+        ),
+        (
+            "GuardedInterface.php",
+            "<?php\nnamespace Acme;\nif (!interface_exists('Acme\\\\GuardedInterface', false)) {\n    interface GuardedInterface {}\n}\n",
+            true,
+        ),
+        (
+            "AfterFunction.php",
+            "<?php\nnamespace Acme;\nfunction helper() { return function () {}; }\nclass AfterFunction {}\n",
+            false,
+        ),
+    ] {
+        assert_eq!(inside_block(&store, name, source), expected, "{name}");
+        let tier1 = Lexer::extract_with_facts(&store.file(name, source)).unwrap().1;
+        assert_eq!(tier1.inside_block, expected, "{name}: Tier 1");
+    }
+}
+
+#[test]
+fn magento_s_scanner_must_agree_for_classes_and_traits() {
+    let store = Store::with_scanner();
+    assert!(!inside_block(
+        &store,
+        "Seen.php",
+        "<?php\n// scanner: Acme\\Seen\nnamespace Acme;\nclass Seen {}\n"
+    ));
+    assert!(inside_block(
+        &store,
+        "Hidden.php",
+        "<?php\nnamespace Acme;\nif (true) {\n    class Hidden {}\n}\n"
+    ));
+    // The scanner reads no interfaces, so it is not asked for one.
+    assert!(!inside_block(
+        &store,
+        "Asked.php",
+        "<?php\nnamespace Acme;\ninterface Asked {}\n"
+    ));
+    let reason = failure(store.reflect(
+        "Disagrees.php",
+        "<?php\nnamespace Acme;\nclass Disagrees {}\n",
+    ));
+    assert!(
+        reason.contains("FileClassScanner gives no class"),
+        "{reason}"
+    );
+    assert!(reason.contains("at the top level"), "{reason}");
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -1059,7 +1177,7 @@ fn fake_php(store: &Store, name: &str, json: Option<&str>, code: i32) -> String 
 fn a_result_counts_only_with_exit_code_zero() {
     let mut store = Store::new();
     let file = store.file("Any.php", "<?php\nclass Any {}\n");
-    let class_json = r#"{"result":"class","kind":"class","namespace":"","name":"Any","fqcn":"Any","is_final":false,"extends":null,"implements":[],"constructor":null,"methods":[]}"#;
+    let class_json = r#"{"result":"class","kind":"class","namespace":"","name":"Any","fqcn":"Any","is_final":false,"extends":null,"implements":[],"constructor":null,"methods":[],"inside_block":false}"#;
 
     store.config.php = fake_php(
         &store,
