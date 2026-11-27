@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use php_extractor::lexer::Lexer;
 use php_extractor::tier3::{reflect, Tier3Config};
+use php_extractor::types::optional_in_php;
 use php_extractor::{extract_file, ClassInfo, ClassKind, ExtractResult};
+use rustc_hash::FxHashMap;
 use tempfile::TempDir;
 
 fn fixtures() -> PathBuf {
@@ -225,7 +227,121 @@ fn identity(info: &ClassInfo) -> Identity {
     }
 }
 
-fn compare_fixtures<T: PartialEq + std::fmt::Debug>(fields: impl Fn(&ClassInfo) -> T) {
+/// Defaults the reference keeps as source text the resolver cannot evaluate, by fixture and
+/// parameter, with the value PHP gives them.
+const DEFAULT_VALUES: &[(&str, &str, &str)] = &[
+    ("complex_defaults.php", "name", "'default'"),
+    ("complex_defaults.php", "timeout", "1800"),
+];
+
+/// Parameter types where the reference is wrong, by fixture and parameter, with PHP's type.
+/// Tier 2 reads an intersection as one name relative to the namespace.
+const TYPE_HINTS: &[(&str, &str, &str)] =
+    &[("intersection_type.php", "collection", "Countable&Iterator")];
+
+/// The header of a class and its constructor, after the normalization of the comparison.
+#[derive(Debug, PartialEq)]
+struct Header {
+    extends: Option<String>,
+    implements: Vec<String>,
+    is_abstract: bool,
+    is_final: bool,
+    constructor: Option<Vec<Param>>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Param {
+    name: String,
+    type_hint: Option<String>,
+    optional_in_php: bool,
+    /// What the resolver makes of the default, for a parameter PHP calls optional.
+    default: Option<String>,
+    is_primitive: bool,
+    is_variadic: bool,
+    is_promoted: bool,
+}
+
+const BUILTIN_TYPES: &[&str] = &[
+    "int", "float", "string", "bool", "array", "callable", "iterable", "void", "null", "mixed",
+    "never", "true", "false", "object", "static", "parent",
+];
+
+/// Builtin names in lowercase and `self` as the class name; class names as they are.
+fn normalize_type(type_hint: &str, class: &str) -> String {
+    let mut out = String::new();
+    let mut name = String::new();
+    let flush = |name: &mut String, out: &mut String| {
+        let lower = name.to_ascii_lowercase();
+        if lower == "self" {
+            out.push_str(class);
+        } else if BUILTIN_TYPES.contains(&lower.as_str()) {
+            out.push_str(&lower);
+        } else {
+            out.push_str(name);
+        }
+        name.clear();
+    };
+    for c in type_hint.chars() {
+        if matches!(c, '?' | '|' | '&' | '(' | ')') {
+            flush(&mut name, &mut out);
+            out.push(c);
+        } else {
+            name.push(c);
+        }
+    }
+    flush(&mut name, &mut out);
+    out
+}
+
+/// `reference` is whether `info` is the reference's reading, which the tables correct.
+fn header_of(fixture: &str, info: &ClassInfo, reference: bool) -> Header {
+    let const_map = FxHashMap::default();
+    Header {
+        extends: info.extends.clone(),
+        implements: info.implements.clone(),
+        is_abstract: info.is_abstract,
+        is_final: info.is_final,
+        constructor: info.constructor.as_ref().map(|ctor| {
+            ctor.params
+                .iter()
+                .zip(optional_in_php(&ctor.params))
+                .map(|(param, optional)| {
+                    let listed = |table: &[(&str, &str, &'static str)]| {
+                        table
+                            .iter()
+                            .find(|(file, name, _)| {
+                                reference && *file == fixture && *name == param.name
+                            })
+                            .map(|(_, _, value)| *value)
+                    };
+                    Param {
+                        name: param.name.clone(),
+                        type_hint: listed(TYPE_HINTS)
+                            .or(param.type_hint.as_deref())
+                            .map(|t| normalize_type(t, &info.fqcn)),
+                        optional_in_php: optional,
+                        default: optional.then(|| {
+                            format!(
+                                "{:?}",
+                                di_resolver::arguments::resolve_non_object_default(
+                                    listed(DEFAULT_VALUES).or(param.default_value.as_deref()),
+                                    &const_map
+                                )
+                            )
+                        }),
+                        is_primitive: param.is_primitive,
+                        is_variadic: param.is_variadic,
+                        is_promoted: param.is_promoted,
+                    }
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Compares `fields` of Tier 3 and of the reference for every fixture. `fields` gets the
+/// fixture's name and whether the class is the reference's.
+fn compare_fixtures<T: PartialEq + std::fmt::Debug>(fields: impl Fn(&str, &ClassInfo, bool) -> T) {
     let listed: Vec<PathBuf> = FIXTURE_TABLE
         .iter()
         .map(|(name, _)| fixtures().join(name))
@@ -250,12 +366,9 @@ fn compare_fixtures<T: PartialEq + std::fmt::Debug>(fields: impl Fn(&ClassInfo) 
         match (want, got) {
             (None, ExtractResult::NoClass) => {}
             (Some(want), ExtractResult::Ok(got)) => {
-                if fields(&want) != fields(&got) {
-                    mismatches.push(format!(
-                        "{name}:\n  want {:?}\n  got  {:?}",
-                        fields(&want),
-                        fields(&got)
-                    ));
+                let (want, got) = (fields(name, &want, true), fields(name, &got, false));
+                if want != got {
+                    mismatches.push(format!("{name}:\n  want {want:?}\n  got  {got:?}"));
                 }
             }
             (want, got) => mismatches.push(format!(
@@ -270,7 +383,264 @@ fn compare_fixtures<T: PartialEq + std::fmt::Debug>(fields: impl Fn(&ClassInfo) 
 
 #[test]
 fn every_fixture_has_the_identity_of_its_reference() {
-    compare_fixtures(identity);
+    compare_fixtures(|_, info, _| identity(info));
+}
+
+#[test]
+fn every_fixture_has_the_header_and_constructor_of_its_reference() {
+    compare_fixtures(header_of);
+}
+
+// ---------------------------------------------------------------------------
+// Header and constructor
+// ---------------------------------------------------------------------------
+
+fn params(info: &ClassInfo) -> &[php_extractor::ConstructorParam] {
+    &info.constructor.as_ref().expect("a constructor").params
+}
+
+#[test]
+fn explicit_interfaces_stay_in_source_order_when_the_parent_has_them() {
+    let store = Store::new();
+    store.file(
+        "Base.php",
+        "<?php\nnamespace Acme\\Order;\ninterface A {}\ninterface B {}\nclass P implements A {}\n",
+    );
+    let info = class(store.reflect(
+        "X.php",
+        &format!(
+            "<?php\nnamespace Acme\\Order;\nrequire_once {};\nclass X extends P implements B, A {{}}\n",
+            php_string(&store.dir.path().join("files/Base.php").to_string_lossy())
+        ),
+    ));
+    assert_eq!(info.extends.as_deref(), Some("Acme\\Order\\P"));
+    assert_eq!(info.implements, ["Acme\\Order\\B", "Acme\\Order\\A"]);
+}
+
+#[test]
+fn class_flags_follow_the_declaration() {
+    let store = Store::new();
+    let abstract_class = class(store.reflect(
+        "Shape.php",
+        "<?php\nnamespace Acme;\nabstract class Shape { abstract public function area(): float; }\n",
+    ));
+    assert_eq!(abstract_class.kind, ClassKind::AbstractClass);
+    assert!(abstract_class.is_abstract);
+    assert!(!abstract_class.is_final);
+
+    let value = class(store.reflect(
+        "Money.php",
+        "<?php\nnamespace Acme;\nfinal readonly class Money { public function __construct(public int $amount) {} }\n",
+    ));
+    assert_eq!(value.kind, ClassKind::Class);
+    assert!(value.is_final);
+    assert!(!value.is_abstract);
+    assert!(params(&value)[0].is_promoted);
+
+    for (name, source) in [
+        (
+            "AbstractReadonly.php",
+            "<?php\nnamespace Acme;\nabstract readonly class AbstractReadonly {}\n",
+        ),
+        (
+            "ReadonlyAbstract.php",
+            "<?php\nnamespace Acme;\nreadonly abstract class ReadonlyAbstract {}\n",
+        ),
+    ] {
+        let info = class(store.reflect(name, source));
+        assert_eq!(info.kind, ClassKind::AbstractClass, "{name}");
+        assert!(info.is_abstract, "{name}");
+    }
+}
+
+#[test]
+fn an_interface_extending_two_interfaces_is_read_as_tier1() {
+    let store = Store::new();
+    store.file(
+        "Parents.php",
+        "<?php\nnamespace Acme\\Two;\ninterface Readable {}\ninterface Writable {}\n",
+    );
+    let path = store.file(
+        "Stream.php",
+        &format!(
+            "<?php\nnamespace Acme\\Two;\nrequire_once {};\ninterface Stream extends Readable, \\Countable {{}}\n",
+            php_string(&store.dir.path().join("files/Parents.php").to_string_lossy())
+        ),
+    );
+    let tier3 = class(reflect(&store.config, &path));
+    assert_eq!(tier3.kind, ClassKind::Interface);
+    assert_eq!(tier3.extends.as_deref(), Some("Acme\\Two\\Readable"));
+    assert_eq!(tier3.implements, ["Countable"]);
+    let tier1 = Lexer::extract(&path).unwrap();
+    assert_eq!(
+        (tier3.extends, tier3.implements),
+        (tier1.extends, tier1.implements)
+    );
+}
+
+fn contracts(store: &Store) -> String {
+    store.file(
+        "Contracts.php",
+        "<?php\nnamespace Acme\\Contracts;\ninterface First {}\ninterface Second {}\ninterface Third {}\nclass Base {}\n",
+    );
+    php_string(
+        &store
+            .dir
+            .path()
+            .join("files/Contracts.php")
+            .to_string_lossy(),
+    )
+}
+
+#[test]
+fn header_names_resolve_through_imports_as_tier1() {
+    let store = Store::new();
+    let contracts = contracts(&store);
+    let path = store.file(
+        "Imports.php",
+        &format!(
+            "<?php\nnamespace Acme\\Shop;\nuse Acme\\Contracts\\{{First, Second as Two}};\nuse Acme\\Contracts\\Base as Root;\nuse Acme\\Contracts;\nuse function strlen;\nrequire_once {contracts};\n$closure = function () use ($contracts) {{}};\nclass Cart extends Root implements First, Two, Contracts\\Third {{}}\n"
+        ),
+    );
+    let tier3 = class(reflect(&store.config, &path));
+    assert_eq!(tier3.extends.as_deref(), Some("Acme\\Contracts\\Base"));
+    assert_eq!(
+        tier3.implements,
+        [
+            "Acme\\Contracts\\First",
+            "Acme\\Contracts\\Second",
+            "Acme\\Contracts\\Third"
+        ]
+    );
+    let tier1 = Lexer::extract(&path).unwrap();
+    assert_eq!(
+        (tier3.extends, tier3.implements),
+        (tier1.extends, tier1.implements)
+    );
+}
+
+#[test]
+fn every_import_of_a_comma_list_counts() {
+    let store = Store::new();
+    let contracts = contracts(&store);
+    let info = class(store.reflect(
+        "ImportList.php",
+        &format!(
+            "<?php\nnamespace Acme\\Shop;\nuse Acme\\Contracts\\Base as Root, Acme\\Contracts;\nrequire_once {contracts};\nclass Order extends Root implements Contracts\\Third {{}}\n"
+        ),
+    ));
+    assert_eq!(info.extends.as_deref(), Some("Acme\\Contracts\\Base"));
+    assert_eq!(info.implements, ["Acme\\Contracts\\Third"]);
+}
+
+#[test]
+fn a_relative_name_resolves_in_the_namespace() {
+    let store = Store::new();
+    store.file(
+        "Local.php",
+        "<?php\nnamespace Acme\\Local;\ninterface Marker {}\n",
+    );
+    let info = class(store.reflect(
+        "Relative.php",
+        &format!(
+            "<?php\nnamespace Acme\\Local;\nrequire_once {};\nclass Relative implements namespace\\Marker {{}}\n",
+            php_string(&store.dir.path().join("files/Local.php").to_string_lossy())
+        ),
+    ));
+    assert_eq!(info.implements, ["Acme\\Local\\Marker"]);
+}
+
+#[test]
+fn a_header_reflection_does_not_confirm_fails() {
+    let store = Store::new();
+    // An alias: the source names `Alias`, PHP has the interface as `Acme\Real`.
+    let reason = failure(store.reflect(
+        "Aliased.php",
+        "<?php\nnamespace Acme;\neval('namespace Acme; interface Real {}');\nclass_alias('Acme\\\\Real', 'Acme\\\\Alias');\nclass Aliased implements Alias {}\n",
+    ));
+    assert!(reason.contains("does not match reflection"), "{reason}");
+    assert!(reason.contains("Acme\\Alias"), "{reason}");
+}
+
+#[test]
+fn a_constructor_counts_only_when_the_class_or_its_traits_declare_it() {
+    let store = Store::new();
+    store.file(
+        "Parts.php",
+        "<?php\nnamespace Acme\\Ctor;\nclass Parent_ { public function __construct(int $size) {} }\ntrait Builds { public function __construct(string $name = 'x') {} }\n",
+    );
+    let parts = php_string(&store.dir.path().join("files/Parts.php").to_string_lossy());
+    let inherited = class(store.reflect(
+        "Child.php",
+        &format!("<?php\nnamespace Acme\\Ctor;\nrequire_once {parts};\nclass Child extends Parent_ {{}}\n"),
+    ));
+    assert_eq!(inherited.constructor, None);
+    let from_trait = class(store.reflect(
+        "Built.php",
+        &format!("<?php\nnamespace Acme\\Ctor;\nrequire_once {parts};\nclass Built extends Parent_ {{ use Builds; }}\n"),
+    ));
+    let params = params(&from_trait);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "name");
+    assert_eq!(params[0].default_value.as_deref(), Some("'x'"));
+}
+
+#[test]
+fn constructor_parameters_as_reflection_reports_them() {
+    let store = Store::new();
+    let class_file = store.file(
+        "ParamsClass.php",
+        "<?php\nnamespace Acme\\Params;\nuse Acme\\Data\\Item;\nclass Params {\n    const SIZE = 10;\n    public function __construct(\n        $first = 1,\n        Item $item,\n        protected int $size = self::SIZE,\n        (\\Countable&\\Traversable)|null $both = null,\n        ?Item $maybe = null,\n        string ...$rest\n    ) {}\n}\n",
+    );
+    let info = class(reflect(&store.config, &class_file));
+    let params = params(&info);
+    let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["first", "item", "size", "both", "maybe", "rest"]);
+
+    // A default before a required parameter: PHP reports none, Tier 1 keeps the source's.
+    assert!(!params[0].is_optional);
+    assert_eq!(params[0].default_value, None);
+    let tier1 = Lexer::extract(&class_file).unwrap();
+    let tier1_params = &tier1.constructor.as_ref().unwrap().params;
+    assert!(tier1_params[0].is_optional);
+    assert_eq!(optional_in_php(params), optional_in_php(tier1_params));
+
+    assert_eq!(params[1].type_hint.as_deref(), Some("Acme\\Data\\Item"));
+    assert!(!params[1].is_primitive);
+
+    // A promoted parameter with a constant default: PHP evaluates the constant.
+    assert!(params[2].is_promoted);
+    assert_eq!(params[2].type_hint.as_deref(), Some("int"));
+    assert_eq!(params[2].default_value.as_deref(), Some("10"));
+    assert!(params[2].is_primitive);
+
+    assert_eq!(
+        params[3].type_hint.as_deref(),
+        Some("(Countable&Traversable)|null")
+    );
+    assert!(!params[3].is_primitive);
+    assert_eq!(params[3].default_value.as_deref(), Some("NULL"));
+
+    assert_eq!(params[4].type_hint.as_deref(), Some("?Acme\\Data\\Item"));
+
+    // A variadic parameter has no default and is not optional in the source's sense.
+    assert!(params[5].is_variadic);
+    assert!(!params[5].is_optional);
+    assert_eq!(params[5].default_value, None);
+}
+
+#[test]
+fn a_default_php_cannot_evaluate_fails() {
+    let store = Store::new();
+    let reason = failure(store.reflect(
+        "Undefined.php",
+        "<?php\nnamespace Acme;\nclass Undefined { public function __construct(int $size = \\ACME_UNDEFINED_SIZE) {} }\n",
+    ));
+    assert!(
+        reason.contains("constructor of Acme\\Undefined"),
+        "{reason}"
+    );
+    assert!(reason.contains("ACME_UNDEFINED_SIZE"), "{reason}");
 }
 
 // ---------------------------------------------------------------------------
@@ -399,8 +769,7 @@ fn fake_php(store: &Store, name: &str, json: Option<&str>, code: i32) -> String 
 fn a_result_counts_only_with_exit_code_zero() {
     let mut store = Store::new();
     let file = store.file("Any.php", "<?php\nclass Any {}\n");
-    let class_json =
-        r#"{"result":"class","kind":"class","namespace":"","name":"Any","fqcn":"Any"}"#;
+    let class_json = r#"{"result":"class","kind":"class","namespace":"","name":"Any","fqcn":"Any","is_final":false,"extends":null,"implements":[],"constructor":null}"#;
 
     store.config.php = fake_php(
         &store,

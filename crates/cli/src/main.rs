@@ -38,7 +38,7 @@ mod watch_set;
 use class_checks::{ClassChecks, ScannedFile};
 use di_xml_checks::DiXmlCheck;
 use file_level_checks::run_file_level_checks;
-use php_extractor::php_snippets::{ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP};
+use php_extractor::php_snippets::{ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP, TYPE_STRING_PHP};
 
 use code_generator::{
     compile_scope_plugin_list, extension_path, factory_path, generate_app_action_list_php,
@@ -221,23 +221,7 @@ spl_autoload_register(function (string $class) use ($generated): void {
     if (is_file($file)) require $file;
 });
 // ENCODE DEFAULT
-function tstr($t): ?string {
-    if ($t === null) return null;
-    if ($t instanceof ReflectionNamedType) {
-        $name = $t->getName();
-        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') return '?' . $name;
-        return $name;
-    }
-    if ($t instanceof ReflectionUnionType) {
-        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p instanceof ReflectionIntersectionType ? '(' . tstr($p) . ')' : $p->getName();
-        return implode('|', $parts);
-    }
-    if ($t instanceof ReflectionIntersectionType) {
-        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p->getName();
-        return implode('&', $parts);
-    }
-    return null;
-}
+// TYPE STRING
 function resolve_name(string $name, ReflectionClass $declaring): string {
     $lower = strtolower($name);
     if ($lower === 'self') return $declaring->getName();
@@ -534,7 +518,8 @@ fn init_php_worker_pool(php_bin: &str, magento_root: &Path, code_root: &Path) ->
         &script_path,
         WORKER_PHP
             .replace("// OBJECT MANAGER", OBJECT_MANAGER_PHP)
-            .replace("// ENCODE DEFAULT\n", ENCODE_DEFAULT_PHP),
+            .replace("// ENCODE DEFAULT\n", ENCODE_DEFAULT_PHP)
+            .replace("// TYPE STRING\n", TYPE_STRING_PHP),
     )
     .expect("failed to write PHP worker script to temp dir");
     PHP_WORKER_POOL.get_or_init(|| {

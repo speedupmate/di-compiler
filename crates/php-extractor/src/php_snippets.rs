@@ -136,3 +136,24 @@ function encode_default($v): string {
     return var_export($v, true);
 }
 "#;
+
+/// Writes a reflected type as the reflection worker reports it: `?` for a nullable named type
+/// (except `mixed` and `null`), unions with `|`, intersections with `&`, DNF groups in parentheses.
+pub const TYPE_STRING_PHP: &str = r#"function tstr($t): ?string {
+    if ($t === null) return null;
+    if ($t instanceof ReflectionNamedType) {
+        $name = $t->getName();
+        if ($t->allowsNull() && $name !== 'mixed' && $name !== 'null') return '?' . $name;
+        return $name;
+    }
+    if ($t instanceof ReflectionUnionType) {
+        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p instanceof ReflectionIntersectionType ? '(' . tstr($p) . ')' : $p->getName();
+        return implode('|', $parts);
+    }
+    if ($t instanceof ReflectionIntersectionType) {
+        $parts = []; foreach ($t->getTypes() as $p) $parts[] = $p->getName();
+        return implode('&', $parts);
+    }
+    return null;
+}
+"#;

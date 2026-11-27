@@ -705,7 +705,9 @@ fn resolve_php_constant_expr(expr: &str, const_map: &FxHashMap<String, String>) 
     normalized.to_string()
 }
 
-fn resolve_non_object_default(
+/// The value a constructor default compiles to, from Tier 1's source text or the encoded value
+/// of the reflection worker and Tier 3.
+pub fn resolve_non_object_default(
     default_value: Option<&str>,
     const_map: &FxHashMap<String, String>,
 ) -> ResolvedArgValue {

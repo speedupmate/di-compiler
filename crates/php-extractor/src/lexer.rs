@@ -1531,7 +1531,7 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn is_primitive_type(t: &str) -> bool {
+pub(crate) fn is_primitive_type(t: &str) -> bool {
     let t = t.trim_start_matches('?');
     if t.contains('|') {
         return t.split('|').all(is_primitive_base);

@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::php_snippets::{BOOT_PHP, ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP};
-use crate::types::{ClassInfo, ClassKind, ExtractResult};
+use crate::lexer::is_primitive_type;
+use crate::php_snippets::{BOOT_PHP, ENCODE_DEFAULT_PHP, OBJECT_MANAGER_PHP, TYPE_STRING_PHP};
+use crate::types::{ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult};
 
 /// How Tier 3 runs PHP for one store.
 #[derive(Debug, Clone)]
@@ -56,12 +57,12 @@ pub fn extract_tier3(path: &Path) -> ExtractResult {
     if CONFIG.get().is_none() {
         return ExtractResult::PhpFallbackFailed("Tier 3 is not configured".into());
     }
-    // `reflect` reads only which class a file declares so far. A class without its constructor
-    // and methods would compile to wrong code, so the chain does not use it yet.
-    ExtractResult::PhpFallbackFailed("Tier 3 does not read constructors and methods yet".into())
+    // `reflect` does not read methods yet. A class without them would get an interceptor
+    // without its methods, so the chain does not use it yet.
+    ExtractResult::PhpFallbackFailed("Tier 3 does not read methods yet".into())
 }
 
-/// Reads the class a file declares, in PHP.
+/// Reads the class a file declares, in PHP: its identity, header and constructor.
 pub fn reflect(config: &Tier3Config, path: &Path) -> ExtractResult {
     match run(config, path) {
         Ok(Tier3Output::Class(class)) => ExtractResult::Ok(class.into_class_info(path)),
@@ -109,9 +110,14 @@ try {
 while (ob_get_level() > $level) {
     ob_end_clean();
 }
+$fail = static function (string $message) use (&$finished, $write): never {
+    $finished = true;
+    $write(['result' => 'error', 'message' => $message]);
+    exit(0);
+};
 // The class of the file is its first named class-like declaration in source order, as Tier 1
 // reads it. Reflection gives only a line, which two declarations can share, so PHP's tokenizer
-// finds it.
+// finds it, and the names of its header as the source spells them.
 $tokens = PhpToken::tokenize((string) file_get_contents($file));
 $count = count($tokens);
 $next = static function (int $i) use ($tokens, $count): int {
@@ -119,64 +125,206 @@ $next = static function (int $i) use ($tokens, $count): int {
     }
     return $i;
 };
+$nameTokens = [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED, T_NAME_RELATIVE];
 $namespace = '';
+$imports = [];
+$depth = 0;
+$importDepth = 0;
+$resolve = static function (PhpToken $name) use (&$namespace, &$imports): string {
+    if ($name->is(T_NAME_FULLY_QUALIFIED)) {
+        return substr($name->text, 1);
+    }
+    $text = $name->is(T_NAME_RELATIVE) ? substr($name->text, strlen('namespace\\')) : $name->text;
+    $parts = explode('\\', $text, 2);
+    if (!$name->is(T_NAME_RELATIVE) && isset($imports[strtolower($parts[0])])) {
+        return $imports[strtolower($parts[0])] . (isset($parts[1]) ? '\\' . $parts[1] : '');
+    }
+    return $namespace === '' ? $text : $namespace . '\\' . $text;
+};
+// `use A\B, C as D;` and `use A\{B, C as D};` from position $i (the `use`); returns the last token.
+$readImports = static function (int $i) use ($tokens, $count, $next, &$imports): int {
+    $add = static function (string $name, ?string $alias) use (&$imports): void {
+        $name = ltrim($name, '\\');
+        $short = $alias ?? substr($name, (int) strrpos('\\' . $name, '\\'));
+        $imports[strtolower($short)] = $name;
+    };
+    $j = $next($i);
+    if ($j < $count && $tokens[$j]->is([T_FUNCTION, T_CONST])) {
+        return $j;
+    }
+    while ($j < $count && $tokens[$j]->is([T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED])) {
+        $base = $tokens[$j]->text;
+        $k = $next($j);
+        if ($k < $count && $tokens[$k]->is(T_NS_SEPARATOR) && ($group = $next($k)) < $count && $tokens[$group]->text === '{') {
+            for ($k = $next($group); $k < $count && $tokens[$k]->text !== '}'; $k = $next($k)) {
+                if ($tokens[$k]->is([T_STRING, T_NAME_QUALIFIED])) {
+                    $part = $tokens[$k]->text;
+                    $as = $next($k);
+                    $alias = null;
+                    if ($as < $count && $tokens[$as]->is(T_AS)) {
+                        $k = $next($as);
+                        $alias = $tokens[$k]->text;
+                    }
+                    $add($base . '\\' . $part, $alias);
+                } elseif ($tokens[$k]->is([T_FUNCTION, T_CONST])) {
+                    // `use A\{function f}`: no class name.
+                    while (($k = $next($k)) < $count && !in_array($tokens[$k]->text, [',', '}'], true)) {
+                    }
+                    if ($tokens[$k]->text === '}') {
+                        break;
+                    }
+                }
+            }
+            return $k;
+        }
+        $alias = null;
+        if ($k < $count && $tokens[$k]->is(T_AS)) {
+            $alias = $tokens[$next($k)]->text;
+            $k = $next($next($k));
+        }
+        $add($base, $alias);
+        if ($k >= $count || $tokens[$k]->text !== ',') {
+            return $k;
+        }
+        $j = $next($k);
+    }
+    return $j;
+};
 $previous = null;
 $first = null;
+$at = null;
 for ($i = 0; $i < $count && $first === null; $i++) {
     $token = $tokens[$i];
     if ($token->isIgnorable()) {
         continue;
     }
-    if ($token->is(T_NAMESPACE)) {
+    if ($token->text === '{' || $token->is([T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES])) {
+        $depth++;
+    } elseif ($token->text === '}') {
+        $depth--;
+    } elseif ($token->is(T_NAMESPACE)) {
         $j = $next($i);
+        $imports = [];
+        $importDepth = $depth;
         if ($j < $count && $tokens[$j]->is([T_STRING, T_NAME_QUALIFIED])) {
             $namespace = $tokens[$j]->text;
             $i = $j;
-        } elseif ($j < $count && $tokens[$j]->text === '{') {
+            $j = $next($j);
+        } else {
             $namespace = '';
         }
+        if ($j < $count && $tokens[$j]->text === '{') {
+            $importDepth = $depth + 1;
+        }
+    } elseif ($token->is(T_USE) && $depth === $importDepth) {
+        // Only an import statement is at this depth: a closure's `use` and a trait `use` are
+        // inside braces.
+        $i = $readImports($i);
+        $token = $tokens[$i] ?? $token;
     } elseif ($token->is([T_CLASS, T_INTERFACE, T_TRAIT, T_ENUM])
         && !($previous !== null && $previous->is([T_DOUBLE_COLON, T_NEW]))) {
         // `Foo::class` and `new class` are no declarations; an anonymous class has no name.
         $j = $next($i);
         if ($j < $count && $tokens[$j]->is(T_STRING)) {
             $first = ($namespace === '' ? '' : $namespace . '\\') . $tokens[$j]->text;
+            $at = $j;
         }
     }
     $previous = $token;
 }
-$finished = true;
 if ($first === null) {
+    $finished = true;
     $write(['result' => 'no_class']);
     exit(0);
 }
 if (!class_exists($first, false) && !interface_exists($first, false) && !trait_exists($first, false)) {
-    $write(['result' => 'error', 'message' => $first . ' is declared in ' . $file . ', but PHP did not declare it there']);
-    exit(0);
+    $fail($first . ' is declared in ' . $file . ', but PHP did not declare it there');
 }
 $found = new ReflectionClass($first);
 $declared = $found->getFileName();
 if ($declared === false || (realpath($declared) ?: $declared) !== $real) {
-    $write(['result' => 'error', 'message' => $first . ' is declared in ' . $file . ', but PHP has it from ' . ($declared ?: 'PHP itself')]);
-    exit(0);
+    $fail($first . ' is declared in ' . $file . ', but PHP has it from ' . ($declared ?: 'PHP itself'));
 }
 if ($found->isEnum()) {
+    $finished = true;
     $write(['result' => 'no_class']);
     exit(0);
 }
+// The names after `extends` and `implements`, up to the body.
+$header = ['extends' => [], 'implements' => []];
+$list = null;
+for ($k = $at + 1; $k < $count && $tokens[$k]->text !== '{'; $k++) {
+    if ($tokens[$k]->is(T_EXTENDS)) {
+        $list = 'extends';
+    } elseif ($tokens[$k]->is(T_IMPLEMENTS)) {
+        $list = 'implements';
+    } elseif ($list !== null && $tokens[$k]->is($nameTokens)) {
+        $header[$list][] = $resolve($tokens[$k]);
+    }
+}
+// Tier 1 gives an interface's first parent as `extends` and the others as `implements`.
+$extends = $header['extends'][0] ?? null;
+$implements = $found->isInterface() ? array_slice($header['extends'], 1) : $header['implements'];
+$mismatch = static function (string $what) use ($fail, $first): never {
+    $fail('The header of ' . $first . ' does not match reflection: ' . $what);
+};
+if (!$found->isInterface()) {
+    $parent = $found->getParentClass();
+    if ($extends === null && $parent !== false) {
+        $mismatch('no parent in the source, PHP has ' . $parent->getName());
+    }
+    if ($extends !== null && ($parent === false || strcasecmp($extends, $parent->getName()) !== 0)) {
+        $mismatch('extends ' . $extends . ', PHP has ' . ($parent === false ? 'no parent' : $parent->getName()));
+    }
+}
+$interfaces = array_map('strtolower', $found->getInterfaceNames());
+foreach ($found->isInterface() ? $header['extends'] : $implements as $name) {
+    if (!in_array(strtolower($name), $interfaces, true)) {
+        $mismatch($name . ' is not an interface PHP has for it');
+    }
+}
+// A constructor this class declares, its traits' included; an inherited one is the parent's.
+$constructor = null;
+try {
+    $method = $found->getConstructor();
+    if ($method !== null && strcasecmp($method->getDeclaringClass()->getName(), $found->getName()) === 0) {
+        $constructor = [];
+        foreach ($method->getParameters() as $p) {
+            $hasDefault = $p->isDefaultValueAvailable();
+            $constructor[] = [
+                'name' => $p->getName(),
+                'type_hint' => tstr($p->getType()),
+                'has_default' => $hasDefault,
+                'default_value' => $hasDefault ? encode_default($p->getDefaultValue()) : null,
+                'is_variadic' => $p->isVariadic(),
+                'is_promoted' => $p->isPromoted(),
+            ];
+        }
+    }
+} catch (\Throwable $e) {
+    $fail('Could not read the constructor of ' . $first . ': ' . $e->getMessage());
+}
+$kind = $found->isInterface() ? 'interface' : ($found->isTrait() ? 'trait' : ($found->isAbstract() ? 'abstract_class' : 'class'));
+$finished = true;
 $write([
     'result' => 'class',
-    'kind' => $found->isInterface() ? 'interface' : ($found->isTrait() ? 'trait' : ($found->isAbstract() ? 'abstract_class' : 'class')),
+    'kind' => $kind,
     'namespace' => $found->getNamespaceName(),
     'name' => $found->getShortName(),
     'fqcn' => $found->getName(),
+    'is_final' => $kind === 'class' && $found->isFinal(),
+    'extends' => $extends,
+    'implements' => $implements,
+    'constructor' => $constructor,
 ]);
 "#;
 
 fn script() -> &'static str {
     static SCRIPT: OnceLock<String> = OnceLock::new();
     SCRIPT.get_or_init(|| {
-        format!("{REFLECT_HEAD_PHP}{BOOT_PHP}{OBJECT_MANAGER_PHP}{ENCODE_DEFAULT_PHP}{REFLECT_PHP}")
+        format!(
+            "{REFLECT_HEAD_PHP}{BOOT_PHP}{OBJECT_MANAGER_PHP}{ENCODE_DEFAULT_PHP}{TYPE_STRING_PHP}{REFLECT_PHP}"
+        )
     })
 }
 
@@ -203,28 +351,62 @@ struct Tier3Class {
     namespace: String,
     name: String,
     fqcn: String,
+    is_final: bool,
+    extends: Option<String>,
+    implements: Vec<String>,
+    constructor: Option<Vec<Tier3Param>>,
+}
+
+#[derive(Deserialize)]
+struct Tier3Param {
+    name: String,
+    type_hint: Option<String>,
+    has_default: bool,
+    default_value: Option<String>,
+    is_variadic: bool,
+    is_promoted: bool,
 }
 
 impl Tier3Class {
     fn into_class_info(self, path: &Path) -> ClassInfo {
+        let kind = match self.kind {
+            Tier3Kind::Class => ClassKind::Class,
+            Tier3Kind::AbstractClass => ClassKind::AbstractClass,
+            Tier3Kind::Interface => ClassKind::Interface,
+            Tier3Kind::Trait => ClassKind::Trait,
+        };
         ClassInfo {
             path: path.to_path_buf(),
             namespace: self.namespace,
             name: self.name,
             fqcn: self.fqcn,
-            kind: match self.kind {
-                Tier3Kind::Class => ClassKind::Class,
-                Tier3Kind::AbstractClass => ClassKind::AbstractClass,
-                Tier3Kind::Interface => ClassKind::Interface,
-                Tier3Kind::Trait => ClassKind::Trait,
-            },
-            extends: None,
-            implements: Vec::new(),
-            constructor: None,
-            is_abstract: false,
-            is_final: false,
+            is_abstract: kind == ClassKind::AbstractClass,
+            kind,
+            extends: self.extends,
+            implements: self.implements,
+            constructor: self.constructor.map(|params| Constructor {
+                params: params.into_iter().map(Tier3Param::into_param).collect(),
+            }),
+            is_final: self.is_final,
             public_methods: Vec::new(),
             traits: Default::default(),
+        }
+    }
+}
+
+impl Tier3Param {
+    /// `is_optional` is PHP's `isDefaultValueAvailable()`. Tier 1 sets it from the source, which
+    /// differs only for a default before a required parameter, and `optional_in_php` gives the
+    /// same answer for both.
+    fn into_param(self) -> ConstructorParam {
+        ConstructorParam {
+            is_primitive: self.type_hint.as_deref().is_none_or(is_primitive_type),
+            name: self.name,
+            type_hint: self.type_hint,
+            is_optional: self.has_default,
+            default_value: self.default_value,
+            is_variadic: self.is_variadic,
+            is_promoted: self.is_promoted,
         }
     }
 }
