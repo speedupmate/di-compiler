@@ -1184,6 +1184,21 @@ fn fake_php(store: &Store, name: &str, json: Option<&str>, code: i32) -> String 
     path.to_string_lossy().into_owned()
 }
 
+/// `reflect` with a stand-in binary written just before. Another test thread can fork while the
+/// file is still open for writing; until that child execs, running the file fails with "Text
+/// file busy", so that one error is tried again.
+fn reflect_fake(config: &Tier3Config, file: &Path) -> ExtractResult {
+    for _ in 0..50 {
+        match reflect(config, file) {
+            ExtractResult::PhpFallbackFailed(reason) if reason.contains("Text file busy") => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    reflect(config, file)
+}
+
 #[test]
 fn a_result_counts_only_with_exit_code_zero() {
     let mut store = Store::new();
@@ -1196,15 +1211,15 @@ fn a_result_counts_only_with_exit_code_zero() {
         Some(r#"{"result":"no_class"}"#),
         7,
     );
-    let reason = failure(reflect(&store.config, &file));
+    let reason = failure(reflect_fake(&store.config, &file));
     assert!(reason.contains("code 7"), "{reason}");
 
     store.config.php = fake_php(&store, "class-exit-1", Some(class_json), 1);
-    let reason = failure(reflect(&store.config, &file));
+    let reason = failure(reflect_fake(&store.config, &file));
     assert!(reason.contains("code 1"), "{reason}");
 
     store.config.php = fake_php(&store, "nothing-exit-0", None, 0);
-    let reason = failure(reflect(&store.config, &file));
+    let reason = failure(reflect_fake(&store.config, &file));
     assert!(
         reason.contains("code 0 without a usable result"),
         "{reason}"
@@ -1218,12 +1233,12 @@ fn a_result_counts_only_with_exit_code_zero() {
         255,
     );
     assert_eq!(
-        failure(reflect(&store.config, &file)),
+        failure(reflect_fake(&store.config, &file)),
         "There is an error in Any.php at line: 2: boom"
     );
 
     store.config.php = fake_php(&store, "class-exit-0", Some(class_json), 0);
-    assert_eq!(class(reflect(&store.config, &file)).fqcn, "Any");
+    assert_eq!(class(reflect_fake(&store.config, &file)).fqcn, "Any");
 }
 
 #[test]
