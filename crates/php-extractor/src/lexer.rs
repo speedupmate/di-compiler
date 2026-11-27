@@ -321,6 +321,11 @@ impl<'a> Scanner<'a> {
                 }
                 b"abstract" => {
                     self.skip_noise();
+                    // `abstract readonly class`; `readonly abstract class` reaches here too.
+                    if self.peek_word_eq(b"readonly") {
+                        self.read_word();
+                        self.skip_noise();
+                    }
                     if self.peek_word_eq(b"class") {
                         self.read_word();
                         is_abstract = true;
@@ -1701,6 +1706,26 @@ mod tests {
         let info = extract_str("<?php\nnamespace Foo;\nabstract class AbstractThing {}").unwrap();
         assert!(info.is_abstract);
         assert!(matches!(info.kind, ClassKind::AbstractClass));
+    }
+
+    #[test]
+    fn readonly_does_not_hide_abstract_in_either_order() {
+        for source in [
+            "<?php\nnamespace Foo;\nabstract readonly class Thing {}",
+            "<?php\nnamespace Foo;\nreadonly abstract class Thing {}",
+        ] {
+            let info = extract_str(source).unwrap();
+            assert!(info.is_abstract, "{source}");
+            assert_eq!(info.kind, ClassKind::AbstractClass, "{source}");
+        }
+        for source in [
+            "<?php\nnamespace Foo;\nfinal readonly class Thing {}",
+            "<?php\nnamespace Foo;\nreadonly final class Thing {}",
+        ] {
+            let info = extract_str(source).unwrap();
+            assert!(info.is_final, "{source}");
+            assert_eq!(info.kind, ClassKind::Class, "{source}");
+        }
     }
 
     #[test]

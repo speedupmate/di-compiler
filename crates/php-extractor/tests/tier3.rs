@@ -614,9 +614,16 @@ fn class_flags_follow_the_declaration() {
             "<?php\nnamespace Acme;\nreadonly abstract class ReadonlyAbstract {}\n",
         ),
     ] {
-        let info = class(store.reflect(name, source));
+        let path = store.file(name, source);
+        let info = class(reflect(&store.config, &path));
         assert_eq!(info.kind, ClassKind::AbstractClass, "{name}");
         assert!(info.is_abstract, "{name}");
+        let tier1 = Lexer::extract(&path).unwrap();
+        assert_eq!(
+            (tier1.kind, tier1.is_abstract),
+            (info.kind, info.is_abstract),
+            "{name}: Tier 1"
+        );
     }
 }
 
