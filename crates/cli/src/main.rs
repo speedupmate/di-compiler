@@ -33,6 +33,7 @@ mod file_level_checks;
 mod incompatible_modules;
 mod requested_regeneration;
 mod run_report;
+mod unread_files;
 mod watch;
 mod watch_set;
 use class_checks::{ClassChecks, ScannedFile};
@@ -696,6 +697,13 @@ fn main() {
 
     let file_level_checks = Mutex::new(Vec::new());
     let classes_inside_a_block = Mutex::new(Vec::new());
+    let unread_files: Mutex<Vec<unread_files::UnreadFile>> = Mutex::new(Vec::new());
+    let unread = |path: &Path, reason: String| {
+        unread_files.lock().unwrap().push(unread_files::UnreadFile {
+            path: path.to_path_buf(),
+            reason,
+        });
+    };
     let scanned_files = Mutex::new(Vec::with_capacity(php_files.len()));
     let scanned = |class: &str, path: &Path| {
         scanned_files.lock().unwrap().push(ScannedFile {
@@ -734,18 +742,21 @@ fn main() {
                     scanned("", path);
                     fallback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Fallback failed for {}: {}", path.display(), e);
+                    unread(path, e);
                     None
                 }
                 ExtractResult::LexError(e) => {
                     scanned("", path);
                     failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Lex error for {}: {e}", path.display());
+                    unread(path, e.to_string());
                     None
                 }
                 ExtractResult::ParseFailure(e) => {
                     scanned("", path);
                     failure_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::warn!("Parse failure for {}: {}", path.display(), e);
+                    unread(path, e);
                     None
                 }
             }
@@ -783,6 +794,14 @@ fn main() {
         if let Some(info) = class_map.remove(&class) {
             disabled_class_map.insert(class, info);
         }
+    }
+
+    // Decided once the DI configuration is merged, before anything is written.
+    let mut unread_files = unread_files.into_inner().unwrap();
+    unread_files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut unread_uses = unread_files::Uses::default();
+    if !unread_files.is_empty() {
+        unread_uses.add_classes(&class_map);
     }
 
     apply_traits(&mut class_map, &|name| {
@@ -934,6 +953,18 @@ fn main() {
         di_config.virtual_types.len(),
     );
     log_phase_elapsed("Phase 3b", phase_3b_started);
+
+    if !unread_files.is_empty() {
+        unread_uses.add_di_config(&di_config);
+        unread_uses.add_di_config(&full_di_config);
+        decide_unread_files(
+            &unread_files,
+            &unread_uses,
+            &magento_root,
+            &code_root,
+            &args.fallback_php,
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Phase 3c: Collect extension-attributes metadata (for Extension* artifacts)
@@ -2414,6 +2445,38 @@ fn is_generated_class_name(class: &str) -> bool {
 /// Ends a compile that Magento would stop too. `DiCompileCommand::execute()` empties
 /// `generated/metadata` first, so a failed compile never leaves old metadata for the store to use.
 /// Removing it at the end gives the same result, and a passing compile can still skip phase 7.
+/// Stops the compile for files Magento needs and no tier could read; leaves the others out with
+/// a warning.
+fn decide_unread_files(
+    files: &[unread_files::UnreadFile],
+    uses: &unread_files::Uses,
+    magento_root: &Path,
+    code_root: &Path,
+    php_bin: &str,
+) {
+    let scopes = unread_files::check_scope(files, magento_root, code_root, php_bin)
+        .unwrap_or_else(|e| {
+            stop_compile(&format!(
+                "No tier could read {} file(s), the first {}, and whether Magento compiles them is unknown: {e}",
+                files.len(),
+                files[0].path.display()
+            ))
+        });
+    let mut stops = Vec::new();
+    for (file, scope) in files.iter().zip(&scopes) {
+        match unread_files::stop_reason(file, scope, uses) {
+            Some(reason) => stops.push(reason),
+            None => log::warn!(
+                "Left {} out of the compile: Magento does not compile it, and nothing active uses the classes it declares",
+                file.path.display()
+            ),
+        }
+    }
+    if !stops.is_empty() {
+        stop_compile(&stops.join("\nerror: "));
+    }
+}
+
 fn stop_compile(message: &str) -> ! {
     eprintln!("error: {message}");
     run_report::clean_up();
