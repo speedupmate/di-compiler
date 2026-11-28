@@ -52,6 +52,14 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The Tier 3 and end-to-end tests run PHP; property hooks need 8.4.
+      - name: Install PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: none
+
       - name: Run tests
         run: cargo test --locked --workspace
 
