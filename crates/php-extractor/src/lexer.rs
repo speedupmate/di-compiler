@@ -321,6 +321,11 @@ impl<'a> Scanner<'a> {
                 }
                 b"abstract" => {
                     self.skip_noise();
+                    // `abstract readonly class`; `readonly abstract class` reaches here too.
+                    if self.peek_word_eq(b"readonly") {
+                        self.read_word();
+                        self.skip_noise();
+                    }
                     if self.peek_word_eq(b"class") {
                         self.read_word();
                         is_abstract = true;
@@ -482,6 +487,15 @@ impl<'a> Scanner<'a> {
             }
             self.pos = saved;
         }
+        // `use A\B as C, D\E;` imports each name of the list.
+        while self.read_one_import() {
+            self.skip_noise();
+        }
+    }
+
+    /// One name of a `use` statement. True when a `,` follows it, so another name comes next;
+    /// the `;` after the last name is read.
+    fn read_one_import(&mut self) -> bool {
         // Skip leading `\`
         if self.peek() == b'\\' {
             self.advance(1);
@@ -538,7 +552,7 @@ impl<'a> Scanner<'a> {
                     if self.peek() == b';' {
                         self.advance(1);
                     }
-                    return;
+                    return false;
                 }
                 base.push('\\');
             } else {
@@ -547,7 +561,7 @@ impl<'a> Scanner<'a> {
         }
         if base.is_empty() {
             self.skip_to_semicolon();
-            return;
+            return false;
         }
         // Optional `as Alias`
         let alias = self
@@ -557,8 +571,16 @@ impl<'a> Scanner<'a> {
             self.use_map.insert(alias.to_ascii_lowercase(), base);
         }
         self.skip_noise();
-        if self.peek() == b';' {
-            self.advance(1);
+        match self.peek() {
+            b';' => {
+                self.advance(1);
+                false
+            }
+            b',' => {
+                self.advance(1);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -595,6 +617,14 @@ impl<'a> Scanner<'a> {
         // Primitives stay as-is — they are never FQCNs.
         if is_primitive_type(raw) {
             return raw.to_ascii_lowercase();
+        }
+        // `namespace\Foo` is relative to the current namespace.
+        if let Some(rest) = crate::tier2::strip_namespace_keyword(raw) {
+            return if self.namespace.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{}\\{}", self.namespace, rest)
+            };
         }
         // The first segment determines whether there's a use-import match.
         let first = raw.split('\\').next().unwrap_or(raw);
@@ -1531,7 +1561,7 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn is_primitive_type(t: &str) -> bool {
+pub(crate) fn is_primitive_type(t: &str) -> bool {
     let t = t.trim_start_matches('?');
     if t.contains('|') {
         return t.split('|').all(is_primitive_base);
@@ -1684,6 +1714,86 @@ mod tests {
         let info = extract_str("<?php\nnamespace Foo;\nabstract class AbstractThing {}").unwrap();
         assert!(info.is_abstract);
         assert!(matches!(info.kind, ClassKind::AbstractClass));
+    }
+
+    #[test]
+    fn readonly_does_not_hide_abstract_in_either_order() {
+        for source in [
+            "<?php\nnamespace Foo;\nabstract readonly class Thing {}",
+            "<?php\nnamespace Foo;\nreadonly abstract class Thing {}",
+        ] {
+            let info = extract_str(source).unwrap();
+            assert!(info.is_abstract, "{source}");
+            assert_eq!(info.kind, ClassKind::AbstractClass, "{source}");
+        }
+        for source in [
+            "<?php\nnamespace Foo;\nfinal readonly class Thing {}",
+            "<?php\nnamespace Foo;\nreadonly final class Thing {}",
+        ] {
+            let info = extract_str(source).unwrap();
+            assert!(info.is_final, "{source}");
+            assert_eq!(info.kind, ClassKind::Class, "{source}");
+        }
+    }
+
+    #[test]
+    fn every_import_of_a_comma_list_counts() {
+        let info = extract_str(
+            "<?php\nnamespace Acme\\Shop;\nuse Lib\\Base as Root, Lib\\Contracts, \\Lib\\Other;\nuse Lib\\Group\\{First, Second as Two};\n\
+             class Order extends Root implements Contracts\\Third, Other, First, Two {\n    \
+             public function __construct(Contracts\\Fourth $a, Other $b) {}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(info.extends.as_deref(), Some("Lib\\Base"));
+        assert_eq!(
+            info.implements,
+            [
+                "Lib\\Contracts\\Third",
+                "Lib\\Other",
+                "Lib\\Group\\First",
+                "Lib\\Group\\Second"
+            ]
+        );
+        let types: Vec<Option<&str>> = info
+            .constructor
+            .as_ref()
+            .unwrap()
+            .params
+            .iter()
+            .map(|p| p.type_hint.as_deref())
+            .collect();
+        assert_eq!(types, [Some("Lib\\Contracts\\Fourth"), Some("Lib\\Other")]);
+    }
+
+    #[test]
+    fn a_long_import_list_is_read_without_deep_recursion() {
+        // Valid PHP; each name used to cost a stack frame.
+        let names: Vec<String> = (0..30_000).map(|i| format!("Lib\\C{i}")).collect();
+        let source = format!(
+            "<?php\nnamespace Acme;\nuse {};\nclass Last implements C29999 {{}}\n",
+            names.join(", ")
+        );
+        let info = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || extract_str(&source).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(info.implements, ["Lib\\C29999"]);
+    }
+
+    #[test]
+    fn a_name_after_the_namespace_keyword_is_relative_to_the_namespace() {
+        let info = extract_str(
+            "<?php\nnamespace Acme\\Shop;\nclass Cart implements namespace\\Marker {\n    \
+             public function __construct(NAMESPACE\\Sub\\Item $item) {}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(info.implements, ["Acme\\Shop\\Marker"]);
+        assert_eq!(
+            info.constructor.unwrap().params[0].type_hint.as_deref(),
+            Some("Acme\\Shop\\Sub\\Item")
+        );
     }
 
     #[test]

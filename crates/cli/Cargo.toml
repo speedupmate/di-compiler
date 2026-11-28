@@ -25,6 +25,7 @@ di-resolver = { path = "../di-resolver" }
 code-generator = { path = "../code-generator" }
 validator = { path = "../validator" }
 notify.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true

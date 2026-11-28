@@ -58,7 +58,7 @@ fn compile(classes: &[(&str, &str)]) -> tempfile::TempDir {
     write(
         root,
         "app/code/Acme/On/Plugin/Watch.php",
-        "<?php\nnamespace Acme\\On\\Plugin;\n\nclass Watch\n{\n    public function beforeRun($subject)\n    {\n    }\n}\n",
+        "<?php\nnamespace Acme\\On\\Plugin;\n\nclass Watch\n{\n    public function beforeRun($subject)\n    {\n    }\n\n    public function beforeTake($subject)\n    {\n    }\n\n    public function beforePart($subject)\n    {\n    }\n}\n",
     );
     write(
         root,
@@ -210,4 +210,75 @@ fn walk(folder: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+#[test]
+fn a_class_tier2_reads_keeps_its_interfaces_and_intersection_types() {
+    if !has_php() {
+        return;
+    }
+    // Tier 1 rejects the intersection, so Tier 2 reads the class. It has to find
+    // `implements RunnerInterface` for the plugin to apply, and keep both members of the type.
+    let store = compile(&[(
+        "Joined",
+        "<?php\nnamespace Acme\\On\\Model;\n\nuse Acme\\On\\Model\\Gadget AS Part;\n\n\
+         class Joined implements RunnerInterface\n{\n    \
+         public function __construct(\\Countable&\\Traversable $items, Part&Widget $part, \\Acme\\On\\Model\\Gadget $gadget)\n    {\n    }\n\n    \
+         public function run(): \\Countable&\\Traversable\n    {\n    }\n\n    \
+         public function take(\\Countable&\\Iterator & $items): void\n    {\n    }\n\n    \
+         public function part(): Part\n    {\n    }\n}\n",
+    )]);
+    let code = interceptor(&store, "Joined");
+    assert_eq!(
+        line_with(&code, "function __construct"),
+        format!(
+            "public function __construct(\\Countable&\\Traversable $items, {MODEL}\\Gadget&{MODEL}\\Widget $part, {MODEL}\\Gadget $gadget)"
+        )
+    );
+    assert_eq!(
+        line_with(&code, "function run"),
+        "public function run() : \\Countable&\\Traversable"
+    );
+    // PHP refuses an override that drops the `&` of a reference parameter.
+    assert_eq!(
+        line_with(&code, "function take"),
+        "public function take(\\Countable&\\Iterator &$items) : void"
+    );
+    // `AS` is a valid spelling of the import keyword.
+    assert_eq!(
+        line_with(&code, "function part"),
+        format!("public function part() : {MODEL}\\Gadget")
+    );
+    assert_interceptor_loads(&store, "Joined");
+}
+
+/// PHP declares the interceptor, which checks each method against the one it overrides.
+fn assert_interceptor_loads(store: &tempfile::TempDir, class: &str) {
+    let root = store.path();
+    let stubs = root.join("interception-stubs.php");
+    fs::write(
+        &stubs,
+        "<?php\nnamespace Magento\\Framework\\Interception;\ninterface InterceptorInterface {}\ntrait Interceptor {}\n",
+    )
+    .unwrap();
+    let output = Command::new("php")
+        .arg("-r")
+        .arg(
+            "require $argv[1]; require $argv[2]; require $argv[3]; \
+             echo class_exists($argv[4], false) ? 'loaded' : 'missing';",
+        )
+        .arg(root.join("vendor/autoload.php"))
+        .arg(&stubs)
+        .arg(root.join(format!(
+            "generated/code/Acme/On/Model/{class}/Interceptor.php"
+        )))
+        .arg(format!("Acme\\On\\Model\\{class}\\Interceptor"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "loaded",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

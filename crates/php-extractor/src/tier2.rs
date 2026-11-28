@@ -5,25 +5,67 @@ use std::path::Path;
 
 use tree_sitter::{Node, Parser};
 
+use crate::lexer::ScanFacts;
 use crate::types::{
     ClassInfo, ClassKind, Constructor, ConstructorParam, ExtractResult, MethodParam,
     MethodSignature, TraitData, TraitMethod,
 };
 
 pub fn extract_tier2(path: &Path) -> ExtractResult {
+    extract_tier2_with_facts(path).0
+}
+
+/// Like [`extract_tier2`], and also says whether the declaration is inside a block. A file
+/// whose tree has a syntax error is a `ParseFailure`, so it goes on to Tier 3: tree-sitter-php
+/// returns a partial tree for syntax it does not know, such as property hooks.
+pub fn extract_tier2_with_facts(path: &Path) -> (ExtractResult, ScanFacts) {
     let source = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) => return ExtractResult::PhpFallbackFailed(format!("io: {e}")),
+        Err(e) => {
+            return (
+                ExtractResult::PhpFallbackFailed(format!("io: {e}")),
+                ScanFacts::default(),
+            )
+        }
     };
 
     match extract_with_treesitter(&source, path) {
-        Ok(Some(info)) => ExtractResult::Ok(info),
-        Ok(None) => ExtractResult::NoClass,
-        Err(e) => ExtractResult::ParseFailure(e),
+        Ok(Some((info, inside_block))) => (
+            ExtractResult::Ok(info),
+            ScanFacts {
+                class_check: false,
+                inside_block,
+            },
+        ),
+        Ok(None) => (ExtractResult::NoClass, ScanFacts::default()),
+        Err(e) => (ExtractResult::ParseFailure(e), ScanFacts::default()),
     }
 }
 
-fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInfo>, String> {
+/// Whether `node` is inside a block. The file, a namespace and the body of a braced namespace
+/// are no blocks, as for Magento's `FileClassScanner`.
+fn is_inside_block(node: Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let top_level = match parent.kind() {
+            "program" | "namespace_definition" => true,
+            "compound_statement" => parent
+                .parent()
+                .is_some_and(|above| above.kind() == "namespace_definition"),
+            _ => false,
+        };
+        if !top_level {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn extract_with_treesitter(
+    source: &[u8],
+    path: &Path,
+) -> Result<Option<(ClassInfo, bool)>, String> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_php::language_php())
@@ -34,11 +76,12 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         .ok_or_else(|| "tree-sitter returned None".to_string())?;
 
     let root = tree.root_node();
+    if root.has_error() {
+        return Err("tree-sitter-php found a syntax error".into());
+    }
     let src = source;
 
-    // Find namespace and collect use-import map for type resolution
     let namespace = find_namespace(&root, src);
-    let use_map = collect_use_map(&root, src);
 
     // Find class/interface/trait/enum declaration
     let class_node = find_class_node(&root);
@@ -46,6 +89,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         Some(n) => n,
         None => return Ok(None),
     };
+    let use_map = collect_use_map(root, class_node, src);
 
     let node_kind = class_node.kind();
 
@@ -54,7 +98,7 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         return Ok(None);
     }
 
-    let kind = match node_kind {
+    let mut kind = match node_kind {
         "class_declaration" => ClassKind::Class,
         "interface_declaration" => ClassKind::Interface,
         "trait_declaration" => ClassKind::Trait,
@@ -84,6 +128,11 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         }
     }
 
+    // As Tier 1: an abstract class has its own kind.
+    if is_abstract && kind == ClassKind::Class {
+        kind = ClassKind::AbstractClass;
+    }
+
     let name = class_node
         .child_by_field_name("name")
         .map(|n| node_text(n, src).trim().to_string())
@@ -93,32 +142,22 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         return Ok(None); // anonymous class
     }
 
-    let extends = class_node
-        .child_by_field_name("base_clause")
-        .or_else(|| class_node.child_by_field_name("extends_clause"))
-        .map(|n| {
-            // base_clause may have a name child
-            n.child_by_field_name("name")
-                .or_else(|| find_named_node(n, "qualified_name"))
-                .or_else(|| find_named_node(n, "name"))
-                .map(|nn| normalize_fqn(node_text(nn, src).trim()))
-                .unwrap_or_else(|| {
-                    normalize_fqn(
-                        node_text(n, src)
-                            .trim()
-                            .trim_start_matches("extends")
-                            .trim(),
-                    )
-                })
-        });
-
+    // tree-sitter-php gives `extends` and `implements` as plain children, not as fields. Tier 1
+    // reads an interface's first parent as `extends` and the others as `implements`.
+    let mut parents: Vec<String> = Vec::new();
     let mut implements: Vec<String> = Vec::new();
-    if let Some(iface_clause) = class_node
-        .child_by_field_name("class_implements")
-        .or_else(|| class_node.child_by_field_name("implements_clause"))
-    {
-        collect_fqns(iface_clause, src, &mut implements);
+    for child in iter_children(class_node) {
+        match child.kind() {
+            "base_clause" => collect_names(child, src, &namespace, &use_map, &mut parents),
+            "class_interface_clause" => {
+                collect_names(child, src, &namespace, &use_map, &mut implements)
+            }
+            _ => {}
+        }
     }
+    let mut parents = parents.into_iter();
+    let extends = parents.next();
+    implements.extend(parents);
 
     // Find class body
     let body_node = class_node.child_by_field_name("body");
@@ -159,9 +198,13 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
                         let is_static = has_modifier(member, src, "static");
                         let returns_reference = node_text(member, src).contains("function &");
                         let params = parse_method_params_ts(member, src, &namespace, &use_map);
-                        let return_type = member
-                            .child_by_field_name("return_type")
-                            .map(|n| node_text(n, src).trim_start_matches(':').trim().to_string());
+                        let return_type = member.child_by_field_name("return_type").map(|n| {
+                            resolve_type(
+                                node_text(n, src).trim_start_matches(':'),
+                                &namespace,
+                                &use_map,
+                            )
+                        });
                         let signature = MethodSignature {
                             name: method_name,
                             params,
@@ -196,20 +239,24 @@ fn extract_with_treesitter(source: &[u8], path: &Path) -> Result<Option<ClassInf
         format!("{}\\{}", namespace, name)
     };
 
-    Ok(Some(ClassInfo {
-        path: path.to_path_buf(),
-        namespace,
-        name,
-        fqcn,
-        kind,
-        extends,
-        implements,
-        constructor,
-        is_abstract,
-        is_final,
-        public_methods,
-        traits: Box::new(traits),
-    }))
+    let inside_block = is_inside_block(class_node);
+    Ok(Some((
+        ClassInfo {
+            path: path.to_path_buf(),
+            namespace,
+            name,
+            fqcn,
+            kind,
+            extends,
+            implements,
+            constructor,
+            is_abstract,
+            is_final,
+            public_methods,
+            traits: Box::new(traits),
+        },
+        inside_block,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -220,130 +267,90 @@ fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
 }
 
-/// Collect file-level `use` declarations into a lowercase-alias → FQCN map.
-///
-/// Uses text-based parsing on the raw source so that tree-sitter node-name
-/// differences across versions do not affect correctness.
-fn collect_use_map(_root: &Node, src: &[u8]) -> rustc_hash::FxHashMap<String, String> {
+/// The class imports in effect at the declaration: lowercase alias → name. Read from the tree, so
+/// keyword case (`AS`), comments and line breaks do not matter. A namespace starts its own list.
+fn collect_use_map(
+    root: Node,
+    class_node: Node,
+    src: &[u8],
+) -> rustc_hash::FxHashMap<String, String> {
     let mut map = rustc_hash::FxHashMap::default();
-    let text = match std::str::from_utf8(src) {
-        Ok(s) => s,
-        Err(_) => return map,
-    };
-
-    // Find the class body start to avoid processing trait `use` inside the class.
-    let class_brace = find_class_body_brace_offset(text);
-
-    // Scan for all `use ` occurrences before the class body.
-    let search_region = &text[..class_brace.unwrap_or(text.len())];
-    let mut pos = 0;
-    while pos < search_region.len() {
-        let Some(use_pos) = search_region[pos..].find("use ") else {
-            break;
-        };
-        let abs = pos + use_pos;
-        // Check that `use` is preceded by a statement boundary (newline, ';', or start)
-        let ok = abs == 0
-            || search_region[..abs]
-                .chars()
-                .next_back()
-                .map(|c| c == '\n' || c == ';' || c == '{' || c == '}')
-                .unwrap_or(true);
-        pos = abs + 4;
-        if !ok {
-            continue;
+    let before_class = |node: &Node| node.start_byte() < class_node.start_byte();
+    for child in iter_children(root).filter(before_class) {
+        match child.kind() {
+            "namespace_definition" => {
+                map.clear();
+                // A braced namespace holds its imports and the class in its body.
+                if let Some(body) = child.child_by_field_name("body") {
+                    for statement in iter_children(body).filter(before_class) {
+                        if statement.kind() == "namespace_use_declaration" {
+                            add_imports(statement, src, &mut map);
+                        }
+                    }
+                }
+            }
+            "namespace_use_declaration" => add_imports(child, src, &mut map),
+            _ => {}
         }
-        // Read to next semicolon
-        let Some(semi) = search_region[pos..].find(';') else {
-            break;
-        };
-        let stmt = search_region[pos..pos + semi].trim();
-        // Skip `use function` and `use const`
-        if stmt.starts_with("function ") || stmt.starts_with("const ") {
-            pos += semi + 1;
-            continue;
-        }
-        // Parse the statement
-        parse_use_stmt(stmt, &mut map);
-        pos += semi + 1;
     }
     map
 }
 
-/// Find the byte offset of the opening brace of the first class/trait/interface body.
-fn find_class_body_brace_offset(text: &str) -> Option<usize> {
-    // Simple heuristic: find `class `, `trait `, or `interface ` then the first `{`
-    for kw in &["class ", "trait ", "interface "] {
-        if let Some(kw_pos) = text.find(kw) {
-            if let Some(brace) = text[kw_pos..].find('{') {
-                return Some(kw_pos + brace);
+/// One `use` statement: single and comma-separated names, and groups. `use function` and
+/// `use const` import no classes.
+fn add_imports(declaration: Node, src: &[u8], map: &mut rustc_hash::FxHashMap<String, String>) {
+    let imports_no_class =
+        |node: Node| iter_children(node).any(|c| matches!(c.kind(), "function" | "const"));
+    if imports_no_class(declaration) {
+        return;
+    }
+    let mut add = |name: &str, alias: Option<&str>| {
+        let name = normalize_fqn(name.trim());
+        let alias = alias
+            .map(str::to_string)
+            .unwrap_or_else(|| name.rsplit('\\').next().unwrap_or(&name).to_string());
+        if !name.is_empty() && !alias.is_empty() {
+            map.insert(alias.to_ascii_lowercase(), name);
+        }
+    };
+    let alias_of = |clause: Node| {
+        iter_children(clause)
+            .find(|c| c.kind() == "namespace_aliasing_clause")
+            .and_then(|aliasing| iter_children(aliasing).find(|c| c.kind() == "name"))
+            .map(|name| node_text(name, src).trim().to_string())
+    };
+    let mut prefix = String::new();
+    for child in iter_children(declaration) {
+        match child.kind() {
+            "namespace_use_clause" => {
+                let name = iter_children(child)
+                    .find(|c| matches!(c.kind(), "qualified_name" | "name" | "namespace_name"))
+                    .map(|n| node_text(n, src).to_string())
+                    .unwrap_or_default();
+                add(&name, alias_of(child).as_deref());
             }
+            // `use A\B\{C, D as E}`: the prefix comes before the group.
+            "namespace_name" | "qualified_name" => prefix = node_text(child, src).to_string(),
+            "namespace_use_group" => {
+                for clause in iter_children(child) {
+                    if clause.kind() != "namespace_use_group_clause" || imports_no_class(clause) {
+                        continue;
+                    }
+                    let Some(name) = iter_children(clause)
+                        .find(|c| matches!(c.kind(), "namespace_name" | "qualified_name" | "name"))
+                    else {
+                        continue;
+                    };
+                    let full = format!(
+                        "{}\\{}",
+                        prefix.trim().trim_end_matches('\\'),
+                        node_text(name, src).trim()
+                    );
+                    add(&full, alias_of(clause).as_deref());
+                }
+            }
+            _ => {}
         }
-    }
-    None
-}
-
-/// Parse a use statement body (without leading `use ` and without trailing `;`).
-fn parse_use_stmt(stmt: &str, map: &mut rustc_hash::FxHashMap<String, String>) {
-    let stmt = stmt.trim();
-    // Grouped: Foo\Bar\{Baz, Qux as Q}
-    if stmt.contains('{') {
-        parse_grouped_use(&format!("use {stmt}"), map);
-        return;
-    }
-    // Multiple: use Foo, Bar\Baz (rare in PHP but handle it)
-    for part in stmt.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (fqcn_raw, alias) = if let Some((fqcn_part, alias_part)) = part.split_once(" as ") {
-            (fqcn_part.trim(), alias_part.trim().to_ascii_lowercase())
-        } else {
-            let seg = part
-                .rsplit('\\')
-                .next()
-                .unwrap_or(part)
-                .to_ascii_lowercase();
-            (part, seg)
-        };
-        let fqcn = normalize_fqn(fqcn_raw.trim_start_matches('\\'));
-        if !fqcn.is_empty() && !alias.is_empty() {
-            map.insert(alias, fqcn);
-        }
-    }
-}
-
-/// Parse a grouped use statement like `use Foo\Bar\{Baz, Qux as Q};`
-fn parse_grouped_use(text: &str, map: &mut rustc_hash::FxHashMap<String, String>) {
-    // Extract prefix (before '{') and items (inside '{}')
-    let text = text.trim_start_matches("use ").trim_end_matches(';').trim();
-    let Some(brace_start) = text.find('{') else {
-        return;
-    };
-    let Some(brace_end) = text.rfind('}') else {
-        return;
-    };
-    let prefix = text[..brace_start].trim_end_matches('\\').trim();
-    let items = &text[brace_start + 1..brace_end];
-    for item in items.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        let (class_part, alias) = if let Some((c, a)) = item.split_once(" as ") {
-            (c.trim(), a.trim().to_ascii_lowercase())
-        } else {
-            let seg = item
-                .rsplit('\\')
-                .next()
-                .unwrap_or(item)
-                .to_ascii_lowercase();
-            (item, seg)
-        };
-        let fqcn = format!("{}\\{}", prefix, class_part);
-        let fqcn = normalize_fqn(&fqcn);
-        map.insert(alias, fqcn);
     }
 }
 
@@ -359,6 +366,14 @@ fn resolve_type_hint(
     // Already fully-qualified (starts with \)
     if raw.starts_with('\\') {
         return normalize_fqn(raw);
+    }
+    // `namespace\Foo` is relative to the current namespace.
+    if let Some(rest) = strip_namespace_keyword(raw) {
+        return if namespace.is_empty() {
+            rest.to_string()
+        } else {
+            format!("{namespace}\\{rest}")
+        };
     }
     let first = raw.split('\\').next().unwrap_or(raw);
     if let Some(mapped) = use_map.get(&first.to_ascii_lowercase()) {
@@ -415,20 +430,23 @@ fn find_class_node<'a>(root: &'a Node<'a>) -> Option<Node<'a>> {
     None
 }
 
-fn find_named_node<'a>(parent: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    iter_children(parent).find(|&child| child.kind() == kind)
-}
-
-fn collect_fqns(node: Node, src: &[u8], out: &mut Vec<String>) {
+/// The class names of a header clause, resolved as Tier 1 resolves them.
+fn collect_names(
+    node: Node,
+    src: &[u8],
+    namespace: &str,
+    use_map: &rustc_hash::FxHashMap<String, String>,
+    out: &mut Vec<String>,
+) {
     for child in iter_children(node) {
         match child.kind() {
-            "qualified_name" | "name" => {
-                let s = normalize_fqn(node_text(child, src).trim());
-                if !s.is_empty() {
-                    out.push(s);
+            "qualified_name" | "name" | "relative_name" => {
+                let name = resolve_type(node_text(child, src), namespace, use_map);
+                if !name.is_empty() {
+                    out.push(name);
                 }
             }
-            _ => collect_fqns(child, src, out),
+            _ => {}
         }
     }
 }
@@ -481,10 +499,9 @@ fn parse_ctor_params_ts(
                 let is_promoted = child.kind() == "property_promotion_parameter";
                 let is_variadic = child.kind() == "variadic_parameter";
 
-                let type_hint = child.child_by_field_name("type").map(|n| {
-                    let raw = extract_type_from_node(n, src);
-                    resolve_type_in_hint(&raw, namespace, use_map)
-                });
+                let type_hint = child
+                    .child_by_field_name("type")
+                    .map(|n| resolve_type(node_text(n, src), namespace, use_map));
 
                 let name = child
                     .child_by_field_name("name")
@@ -530,10 +547,9 @@ fn parse_method_params_ts(
             match child.kind() {
                 "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
                     let is_variadic = child.kind() == "variadic_parameter";
-                    let type_hint = child.child_by_field_name("type").map(|n| {
-                        let raw = extract_type_from_node(n, src);
-                        resolve_type_in_hint(&raw, namespace, use_map)
-                    });
+                    let type_hint = child
+                        .child_by_field_name("type")
+                        .map(|n| resolve_type(node_text(n, src), namespace, use_map));
                     let name = child
                         .child_by_field_name("name")
                         .map(|n| node_text(n, src).trim().trim_start_matches('$').to_string())
@@ -543,8 +559,8 @@ fn parse_method_params_ts(
                         .child_by_field_name("default_value")
                         .map(|n| node_text(n, src).trim().to_string())
                         .filter(|v| !v.is_empty());
-                    let raw = node_text(child, src);
-                    let is_by_ref = raw.contains("&$") || raw.trim_start().starts_with('&');
+                    // `&` before the name. The type's own `&`s are part of an intersection.
+                    let is_by_ref = child.child_by_field_name("reference_modifier").is_some();
                     params.push(MethodParam {
                         name,
                         type_hint,
@@ -561,72 +577,69 @@ fn parse_method_params_ts(
     params
 }
 
-/// Resolve each segment in a (possibly union) type hint using namespace + use_map.
-/// Primitives and `null` are left as-is. FQCN segments are resolved.
-fn resolve_type_in_hint(
+/// A type as Tier 1 writes it: each name resolved against the namespace and the `use` imports,
+/// builtin names in lowercase, `?`, `|`, `&` and the parentheses of a DNF group kept, and
+/// whitespace and comments dropped.
+fn resolve_type(
     raw: &str,
     namespace: &str,
     use_map: &rustc_hash::FxHashMap<String, String>,
 ) -> String {
-    if raw.is_empty() {
-        return raw.to_string();
-    }
-    // Nullable prefix
-    let (prefix, inner) = if let Some(rest) = raw.strip_prefix('?') {
-        ("?", rest)
-    } else {
-        ("", raw)
+    let text = without_comments(raw);
+    let mut out = String::new();
+    let mut name = String::new();
+    let flush = |name: &mut String, out: &mut String| {
+        if name.is_empty() {
+            return;
+        }
+        if let Some(absolute) = name.strip_prefix('\\') {
+            out.push_str(absolute);
+        } else if is_primitive_type(name) {
+            out.push_str(&name.to_ascii_lowercase());
+        } else {
+            out.push_str(&resolve_type_hint(name, namespace, use_map));
+        }
+        name.clear();
     };
-    // Union type (Foo|Bar|null)
-    if inner.contains('|') {
-        let resolved: Vec<String> = inner
-            .split('|')
-            .map(|part| {
-                let p = part.trim();
-                if is_primitive_type(p) {
-                    p.to_ascii_lowercase()
-                } else {
-                    resolve_type_hint(p, namespace, use_map)
-                }
-            })
-            .collect();
-        return format!("{}{}", prefix, resolved.join("|"));
+    for c in text.chars() {
+        if matches!(c, '?' | '|' | '&' | '(' | ')') {
+            flush(&mut name, &mut out);
+            out.push(c);
+        } else if c.is_whitespace() {
+            flush(&mut name, &mut out);
+        } else {
+            name.push(c);
+        }
     }
-    if is_primitive_type(inner) {
-        return raw.to_ascii_lowercase();
-    }
-    format!("{}{}", prefix, resolve_type_hint(inner, namespace, use_map))
+    flush(&mut name, &mut out);
+    out
 }
 
-fn extract_type_from_node(type_node: Node, src: &[u8]) -> String {
-    match type_node.kind() {
-        "named_type" | "qualified_name" | "name" => normalize_fqn(node_text(type_node, src).trim()),
-        "nullable_type" => {
-            // `?TypeName`
-            let inner = type_node
-                .named_child(0)
-                .map(|n| normalize_fqn(node_text(n, src).trim()))
-                .unwrap_or_default();
-            format!("?{inner}")
+/// `/* … */`, `// …` and `# …` comments, which a type's text can hold around `|`.
+fn without_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.find("*/").map_or("", |end| &after[end + 2..]);
+            out.push(' ');
+        } else if rest.starts_with("//") || (rest.starts_with('#') && !rest.starts_with("#[")) {
+            rest = rest.find('\n').map_or("", |end| &rest[end..]);
+        } else {
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
         }
-        "union_type" => {
-            // `Foo|Bar` — preserve all union parts in declaration order
-            let mut parts = Vec::new();
-            for child in iter_children(type_node) {
-                match child.kind() {
-                    "named_type" | "name" | "qualified_name" => {
-                        parts.push(normalize_fqn(node_text(child, src).trim()));
-                    }
-                    "primitive_type" => {
-                        parts.push(node_text(child, src).trim().to_string());
-                    }
-                    _ => {}
-                }
-            }
-            parts.join("|")
-        }
-        _ => normalize_fqn(node_text(type_node, src).trim()),
     }
+    out
+}
+
+/// The rest of `namespace\Foo`, in any case of the keyword.
+pub(crate) fn strip_namespace_keyword(name: &str) -> Option<&str> {
+    let prefix = name.get(..10)?;
+    prefix
+        .eq_ignore_ascii_case("namespace\\")
+        .then(|| &name[10..])
 }
 
 fn normalize_fqn(s: &str) -> String {
@@ -721,6 +734,52 @@ mod tests {
             }
             other => panic!("Expected Ok, got {:?}", other),
         }
+    }
+
+    fn extract_with_facts(php: &str) -> (ExtractResult, ScanFacts) {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(php.as_bytes()).unwrap();
+        extract_tier2_with_facts(f.path())
+    }
+
+    const HOOKED: &str = "class Hooked {\n    public string $label { get => 'x'; }\n    public function __construct(private A&B $both, int $size = 3) {}\n}";
+
+    #[test]
+    fn a_tree_with_a_syntax_error_goes_on_to_the_next_tier() {
+        // tree-sitter-php 0.22 does not know property hooks. Its partial tree used to give the
+        // class without its constructor.
+        match extract(&format!("<?php\nnamespace Acme;\n{HOOKED}\n")) {
+            ExtractResult::ParseFailure(reason) => assert!(reason.contains("syntax error")),
+            other => panic!("expected ParseFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tree_with_a_syntax_error_and_no_class_goes_on_too() {
+        // Inside `if`, Tier 2 finds no declaration; before, that was `NoClass`.
+        let result = extract(&format!(
+            "<?php\nnamespace Acme;\nif (true) {{\n{HOOKED}\n}}\n"
+        ));
+        assert!(
+            matches!(result, ExtractResult::ParseFailure(_)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_class_in_a_block_is_reported_inside_one() {
+        let (result, facts) = extract_with_facts(
+            "<?php\nnamespace Acme;\n{\n    class Blocked { public function __construct(A&B $x) {} }\n}\n",
+        );
+        assert!(matches!(result, ExtractResult::Ok(_)), "{result:?}");
+        assert!(facts.inside_block);
+        assert!(!facts.class_check);
+
+        let (result, facts) = extract_with_facts(
+            "<?php\nnamespace Acme;\nclass Top { public function __construct(A&B $x) {} }\n",
+        );
+        assert!(matches!(result, ExtractResult::Ok(_)), "{result:?}");
+        assert!(!facts.inside_block);
     }
 
     #[test]
