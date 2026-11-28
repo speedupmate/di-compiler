@@ -905,3 +905,34 @@ fn a_process_left_by_the_cache_clean_takes_no_thread_or_descriptor_of_the_watche
         watcher.seen.join("\n")
     );
 }
+
+#[test]
+fn a_file_no_tier_can_read_fails_the_compile_like_any_other_stop() {
+    if !has_php() {
+        return;
+    }
+    let store = Store::new();
+    let mut watcher = store.watch(&["--watch"]);
+    // Tier 1 rejects the intersection, tree-sitter-php does not know the property hook, and the
+    // parent does not exist. This store has no Magento scanner, so the compile cannot tell
+    // whether Magento needs the file.
+    write(
+        store.root(),
+        "app/code/Acme/On/Model/Lost.php",
+        "<?php\nnamespace Acme\\On\\Model;\n\nclass Lost extends \\Acme\\Missing\\Base\n{\n    \
+         public string $label { get => 'lost'; }\n\n    \
+         public function __construct(\\Countable&\\Traversable $items)\n    {\n    }\n}\n",
+    );
+    let status = watcher.next_status(WAIT);
+    assert!(status.contains("✗ failed"), "{status}");
+    assert!(
+        watcher.wait_for("No tier could read", WAIT),
+        "{}",
+        watcher.seen.join("\n")
+    );
+    assert!(!store.metadata().exists());
+
+    fs::remove_file(store.root().join("app/code/Acme/On/Model/Lost.php")).unwrap();
+    assert!(watcher.next_status(WAIT).contains("✓ compiled"));
+    assert!(store.metadata().exists());
+}

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 
-use crate::class_checks::{BOOT_PHP, OBJECT_MANAGER_PHP};
+use php_extractor::php_snippets::{BOOT_PHP, OBJECT_MANAGER_PHP};
 
 const VALID_XML_PHP: &str = r#"
 ini_set('display_errors', '0');

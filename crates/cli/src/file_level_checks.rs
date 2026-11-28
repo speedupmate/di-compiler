@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 
 use php_extractor::{lexer::Lexer, ClassInfo};
 
-use crate::class_checks::OBJECT_MANAGER_PHP;
+use php_extractor::php_snippets::OBJECT_MANAGER_PHP;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;

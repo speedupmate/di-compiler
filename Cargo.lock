@@ -682,12 +682,15 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "php-extractor"
 version = "1.0.5"
 dependencies = [
+ "di-resolver",
  "ignore",
  "insta",
  "log",
  "memmap2",
  "rayon",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tree-sitter",

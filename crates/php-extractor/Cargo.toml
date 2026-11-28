@@ -12,7 +12,10 @@ ignore.workspace = true
 memmap2.workspace = true
 tree-sitter.workspace = true
 tree-sitter-php.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
+di-resolver = { path = "../di-resolver" }
 insta.workspace = true
-tempfile.workspace = true

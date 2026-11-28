@@ -2,6 +2,7 @@ pub mod constants;
 pub mod default_literal;
 pub mod extractor;
 pub mod lexer;
+pub mod php_snippets;
 pub mod tier2;
 pub mod tier3;
 pub mod traits;
